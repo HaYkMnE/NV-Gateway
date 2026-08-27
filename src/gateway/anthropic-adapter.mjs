@@ -307,8 +307,7 @@ export function translateAnthropicResponse(openaiResponse) {
     output_tokens: openaiResponse.usage?.completion_tokens || 0,
   };
 
-  return {
-    id: openaiResponse.id || 'msg_' + Date.now(),
+  return {\n    id: openaiResponse.id || 'msg_' + Date.now(),
     type: 'message',
     role: 'assistant',
     model: openaiResponse.model || '',

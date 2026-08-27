@@ -494,8 +494,7 @@ export async function discoverReasoningModes(model, options = {}) {
                 // acceptance — verify each listed value with a tiny request so
                 // the advertised set is what THIS model actually accepts.
                 deps.logger(redact({ step: "probe", model, result: "listed_by_validation_error", status: first.status, listed: normalizeDiscoveredModes(listed) }));
-                return await probeCandidatesIndividually(model, {
-                    ...deps,
+                return await probeCandidatesIndividually(model, {\n                    ...deps,
                     candidates: normalizeDiscoveredModes(listed),
                     methodLabel: "validation_error+verified",
                     baseEvidence: message
@@ -526,8 +525,7 @@ function positiveIntEnv(raw, fallback) {
 let ttlMs = positiveIntEnv(process.env.GATEWAY_CAPABILITY_PROBE_TTL_MS, DEFAULT_TTL_MS);
 
 /** @type {{ cachePath: string | null | undefined, loaded: boolean, lastSweepAt: number }} */
-let state = {
-    // Resolved ONCE from env at import (the gateway child's env is fixed for
+let state = {\n    // Resolved ONCE from env at import (the gateway child's env is fixed for
     // its lifetime); resetCapabilityProbeState may override it for tests.
     cachePath: resolveCapabilityCachePath(),
     loaded: false,
@@ -725,4 +723,165 @@ function reconcileWithPrevious(existing, fresh, nowMs) {
  * result on success. Failures return null and leave any previous entry intact.
  *
  * @param {string} modelId
- * @param {{\n *   force?: boolean,\n *   apiKey?: string,\n *   requestImpl?: Function,\n *   logger?: (outcome: object) => void,\n *   now?: () => number\n * }} [options]\n * @returns {Promise<object | null>} The (new or existing) cached entry, or null.\n */\nexport async function probeAndCacheReasoningModes(modelId, options = {}) {\n    ensureCacheLoaded();\n    if (typeof modelId !== \"string\" || modelId.length === 0) return null;\n    const now = typeof options.now === \"function\" ? options.now : Date.now;\n    const existing = capabilityCache.get(modelId) ?? null;\n    if (!options.force && existing && isEntryFresh(existing, now())) {\n        return cloneEntry(existing);\n    }\n    const pending = inFlightProbes.get(modelId);\n    if (pending) return pending;\n\n    const promise = (async () => {\n        const entry = await discoverReasoningModes(modelId, {\n            apiKey: typeof options.apiKey === \"string\" ? options.apiKey : \"\",\n            requestImpl: /** @type {*} */ (options.requestImpl),\n            logger: typeof options.logger === \"function\" ? options.logger : () => {},\n            now\n        });\n        if (entry) {\n            const reconciled = reconcileWithPrevious(existing, entry, now());\n            capabilityCache.set(modelId, reconciled);\n            persistCache();\n            return cloneEntry(reconciled);\n        }\n        return null;\n    })().finally(() => {\n        if (inFlightProbes.get(modelId) === promise) inFlightProbes.delete(modelId);\n    });\n    inFlightProbes.set(modelId, promise);\n    return promise;\n}\n\n/**\n * Background sweep triggered by /v1/models traffic: refresh stale/missing\n * models SEQUENTIALLY (bounded load), fire-and-forget — the HTTP response is\n * served from cache/static immediately and never waits on this.\n *\n * Scheduling gate mirrors the established project convention (model-discovery\n * warm guard): enabled by default in production, disabled under the\n * GATEWAY_TEST_LOCAL_UPSTREAM_PORT test sentinel unless explicitly force-\n * enabled, and hard-disabled via GATEWAY_CAPABILITY_PROBE_DISABLE=1.\n *\n * @param {unknown} modelIds Model ids from the freshly served catalog.\n * @param {{\n *   logger?: (outcome: object) => void,\n *   keyProvider?: () => string | null,\n *   requestImpl?: Function,\n *   force?: boolean\n * }} [options]\n * @returns {number} How many probes were queued this sweep (0 = skipped).\n */\nexport function scheduleCapabilityRefresh(modelIds, options = {}) {\n    const env = process.env;\n    const enabled = env.GATEWAY_CAPABILITY_PROBE_ENABLE === \"1\"\n        || (env.GATEWAY_CAPABILITY_PROBE_DISABLE !== \"1\" && !env.GATEWAY_TEST_LOCAL_UPSTREAM_PORT);\n    if (!enabled) return 0;\n    ensureCacheLoaded();\n\n    const nowMs = Date.now();\n    if (!options.force && (nowMs - state.lastSweepAt) < SWEEP_COOLDOWN_MS) return 0;\n    state.lastSweepAt = nowMs;\n\n    const maxPerSweep = positiveIntEnv(env.GATEWAY_CAPABILITY_PROBE_MAX_PER_SWEEP, 25);\n    const ids = [...new Set(\n        (Array.isArray(modelIds) ? modelIds : [])\n            .filter((id) => typeof id === \"string\" && id.includes(\"/\"))\n    )]\n        .filter((id) => {\n            const entry = capabilityCache.get(id);\n            return !isEntryFresh(entry, nowMs);\n        })\n        .sort()\n        .slice(0, maxPerSweep);\n    if (ids.length === 0) return 0;\n\n    const logger = typeof options.logger === \"function\" ? options.logger : () => {};\n    const keyProvider = typeof options.keyProvider === \"function\" ? options.keyProvider : null;\n\n    void (async () => {\n        for (const id of ids) {\n            try {\n                // Inside the try: a throwing keyProvider must degrade to a\n                // logged \"failed\" sweep step, never escape as an\n                // unhandledRejection (which would crash the gateway child).\n                const apiKey = keyProvider ? keyProvider() : \"\";\n                const entry = await probeAndCacheReasoningModes(id, {\n                    apiKey: apiKey ?? \"\",\n                    requestImpl: /** @type {*} */ (options.requestImpl),\n                    logger\n                });\n                logger(redact({\n                    step: \"sweep\", model: id,\n                    result: entry ? \"cached\" : \"inconclusive_static_fallback\",\n                    modes: entry ? entry.modes : undefined\n                }));\n            } catch (err) {\n                logger(redact({ step: \"sweep\", model: id, result: \"failed\", error: String(err?.message || err) }));\n            }\n        }\n    })();\n\n    return ids.length;\n}\n\n/**\n * Apply a cached probed result OVER the static family metadata for /v1/models\n * advertisement. Mutates `capabilities.reasoning` in place when a probed entry\n * exists; otherwise leaves the static metadata untouched. Tools/vision/audio\n * and the static shape are never altered.\n *\n * @param {{ reasoning?: object }} capabilities Output of getCapabilityMetadata().\n * @param {string} modelId\n * @returns {{ reasoning?: object }} Same object, for chaining.\n */\nexport function mergeProbedReasoning(capabilities, modelId) {\n    if (!capabilities || typeof capabilities !== \"object\") return capabilities;\n    const entry = getCachedReasoningCapability(modelId);\n    if (!entry) return capabilities;\n    const reasoning = capabilities.reasoning;\n    if (!reasoning || typeof reasoning !== \"object\") return capabilities;\n    reasoning.supported = Boolean(entry.supported);\n    reasoning.modes = Array.isArray(entry.modes) ? [...entry.modes] : [];\n    reasoning.controlKey = typeof entry.controlKey === \"string\" && entry.controlKey ? entry.controlKey : null;\n    reasoning.defaultMode = typeof entry.defaultMode === \"string\" && entry.defaultMode\n        ? entry.defaultMode\n        : (reasoning.modes.length > 0 ? reasoning.modes[reasoning.modes.length - 1] : null);\n    return capabilities;\n}\n\n/**\n * Reset all probe/cache state. Used by tests; accepts overrides so unit tests\n * can inject a deterministic clock / cache path without touching process.env.\n * The next cache access re-loads from disk, which is exactly what a process\n * restart does — pass a fresh path for a clean slate.\n *\n * @param {{ cachePath?: string | null, ttlMs?: number }} [overrides]\n * @returns {void}\n */\nexport function resetCapabilityProbeState(overrides = {}) {\n    capabilityCache.clear();\n    inFlightProbes.clear();\n    if (Number.isSafeInteger(overrides.ttlMs) && overrides.ttlMs > 0) {\n        ttlMs = overrides.ttlMs;\n    } else {\n        ttlMs = positiveIntEnv(process.env.GATEWAY_CAPABILITY_PROBE_TTL_MS, DEFAULT_TTL_MS);\n    }\n    state = {\n        // Explicit null ⇒ memory-only; undefined ⇒ derive from env once.\n        cachePath: overrides.cachePath !== undefined ? overrides.cachePath : resolveCapabilityCachePath(),\n        loaded: false,\n        lastSweepAt: 0\n    };\n}\n
+ * @param {{
+ *   force?: boolean,
+ *   apiKey?: string,
+ *   requestImpl?: Function,
+ *   logger?: (outcome: object) => void,
+ *   now?: () => number
+ * }} [options]
+ * @returns {Promise<object | null>} The (new or existing) cached entry, or null.
+ */
+export async function probeAndCacheReasoningModes(modelId, options = {}) {
+    ensureCacheLoaded();
+    if (typeof modelId !== "string" || modelId.length === 0) return null;
+    const now = typeof options.now === "function" ? options.now : Date.now;
+    const existing = capabilityCache.get(modelId) ?? null;
+    if (!options.force && existing && isEntryFresh(existing, now())) {
+        return cloneEntry(existing);
+    }
+    const pending = inFlightProbes.get(modelId);
+    if (pending) return pending;
+
+    const promise = (async () => {
+        const entry = await discoverReasoningModes(modelId, {
+            apiKey: typeof options.apiKey === "string" ? options.apiKey : "",
+            requestImpl: /** @type {*} */ (options.requestImpl),
+            logger: typeof options.logger === "function" ? options.logger : () => {},
+            now
+        });
+        if (entry) {
+            const reconciled = reconcileWithPrevious(existing, entry, now());
+            capabilityCache.set(modelId, reconciled);
+            persistCache();
+            return cloneEntry(reconciled);
+        }
+        return null;
+    })().finally(() => {
+        if (inFlightProbes.get(modelId) === promise) inFlightProbes.delete(modelId);
+    });
+    inFlightProbes.set(modelId, promise);
+    return promise;
+}
+
+/**
+ * Background sweep triggered by /v1/models traffic: refresh stale/missing
+ * models SEQUENTIALLY (bounded load), fire-and-forget — the HTTP response is
+ * served from cache/static immediately and never waits on this.
+ *
+ * Scheduling gate mirrors the established project convention (model-discovery
+ * warm guard): enabled by default in production, disabled under the
+ * GATEWAY_TEST_LOCAL_UPSTREAM_PORT test sentinel unless explicitly force-
+ * enabled, and hard-disabled via GATEWAY_CAPABILITY_PROBE_DISABLE=1.
+ *
+ * @param {unknown} modelIds Model ids from the freshly served catalog.
+ * @param {{
+ *   logger?: (outcome: object) => void,
+ *   keyProvider?: () => string | null,
+ *   requestImpl?: Function,
+ *   force?: boolean
+ * }} [options]
+ * @returns {number} How many probes were queued this sweep (0 = skipped).
+ */
+export function scheduleCapabilityRefresh(modelIds, options = {}) {
+    const env = process.env;
+    const enabled = env.GATEWAY_CAPABILITY_PROBE_ENABLE === "1"
+        || (env.GATEWAY_CAPABILITY_PROBE_DISABLE !== "1" && !env.GATEWAY_TEST_LOCAL_UPSTREAM_PORT);
+    if (!enabled) return 0;
+    ensureCacheLoaded();
+
+    const nowMs = Date.now();
+    if (!options.force && (nowMs - state.lastSweepAt) < SWEEP_COOLDOWN_MS) return 0;
+    state.lastSweepAt = nowMs;
+
+    const maxPerSweep = positiveIntEnv(env.GATEWAY_CAPABILITY_PROBE_MAX_PER_SWEEP, 25);
+    const ids = [...new Set(
+        (Array.isArray(modelIds) ? modelIds : [])
+            .filter((id) => typeof id === "string" && id.includes("/"))
+    )]
+        .filter((id) => {
+            const entry = capabilityCache.get(id);
+            return !isEntryFresh(entry, nowMs);
+        })
+        .sort()
+        .slice(0, maxPerSweep);
+    if (ids.length === 0) return 0;
+
+    const logger = typeof options.logger === "function" ? options.logger : () => {};
+    const keyProvider = typeof options.keyProvider === "function" ? options.keyProvider : null;
+
+    void (async () => {
+        for (const id of ids) {
+            try {
+                // Inside the try: a throwing keyProvider must degrade to a
+                // logged "failed" sweep step, never escape as an
+                // unhandledRejection (which would crash the gateway child).
+                const apiKey = keyProvider ? keyProvider() : "";
+                const entry = await probeAndCacheReasoningModes(id, {
+                    apiKey: apiKey ?? "",
+                    requestImpl: /** @type {*} */ (options.requestImpl),
+                    logger
+                });
+                logger(redact({
+                    step: "sweep", model: id,
+                    result: entry ? "cached" : "inconclusive_static_fallback",
+                    modes: entry ? entry.modes : undefined
+                }));
+            } catch (err) {
+                logger(redact({ step: "sweep", model: id, result: "failed", error: String(err?.message || err) }));
+            }
+        }
+    })();
+
+    return ids.length;
+}
+
+/**
+ * Apply a cached probed result OVER the static family metadata for /v1/models
+ * advertisement. Mutates `capabilities.reasoning` in place when a probed entry
+ * exists; otherwise leaves the static metadata untouched. Tools/vision/audio
+ * and the static shape are never altered.
+ *
+ * @param {{ reasoning?: object }} capabilities Output of getCapabilityMetadata().
+ * @param {string} modelId
+ * @returns {{ reasoning?: object }} Same object, for chaining.
+ */
+export function mergeProbedReasoning(capabilities, modelId) {
+    if (!capabilities || typeof capabilities !== "object") return capabilities;
+    const entry = getCachedReasoningCapability(modelId);
+    if (!entry) return capabilities;
+    const reasoning = capabilities.reasoning;
+    if (!reasoning || typeof reasoning !== "object") return capabilities;
+    reasoning.supported = Boolean(entry.supported);
+    reasoning.modes = Array.isArray(entry.modes) ? [...entry.modes] : [];
+    reasoning.controlKey = typeof entry.controlKey === "string" && entry.controlKey ? entry.controlKey : null;
+    reasoning.defaultMode = typeof entry.defaultMode === "string" && entry.defaultMode
+        ? entry.defaultMode
+        : (reasoning.modes.length > 0 ? reasoning.modes[reasoning.modes.length - 1] : null);
+    return capabilities;
+}
+
+/**
+ * Reset all probe/cache state. Used by tests; accepts overrides so unit tests
+ * can inject a deterministic clock / cache path without touching process.env.
+ * The next cache access re-loads from disk, which is exactly what a process
+ * restart does — pass a fresh path for a clean slate.
+ *
+ * @param {{ cachePath?: string | null, ttlMs?: number }} [overrides]
+ * @returns {void}
+ */
+export function resetCapabilityProbeState(overrides = {}) {
+    capabilityCache.clear();
+    inFlightProbes.clear();
+    if (Number.isSafeInteger(overrides.ttlMs) && overrides.ttlMs > 0) {
+        ttlMs = overrides.ttlMs;
+    } else {
+        ttlMs = positiveIntEnv(process.env.GATEWAY_CAPABILITY_PROBE_TTL_MS, DEFAULT_TTL_MS);
+    }
+    state = {
+        // Explicit null ⇒ memory-only; undefined ⇒ derive from env once.
+        cachePath: overrides.cachePath !== undefined ? overrides.cachePath : resolveCapabilityCachePath(),
+        loaded: false,
+        lastSweepAt: 0
+    };
+}

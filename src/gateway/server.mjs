@@ -1124,30 +1124,28 @@ function handleModelsRequest(req, res, targetKey, onResult) {
                     res.end(responseBody);
                     settle({ success: true });
                 }
-                return;
+            } else {
+                const retryAfter = parseRetryAfter(upstreamRes.headers["retry-after"]);
+                handleKeyError(targetKey.id, upstreamRes.statusCode, responseBody, retryAfter);
+                if (onResult && classifyUpstreamResponse(upstreamRes.statusCode, upstreamRes.headers).retryable && !res.headersSent) {
+                    settle({ success: false, retryable: true, statusCode: upstreamRes.statusCode, reason: "http_" + upstreamRes.statusCode });
+                    return;
+                }
+                res.writeHead(upstreamRes.statusCode, capResponseHeaders(upstreamRes.headers));
+                res.end(responseBody);
+                settle({ success: false, retryable: false, statusCode: upstreamRes.statusCode });
             }
-
-            warn("Upstream non-2xx response on models", { statusCode: upstreamRes.statusCode });
-            handleKeyError(targetKey.id, upstreamRes.statusCode, responseBody, parseRetryAfter(upstreamRes.headers["retry-after"]));
-
-            if (classifyUpstreamResponse(upstreamRes.statusCode, upstreamRes.headers).retryable && !res.headersSent) {
-                settle({ success: false, retryable: true, statusCode: upstreamRes.statusCode, reason: "http_" + upstreamRes.statusCode });
-                return;
-            }
-
-            res.writeHead(upstreamRes.statusCode, capResponseHeaders(upstreamRes.headers));
-            res.end(responseBody);
-            settle({ success: false, retryable: false, statusCode: upstreamRes.statusCode });
         });
-
         upstreamRes.on("error", (err) => {
-            error("Upstream models response stream error", { id: targetKey.id });
-            if (!res.headersSent) {
-                handleKeyError(targetKey.id, 502, err.message, null);
-                settle({ success: false, retryable: true, statusCode: 502, reason: "upstream_stream_error" });
-                return;
-            }
-            res.destroy(err);
+            if (settled) return;
+            settle({ success: false, retryable: false, statusCode: 502, reason: "response_error" });
+            if (!res.headersSent) { res.writeHead(502); res.end(JSON.stringify({ error: "Bad Gateway" })); }
+            else res.destroy(err);
+        });
+        upstreamRes.on("aborted", () => {
+            if (settled) return;
+            settle({ success: false, retryable: false, statusCode: 502, reason: "response_aborted" });
+            if (!res.headersSent) { res.writeHead(502); res.end(JSON.stringify({ error: "Bad Gateway" })); }
         });
     });
 
