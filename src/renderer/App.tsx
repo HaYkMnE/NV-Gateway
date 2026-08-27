@@ -110,5 +110,26 @@ export default function App() {
   if (!hydrated && hydration.state === 'error') return <div className="h-full grid place-items-center p-6"><div role="alert" className="max-w-md border border-error p-5 break-words"><p>{t('hydration_error')}</p><p className="mt-2 text-sm text-textMuted break-all">{hydration.message}</p><button onClick={() => void retryHydration()} className="mt-4 text-accent-neon">{t('retry')}</button></div></div>;
   if (!hydrated) return <div className="h-full grid place-items-center" role="status">{t('loading')}</div>;
 
-  return (\n    <ModalContext.Provider value={modalValue}>\n      <QueryClientProvider client={queryClient}>\n        <Router>\n          <Routes>\n            <Route path=\"/\" element={setupComplete ? <Navigate to=\"/dashboard\" /> : <Navigate to=\"/wizard\" />} />\n            <Route path=\"/wizard\" element={<Wizard />} />\n            <Route element={<Layout />}>\n              <Route path=\"/dashboard\" element={<Dashboard />} />\n              <Route path=\"/models\" element={<Models />} />\n              <Route path=\"/endpoint\" element={<Endpoint />} />\n              <Route path=\"/logs\" element={<Logs />} />\n              <Route path=\"/settings\" element={<Settings />} />\n            </Route>\n          </Routes>\n        </Router>\n      </QueryClientProvider>\n      <FeedbackModal isOpen={feedbackModalOpen} onClose={() => setFeedbackModalOpen(false)} />\n      <AboutDialog isOpen={aboutDialogOpen} onClose={() => setAboutDialogOpen(false)} />\n      <DonationModal open={donationModalOpen} onClose={() => setDonationModalOpen(false)} onAscension={handleAscension} />\n    </ModalContext.Provider>\n  );
+  return (
+    <ModalContext.Provider value={modalValue}>
+      <QueryClientProvider client={queryClient}>
+        <Router>
+          <Routes>
+            <Route path="/" element={setupComplete ? <Navigate to="/dashboard" /> : <Navigate to="/wizard" />} />
+            <Route path="/wizard" element={<Wizard />} />
+            <Route element={<Layout />}>
+              <Route path="/dashboard" element={<Dashboard />} />
+              <Route path="/models" element={<Models />} />
+              <Route path="/endpoint" element={<Endpoint />} />
+              <Route path="/logs" element={<Logs />} />
+              <Route path="/settings" element={<Settings />} />
+            </Route>
+          </Routes>
+        </Router>
+      </QueryClientProvider>
+      <FeedbackModal isOpen={feedbackModalOpen} onClose={() => setFeedbackModalOpen(false)} />
+      <AboutDialog isOpen={aboutDialogOpen} onClose={() => setAboutDialogOpen(false)} />
+      <DonationModal open={donationModalOpen} onClose={() => setDonationModalOpen(false)} onAscension={handleAscension} />
+    </ModalContext.Provider>
+  );
 }
