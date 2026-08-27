@@ -1,4 +1,4 @@
-export default {
+﻿export default {
   content: ['./src/renderer/**/*.{js,jsx,ts,tsx,html}'],
   safelist: ['glow-red'],
   theme: {

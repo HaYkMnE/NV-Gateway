@@ -136,4 +136,12 @@ This repository is equipped with a complete, closed-loop autonomous software eng
 3. **The 2 Clean Passes Rule (`.jules/scripts/verify-clean-passes.ts`)**:
    - Bug Hunter requires **two independent, sequential passing test runs** (`npm test`) on an identical commit SHA before granting approval.
 4. **Telemetry & Minimization (`.jules/scripts/collect-minimized-logs.ts`)**:
-   - Telemetry logs are strictly sanitized, deduplicated, and minimized into `telemetry-bundle.json` without leaking secrets, tokens, or PII.\n\n---\n\n## 5. Rules for Modifying Files\n\n- **Never create ad-hoc mock files or bypasses in production code.**\n- **Preserve type-safety**: Ensure `npm run build` succeeds with zero TypeScript errors across both `tsconfig.json` and `tsconfig.node.json`.\n- **Localization**: If adding UI strings, define entries in both English (`src/renderer/i18n/resources.ts` -> `en`) and Russian (`ru`).\n
+   - Telemetry logs are strictly sanitized, deduplicated, and minimized into `telemetry-bundle.json` without leaking secrets, tokens, or PII.
+
+---
+
+## 5. Rules for Modifying Files
+
+- **Never create ad-hoc mock files or bypasses in production code.**
+- **Preserve type-safety**: Ensure `npm run build` succeeds with zero TypeScript errors across both `tsconfig.json` and `tsconfig.node.json`.
+- **Localization**: If adding UI strings, define entries in both English (`src/renderer/i18n/resources.ts` -> `en`) and Russian (`ru`).
