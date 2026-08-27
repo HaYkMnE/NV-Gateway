@@ -1,19 +1,15 @@
-import { createContext, useContext } from 'react';
+import React, { createContext, useContext } from 'react';
 
 export interface ModalContextValue {
-  openFeedback: () => void;
   openAbout: () => void;
-  openDonation: () => void;
+  openFeedback: () => void;
+  openSettings: () => void;
 }
 
-const defaultModalContext: ModalContextValue = {
-  openFeedback: () => {},
+export const ModalContext = createContext<ModalContextValue>({
   openAbout: () => {},
-  openDonation: () => {},
-};
+  openFeedback: () => {},
+  openSettings: () => {},
+});
 
-export const ModalContext = createContext<ModalContextValue>(defaultModalContext);
-
-export function useModal(): ModalContextValue {
-  return useContext(ModalContext);
-}
+export const useModalContext = () => useContext(ModalContext);

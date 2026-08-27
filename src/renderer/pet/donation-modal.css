@@ -1,23 +1,36 @@
-/*
- * DonationModal animation keyframes.
- * MUST stay a static stylesheet (renderer CSP blocks inline <style>).
- */
+/* NV-GATEWAY - PET & DONATION MODAL OVERLAYS */
 
-@keyframes nv-donation-laser {
-          0%, 100% { top: 4%; opacity: 0.9; }
-          50% { top: 94%; opacity: 1; }
-        }
-        .nv-donation-laser {
-          animation: nv-donation-laser 2.2s ease-in-out infinite;
-        }
-        @keyframes nv-donation-bubble {
-          0% { transform: translateY(6px) scale(0.96); opacity: 0; }
-          12% { transform: translateY(0) scale(1); opacity: 1; }
-          88% { transform: translateY(0) scale(1); opacity: 1; }
-          100% { transform: translateY(-4px) scale(0.98); opacity: 0; }
-        }
-        .nv-donation-bubble { animation: nv-donation-bubble 4s ease forwards; }
-        @media (prefers-reduced-motion: reduce) {
-          .nv-donation-laser, .nv-donation-bubble { animation: none !important; }
-          .nv-donation-bubble { opacity: 1 !important; }
-        }
+.donation-qr-overlay {
+  animation: fadeInQuick 0.18s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes fadeInQuick {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.donation-qr-canvas {
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+
+/* Custom scrollbar for donation tabs */
+.donation-scrollbar::-webkit-scrollbar {
+  width: 4px;
+}
+.donation-scrollbar::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.4);
+}
+.donation-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(89, 255, 0, 0.3);
+  border-radius: 2px;
+}
+.donation-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(89, 255, 0, 0.6);
+}

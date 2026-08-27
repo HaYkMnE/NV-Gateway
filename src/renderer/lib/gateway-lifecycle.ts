@@ -1,19 +1,19 @@
-import { createContext, useContext } from 'react';
+import { getGatewayApi } from './api';
 
-export interface GatewayLifecycleSnapshot {
-  status?: GatewayStatus;
-  isError: boolean;
-  refetch: () => Promise<unknown>;
+export async function startGatewayProcess(port?: number): Promise<boolean> {
+  const api = getGatewayApi();
+  const res = await api.startGateway(port);
+  return res.success;
 }
 
-const unavailableSnapshot: GatewayLifecycleSnapshot = {
-  status: undefined,
-  isError: false,
-  refetch: async () => undefined
-};
+export async function stopGatewayProcess(): Promise<boolean> {
+  const api = getGatewayApi();
+  const res = await api.stopGateway();
+  return res.success;
+}
 
-export const GatewayLifecycleContext = createContext<GatewayLifecycleSnapshot>(unavailableSnapshot);
-
-export function useGatewayLifecycle(): GatewayLifecycleSnapshot {
-  return useContext(GatewayLifecycleContext);
+export async function restartGatewayProcess(port?: number): Promise<boolean> {
+  const api = getGatewayApi();
+  const res = await api.restartGateway(port);
+  return res.success;
 }
