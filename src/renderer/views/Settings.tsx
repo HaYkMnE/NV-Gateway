@@ -112,8 +112,7 @@ function ModelsSection() {
         <p role="status" className="text-sm text-textMuted">{t('loading')}</p>
       )}
 
-      {!loading && models.length === 0 && !error && (
-        <p className="text-sm text-textMuted">{t('models_available')}</p>
+      {!loading && models.length === 0 && !error && (\n        <p className="text-sm text-textMuted">{t('models_available')}</p>
       )}
 
       {models.length > 0 && (

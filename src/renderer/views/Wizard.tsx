@@ -50,8 +50,7 @@ export function Wizard() {
   };
 
   const errorKey = validation ? `port_${validation}` : null;
-  const languageOptions: Array<{ value: AppLanguage; labelKey: string }> = [
-    { value: 'en', labelKey: 'english' },
+  const languageOptions: Array<{ value: AppLanguage; labelKey: string }> = [\n    { value: 'en', labelKey: 'english' },
     { value: 'zh', labelKey: 'chinese' },
     { value: 'es', labelKey: 'spanish' },
     { value: 'hi', labelKey: 'hindi' },

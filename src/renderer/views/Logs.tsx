@@ -314,8 +314,7 @@ function SendErrorsDialog({ count, preview, previewLoading, sending, onClose, on
             </div>
           ) : preview && preview.length > 0 ? (
             <ul className="grid gap-2 text-xs font-mono">
-              {preview.slice(0, 50).map((entry, idx) => (
-                <li key={idx} className="border-b border-border pb-1 break-words">
+              {preview.slice(0, 50).map((entry, idx) => (\n                <li key={idx} className="border-b border-border pb-1 break-words">
                   <span className="text-textMuted">{entry.timestamp}</span>{' '}
                   <span className="text-warning">[{entry.type}]</span>{' '}
                   <span className="text-textMain">{entry.message}</span>

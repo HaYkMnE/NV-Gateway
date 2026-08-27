@@ -303,8 +303,7 @@ export function Endpoint() {
           </div>
         </button>
 
-        {isConfigOpen && (
-          <div className="mt-2.5 p-5 bg-surface border border-border rounded-xl space-y-4">
+        {isConfigOpen && (\n          <div className="mt-2.5 p-5 bg-surface border border-border rounded-xl space-y-4">
             {/* Tab Selector */}
             <div className="flex flex-wrap gap-2">
               {tabs.map((tab) => (
