@@ -12,13 +12,15 @@
 ```
 
 **Next-Gen Local AI Gateway & Desktop Control Deck for NVIDIA NGC / NIM Models**
+*OpenAI and Anthropic Dual Gateway // Local Anthropic Messages Proxy // Claude Code with NVIDIA NIM*
 
 [![Release](https://img.shields.io/badge/Release-v0.0.0-00FF66?style=for-the-badge&logo=github&logoColor=black)](https://github.com/HaYkMnE/NV-Gateway/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-00E5FF?style=for-the-badge)](LICENSE)
 [![Node](https://img.shields.io/badge/Node-20%2B-339933?style=for-the-badge&logo=nodedotjs&logoColor=white)](https://nodejs.org/)
 [![Electron](https://img.shields.io/badge/Electron-31-47848F?style=for-the-badge&logo=electron&logoColor=white)](https://electronjs.org/)
-[![Tests](https://img.shields.io/badge/Tests-511%2F511%20PASSED-brightgreen?style=for-the-badge&logo=checkmarx&logoColor=white)](tests/)
+[![Anthropic Compatible](https://img.shields.io/badge/Anthropic-Messages%20API%20%2F%20Claude%20Code-D97706?style=for-the-badge&logo=anthropic&logoColor=white)](https://docs.anthropic.com)
 [![NVIDIA NIM](https://img.shields.io/badge/NVIDIA-NGC%20%2F%20NIM-76B900?style=for-the-badge&logo=nvidia&logoColor=white)](https://build.nvidia.com)
+[![Tests](https://img.shields.io/badge/Tests-515%2F515%20PASSED-brightgreen?style=for-the-badge&logo=checkmarx&logoColor=white)](tests/)
 
 </div>
 
@@ -26,9 +28,9 @@
 
 ## Bottom Line Up Front (BLUF)
 
-**NV-Gateway** is a high-performance, local OpenAI- and Anthropic-compatible reverse proxy and desktop HUD running on `127.0.0.1:12004`. It aggregates and load-balances across **100+ NVIDIA NGC / NIM models** with multi-key LRU rotation, automated reasoning/thinking capability discovery, sub-millisecond failover, Windows DPAPI encryption at rest, and zero mandatory telemetry.
+**NV-Gateway** is a high-performance, local **OpenAI and Anthropic dual gateway** and desktop HUD running on `127.0.0.1:12004`. It functions as a native **Local Anthropic Messages Proxy** and **NVIDIA NGC Anthropic API adapter**, allowing tools that only speak Anthropic (such as **Claude Code CLI**, Claude Desktop, and Anthropic SDKs) to seamlessly drive **100+ NVIDIA NGC / NIM models** with zero extra middleware while simultaneously serving standard OpenAI `/v1/chat/completions`. It features intelligent multi-key LRU pooling, automated reasoning/thinking capability discovery, **zero rate limits failover** (`429` cooldowns & retries), Windows DPAPI encryption at rest, and zero mandatory telemetry.
 
-Whether you're running autonomous coding swarms (OpenCode, Cline, Cursor, Aider) or interactive chat agents, NV-Gateway eliminates rate limits (`429`), filters out dead keys (`401`/`403`), discovers model-specific reasoning controls, and injects context window metadata on the fly.
+Whether you're running **Claude Code (`claude-code` CLI)**, autonomous coding swarms (OpenCode, Cline, Cursor, Aider), or interactive chat agents, NV-Gateway delivers **zero rate limits failover**, filters out dead keys (`401`/`403`), discovers model-specific reasoning controls (thinking budgets), and injects context window metadata on the fly.
 
 > 🤖 For AI agents & crawlers: [llms.txt](llms.txt) · [AGENTS.md](AGENTS.md)
 
@@ -41,8 +43,9 @@ Whether you're running autonomous coding swarms (OpenCode, Cline, Cursor, Aider)
 ### What You Get After Downloading
 
 - **One installer, zero DevOps** — 1-click setup, tray app, first-run wizard. No Docker, no Python env, no YAML.
-- **One local endpoint, two protocols** — `http://127.0.0.1:12004/v1` speaks OpenAI (`/chat/completions`) and Anthropic (`/v1/messages`) simultaneously. OpenCode, Cline, Cursor, Aider, Continue, Windsurf, OpenClaw: point, and go.
-- **All your keys behave like one** — paste your NVIDIA keys into the GUI once; LRU rotation, dead-key quarantine (`401/403`) and `429` cooldowns are automatic.
+- **OpenAI and Anthropic dual gateway** — `http://127.0.0.1:12004/v1` (and `http://127.0.0.1:12004` as `ANTHROPIC_BASE_URL`) speaks OpenAI (`/chat/completions`) and Anthropic (`/v1/messages`) natively. **Claude Code**, OpenCode, Cline, Cursor, Aider, Continue, Windsurf, OpenClaw: point, and go.
+- **Claude Code with NVIDIA NIM** — Drop-in replace Anthropic endpoints for Anthropic's official `claude-code` CLI and run 100+ NVIDIA NIM models (GLM-5, Llama 3.3 70B, DeepSeek-R1, Qwen 2.5, Nemotron, Mistral) with full tool-calling and streaming support without proxy servers or Docker.
+- **All your keys behave like one** — paste your NVIDIA keys into the GUI once; LRU rotation, dead-key quarantine (`401/403`), and `429` cooldowns are automatic with **zero rate limits failover**.
 - **Runs that don't die mid-task** — automatic failover to the next key keeps long agent sessions alive through quota exhaustion.
 - **Models, auto-tuned** — reasoning levels (`none → max`) and context/output limits are discovered and injected into `/v1/models`, so your tool stops truncating prompts.
 - **Private by default** — keys encrypted with Windows DPAPI, loopback-only listener, zero mandatory telemetry.
@@ -55,10 +58,10 @@ Whether you're running autonomous coding swarms (OpenCode, Cline, Cursor, Aider)
 | What it is | Windows desktop app (GUI + built-in local gateway) | Server you self-host (Python/Docker, config files; some ship a web dashboard) | Nothing — your tool calls `integrate.api.nvidia.com` itself |
 | Setup | 1-click installer | Deploy + configure + keep a service running | One API key from build.nvidia.com |
 | Key pooling | GUI-managed key pool (up to 1,000 keys), automatic LRU rotation | Single key or config-defined pools | One key |
-| 429s & dead keys | Automatic failover + cooldown, requests don't drop | Depends on your config; built for hosted infra | The request fails — you handle it |
-| Protocols | OpenAI **and** Anthropic compatible out of the box | OpenAI-compatible core; Anthropic support varies by product/config | OpenAI-compatible only |
+| 429s & dead keys | Automatic zero rate limits failover + cooldown, requests don't drop | Depends on your config; built for hosted infra | The request fails — you handle it |
+| Protocols | **OpenAI and Anthropic dual gateway** out of the box (native `/v1/messages` facade for Claude Code) | OpenAI-compatible core; Anthropic support varies by product/config | OpenAI-compatible only |
 | Model metadata | Context/output limits + reasoning levels injected into `/v1/models` | Varies | Raw catalog |
-| Best for | A developer on Windows who wants every local AI tool on 100+ NVIDIA models in minutes | Teams running shared, self-hosted LLM infrastructure | One-off tests |
+| Best for | A developer on Windows who wants Claude Code and every local AI tool on 100+ NVIDIA models in minutes | Teams running shared, self-hosted LLM infrastructure | One-off tests |
 
 > Free and open-source (MIT). The only account you need is your NVIDIA NGC API key(s).
 
@@ -69,11 +72,11 @@ Whether you're running autonomous coding swarms (OpenCode, Cline, Cursor, Aider)
 ```
                                   +----------------------------------------------------+
                                   |                 AI Coding Agents                   |
-                                  |  OpenCode / Cline / Cursor / Aider / Continue / ...|
+                                  |Claude Code / OpenCode / Cline / Cursor / Aider / ..|
                                   +-------------------------+--------------------------+
                                                             |
                                       OpenAI / Anthropic REST & SSE Streams
-                                      Base URL: http://127.0.0.1:12004/v1
+                                      Base URL: http://127.0.0.1:12004 (/v1)
                                                             |
                                                             v
 +---------------------------------------------------------------------------------------------------------------+
@@ -100,20 +103,20 @@ Whether you're running autonomous coding swarms (OpenCode, Cline, Cursor, Aider)
 |  |  - Cyber Pet Companion (State Machine)|                                         |                          |
 |  +---------------------------------------+                                         |                          |
 +------------------------------------------------------------------------------------|--------------------------+
-                                                                                     |
-                                                                                     v
-                                                                   +-----------------------------------+
-                                                                   |      NVIDIA NGC / NIM API         |
-                                                                   |  (integrate.api.nvidia.com)       |
-                                                                   |  100+ Models (GLM, LLaMA, Qwen...) |
-                                                                   +-----------------------------------+
+                                                                                      |
+                                                                                      v
+                                                                    +-----------------------------------+
+                                                                    |      NVIDIA NGC / NIM API         |
+                                                                    |  (integrate.api.nvidia.com)       |
+                                                                    |  100+ Models (GLM, LLaMA, Qwen...) |
+                                                                    +-----------------------------------+
 ```
 
 ---
 
 ## Key Features
 
-### 1. Multi-Key Rotation & Zero-Drop Failover
+### 1. Multi-Key Rotation & Zero Rate Limits Failover
 - **Intelligent LRU Selection**: Rotates across your NVIDIA API keys automatically — from a single key to a pool of up to 1,000.
 - **Failover Engine**:
   - `401 / 403`: Immediately disables the invalid key.
@@ -131,9 +134,9 @@ Whether you're running autonomous coding swarms (OpenCode, Cline, Cursor, Aider)
 - Injects real context window (`context_length`) and completion limit (`max_tokens`, `max_completion_tokens`) metadata directly into `/v1/models` responses.
 - Allows AI coding tools to optimize prompts without truncation errors.
 
-### 4. Dual Protocol Compatibility
+### 4. OpenAI and Anthropic Dual Gateway (Native Translation Facade)
 - **OpenAI Compatible**: `/v1/chat/completions`, `/v1/models`.
-- **Anthropic Compatible**: Full `/v1/messages` translation facade supporting tool calls, multi-part contents, and SSE event streaming.
+- **Local Anthropic Messages Proxy & NVIDIA NGC Anthropic API Adapter**: Native `/v1/messages` translation facade that translates Anthropic Messages schema (tool/function calling, multi-turn conversations, multi-part prompt blocks, system prompts, thinking/reasoning parameters, and SSE event streaming) directly to NVIDIA NGC backends. Enables **Claude Code with NVIDIA NIM**, Anthropic SDKs, and Claude Desktop to use 100+ models with zero extra middleware or translation servers.
 
 ### 5. Windows DPAPI Encryption at Rest
 - API keys and administrative tokens are encrypted on disk via Windows Data Protection API (`safeStorage`).
@@ -182,7 +185,27 @@ The portable binary is created in `dist/NV-Gateway 0.0.0.exe`.
 
 Point your favorite AI coding assistant to NV-Gateway:
 
-### 1. OpenCode
+### 1. Claude Code (`claude-code` CLI)
+
+Run Anthropic's official **Claude Code** CLI powered by 100+ NVIDIA NIM models with zero extra middleware. NV-Gateway acts as a native **Local Anthropic Messages Proxy** and **NVIDIA NGC Anthropic API adapter**, translating Anthropic `/v1/messages` schema (multi-turn conversations, tool calling, thinking/reasoning blocks, and SSE streaming) directly to NVIDIA NGC backends:
+
+```bash
+# PowerShell
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:12004"
+$env:ANTHROPIC_API_KEY  = "local-nv-gateway"
+claude --model z-ai/glm-5.2
+
+# Bash / Zsh
+export ANTHROPIC_BASE_URL="http://127.0.0.1:12004"
+export ANTHROPIC_API_KEY="local-nv-gateway"
+claude --model meta/llama-3.3-70b-instruct
+```
+
+> **How it works:** Anthropic clients targeting `http://127.0.0.1:12004` (or `http://127.0.0.1:12004/v1`) send standard Anthropic Messages payloads. NV-Gateway translates the requests on the fly, executes them against your NVIDIA NIM key pool with **zero rate limits failover**, and translates the streaming responses back to Anthropic SSE events. You can target any model in the catalog, including `deepseek-ai/deepseek-r1`, `qwen/qwen2.5-coder-32b-instruct`, and `nvidia/llama-3.1-nemotron-70b-instruct`.
+
+---
+
+### 2. OpenCode
 In `%USERPROFILE%\.config\opencode\opencode.json` or `opencode.jsonc`:
 
 ```jsonc
@@ -203,7 +226,7 @@ In `%USERPROFILE%\.config\opencode\opencode.json` or `opencode.jsonc`:
 
 ---
 
-### 2. Cline / Roo Code (VS Code Extension)
+### 3. Cline / Roo Code (VS Code Extension)
 1. Open Cline Settings (`Ctrl+,` -> search `Cline` or click gear icon).
 2. Set **API Provider** to `OpenAI Compatible`.
 3. Set **Base URL** to `http://127.0.0.1:12004/v1`.
@@ -216,7 +239,7 @@ In `%USERPROFILE%\.config\opencode\opencode.json` or `opencode.jsonc`:
 
 ---
 
-### 3. Cursor
+### 4. Cursor
 1. Go to **Cursor Settings** -> **Models** -> **OpenAI API Key**.
 2. Enable custom OpenAI API base URL: `http://127.0.0.1:12004/v1`.
 3. Set custom API key to `local-nv-gateway`.
@@ -224,7 +247,7 @@ In `%USERPROFILE%\.config\opencode\opencode.json` or `opencode.jsonc`:
 
 ---
 
-### 4. Aider
+### 5. Aider
 Run Aider directly from your terminal:
 
 ```bash
@@ -241,7 +264,7 @@ aider --model openai/meta/llama-3.3-70b-instruct
 
 ---
 
-### 5. Continue (VS Code / JetBrains)
+### 6. Continue (VS Code / JetBrains)
 In `~/.continue/config.json`:
 
 ```json
@@ -267,7 +290,7 @@ In `~/.continue/config.json`:
 
 ---
 
-### 6. Windsurf / OpenClaw
+### 7. Windsurf / OpenClaw
 Set Provider to `OpenAI` with:
 - **Base URL**: `http://127.0.0.1:12004/v1`
 - **API Key**: `local-nv-gateway`
@@ -281,7 +304,7 @@ NV-Gateway binds two paired loopback ports (`P` and `P+1`, default `12004` and `
 | Endpoint | Port | Auth | Purpose |
 | :--- | :--- | :--- | :--- |
 | `POST /v1/chat/completions` | `12004` | Optional Bearer | OpenAI chat completions with streaming SSE & failover |
-| `POST /v1/messages` | `12004` | Optional Bearer | Anthropic Messages API translation facade |
+| `POST /v1/messages` | `12004` | Optional Bearer / x-api-key | Anthropic Messages API translation facade (Claude Code CLI, Anthropic SDKs, Claude Desktop) |
 | `GET /v1/models` | `12004` | Public | Enriched NGC catalog with limits & reasoning specs |
 | `GET /health`, `GET /ready` | `12004` | Public | Process health and readiness probes |
 | `GET /admin/keys` | `12005` | Admin Token | Key status, error counts, and accessible models |
@@ -315,7 +338,7 @@ All runtime state is stored in `%APPDATA%\NV-Gateway\`:
 
 ## Verification & Testing
 
-NV-Gateway maintains a strict zero-regression testing standard with **511 automated tests** covering runtime security, ACL protection, ASAR scans, key failover, and protocol translation:
+NV-Gateway maintains a strict zero-regression testing standard with **515 automated tests** covering runtime security, ACL protection, ASAR scans, key failover, and protocol translation:
 
 ```bash
 # Run full suite
@@ -356,7 +379,7 @@ If NV-Gateway empowers your workflow, support ongoing development:
 
 ## Contributing
 
-We welcome contributions! Please review [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md) before submitting pull requests. All contributions must pass the 511-test suite and adhere to strict credential-redaction policies.
+We welcome contributions! Please review [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md) before submitting pull requests. All contributions must pass the 515-test suite and adhere to strict credential-redaction policies.
 
 ---
 

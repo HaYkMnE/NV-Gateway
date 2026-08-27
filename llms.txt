@@ -1,13 +1,13 @@
 # NV-Gateway
 
-> Neural Proxy & Desktop HUD — a Windows desktop app and local AI gateway for NVIDIA NGC/NIM: 100+ models behind one OpenAI-compatible and Anthropic-compatible endpoint, with multi-key failover, DPAPI encryption at rest, and zero mandatory telemetry. Specification and integration parameters for AI models, agents, and LLM crawlers.
+> Neural Proxy & Desktop HUD — a Windows desktop app, OpenAI and Anthropic dual gateway, and local AI proxy for NVIDIA NGC/NIM: 100+ models behind unified OpenAI-compatible and Anthropic-compatible endpoints, with zero rate limits failover, DPAPI encryption at rest, and zero mandatory telemetry. Specification and integration parameters for AI models, agents, and LLM crawlers.
 
 **Overview**
 
-NV-Gateway is a local reverse proxy for NVIDIA NGC / NIM AI models running on Windows. It exposes OpenAI-compatible and Anthropic-compatible endpoints on `127.0.0.1:12004`, rotating across multiple API keys with automatic failover, DPAPI encryption at rest, and dynamic reasoning capability discovery.
+NV-Gateway is a high-performance local reverse proxy, Local Anthropic Messages Proxy, and NVIDIA NGC Anthropic API adapter running on Windows. It exposes OpenAI-compatible (`/v1/chat/completions`) and Anthropic-compatible (`/v1/messages`) endpoints on `127.0.0.1:12004`, rotating across multiple API keys with zero rate limits failover, DPAPI encryption at rest, and dynamic reasoning capability discovery. This enables Claude Code with NVIDIA NIM as well as autonomous multi-agent swarms with zero external middleware.
 
 **Base URLs**
-- Gateway Endpoint: `http://127.0.0.1:12004/v1`
+- Gateway Endpoint: `http://127.0.0.1:12004/v1` (OpenAI & Anthropic) or `http://127.0.0.1:12004` (as `ANTHROPIC_BASE_URL`)
 - Admin API: `http://127.0.0.1:12005/admin`
 - Health / Readiness: `http://127.0.0.1:12004/health`, `http://127.0.0.1:12004/ready`
 
@@ -21,10 +21,12 @@ NV-Gateway is a local reverse proxy for NVIDIA NGC / NIM AI models running on Wi
   - `reasoning_effort`: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
   - `chat_template_kwargs`: `{"enable_thinking": true}`
 
-**2. Anthropic Messages API Facade**
+**2. Anthropic Messages API Facade (Local Anthropic Messages Proxy)**
 - Route: `POST /v1/messages`
+- Base URL: `http://127.0.0.1:12004` or `http://127.0.0.1:12004/v1`
 - Authentication: Optional `x-api-key: <token>` or `Authorization: Bearer <token>`
-- Protocol: Automatic bidirectional translation between Anthropic Messages schema and NVIDIA OpenAI backend, including tool calls and streaming SSE events.
+- Protocol: Automatic bidirectional translation between Anthropic Messages schema and NVIDIA OpenAI backend, including tool/function calling, multi-turn conversations, multi-part prompt blocks, system prompts, thinking/reasoning parameters, and streaming SSE events.
+- Compatibility: Claude Code (`claude-code` CLI), Anthropic TypeScript/Python SDKs, Claude Desktop.
 
 **3. Model Discovery & Metadata**
 - Route: `GET /v1/models`
@@ -42,6 +44,21 @@ NV-Gateway is a local reverse proxy for NVIDIA NGC / NIM AI models running on Wi
 - **Mistral**: `mistralai/mistral-large-2-instruct`, `mistralai/mixtral-8x22b-instruct`.
 
 **Client Configuration Reference**
+
+**Claude Code (`claude-code` CLI)**
+- Environment: `ANTHROPIC_BASE_URL=http://127.0.0.1:12004`, `ANTHROPIC_API_KEY=local-nv-gateway`
+- Windows PowerShell:
+  ```powershell
+  $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:12004"
+  $env:ANTHROPIC_API_KEY  = "local-nv-gateway"
+  claude --model z-ai/glm-5.2
+  ```
+- Linux / macOS Bash:
+  ```bash
+  export ANTHROPIC_BASE_URL="http://127.0.0.1:12004"
+  export ANTHROPIC_API_KEY="local-nv-gateway"
+  claude --model meta/llama-3.3-70b-instruct
+  ```
 
 **OpenCode (`~/.config/opencode/opencode.json`)**
 ```json
@@ -61,6 +78,10 @@ NV-Gateway is a local reverse proxy for NVIDIA NGC / NIM AI models running on Wi
 **Cline / Roo Code**
 - API Provider: `OpenAI Compatible`
 - Base URL: `http://127.0.0.1:12004/v1`
+- API Key: `local-nv-gateway`
+
+**Cursor**
+- Custom Base URL: `http://127.0.0.1:12004/v1`
 - API Key: `local-nv-gateway`
 
 **Aider**
@@ -86,13 +107,14 @@ NV-Gateway is a local reverse proxy for NVIDIA NGC / NIM AI models running on Wi
 
 ## Integrations
 
-- [OpenCode](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md#1-opencode): provider config block with baseURL
-- [Cline / Roo Code](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md#2-cline--roo-code-vs-code-extension): OpenAI-compatible provider setup, model IDs
-- [Cursor](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md#3-cursor): custom OpenAI base URL and API key
-- [Aider](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md#4-aider): terminal env vars and --model flag
-- [Continue](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md#5-continue-vs-code--jetbrains): config.json model entries
-- [Windsurf](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md#6-windsurf--openclaw): OpenAI provider base URL and key
-- [OpenClaw](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md#6-windsurf--openclaw): OpenAI provider base URL and key
+- [Claude Code](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md#1-claude-code-claude-code-cli): Anthropic CLI env vars (ANTHROPIC_BASE_URL) and --model flag
+- [OpenCode](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md#2-opencode): provider config block with baseURL
+- [Cline / Roo Code](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md#3-cline--roo-code-vs-code-extension): OpenAI-compatible provider setup, model IDs
+- [Cursor](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md#4-cursor): custom OpenAI base URL and API key
+- [Aider](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md#5-aider): terminal env vars and --model flag
+- [Continue](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md#6-continue-vs-code--jetbrains): config.json model entries
+- [Windsurf](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md#7-windsurf--openclaw): OpenAI provider base URL and key
+- [OpenClaw](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md#7-windsurf--openclaw): OpenAI provider base URL and key
 
 ## Optional
 
