@@ -494,7 +494,8 @@ export async function discoverReasoningModes(model, options = {}) {
                 // acceptance — verify each listed value with a tiny request so
                 // the advertised set is what THIS model actually accepts.
                 deps.logger(redact({ step: "probe", model, result: "listed_by_validation_error", status: first.status, listed: normalizeDiscoveredModes(listed) }));
-                return await probeCandidatesIndividually(model, {\n                    ...deps,
+                return await probeCandidatesIndividually(model, {
+                    ...deps,
                     candidates: normalizeDiscoveredModes(listed),
                     methodLabel: "validation_error+verified",
                     baseEvidence: message
@@ -525,7 +526,8 @@ function positiveIntEnv(raw, fallback) {
 let ttlMs = positiveIntEnv(process.env.GATEWAY_CAPABILITY_PROBE_TTL_MS, DEFAULT_TTL_MS);
 
 /** @type {{ cachePath: string | null | undefined, loaded: boolean, lastSweepAt: number }} */
-let state = {\n    // Resolved ONCE from env at import (the gateway child's env is fixed for
+let state = {
+    // Resolved ONCE from env at import (the gateway child's env is fixed for
     // its lifetime); resetCapabilityProbeState may override it for tests.
     cachePath: resolveCapabilityCachePath(),
     loaded: false,
@@ -775,7 +777,7 @@ export async function probeAndCacheReasoningModes(modelId, options = {}) {
  * enabled, and hard-disabled via GATEWAY_CAPABILITY_PROBE_DISABLE=1.
  *
  * @param {unknown} modelIds Model ids from the freshly served catalog.
- * @param {{
+ * @param {{\
  *   logger?: (outcome: object) => void,
  *   keyProvider?: () => string | null,
  *   requestImpl?: Function,
