@@ -1,0 +1,99 @@
+# NV-Gateway
+
+> Neural Proxy & Desktop HUD — a Windows desktop app and local AI gateway for NVIDIA NGC/NIM: 100+ models behind one OpenAI-compatible and Anthropic-compatible endpoint, with multi-key failover, DPAPI encryption at rest, and zero mandatory telemetry. Specification and integration parameters for AI models, agents, and LLM crawlers.
+
+**Overview**
+
+NV-Gateway is a local reverse proxy for NVIDIA NGC / NIM AI models running on Windows. It exposes OpenAI-compatible and Anthropic-compatible endpoints on `127.0.0.1:12004`, rotating across multiple API keys with automatic failover, DPAPI encryption at rest, and dynamic reasoning capability discovery.
+
+**Base URLs**
+- Gateway Endpoint: `http://127.0.0.1:12004/v1`
+- Admin API: `http://127.0.0.1:12005/admin`
+- Health / Readiness: `http://127.0.0.1:12004/health`, `http://127.0.0.1:12004/ready`
+
+**Supported Protocols & Endpoints**
+
+**1. OpenAI Chat Completions**
+- Route: `POST /v1/chat/completions`
+- Authentication: Optional `Authorization: Bearer <token>`
+- Supported features: Full streaming SSE (`stream: true`), function/tool calling, structured output, temperature, max_tokens.
+- Reasoning Parameters:
+  - `reasoning_effort`: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+  - `chat_template_kwargs`: `{"enable_thinking": true}`
+
+**2. Anthropic Messages API Facade**
+- Route: `POST /v1/messages`
+- Authentication: Optional `x-api-key: <token>` or `Authorization: Bearer <token>`
+- Protocol: Automatic bidirectional translation between Anthropic Messages schema and NVIDIA OpenAI backend, including tool calls and streaming SSE events.
+
+**3. Model Discovery & Metadata**
+- Route: `GET /v1/models`
+- Output: List of available NVIDIA NGC models enriched with:
+  - `context_length`: Maximum input context window (e.g. 131072 for GLM-4/5, 128000 for LLaMA 3.3).
+  - `max_completion_tokens`: Maximum generated token limit (e.g. 4096 to 16384).
+  - `capabilities`: Modalities and supported reasoning control levels.
+
+**Key Supported Model Families**
+- **Z-AI GLM**: `z-ai/glm-5.2`, `z-ai/glm-4-9b-chat` (Supports thinking/reasoning modes).
+- **Meta Llama**: `meta/llama-3.3-70b-instruct`, `meta/llama-3.1-405b-instruct`, `meta/llama-3.1-8b-instruct`.
+- **DeepSeek**: `deepseek-ai/deepseek-r1`, `deepseek-ai/deepseek-v3`.
+- **NVIDIA Nemotron**: `nvidia/nemotron-4-340b-instruct`, `nvidia/llama-3.1-nemotron-70b-instruct`.
+- **Qwen**: `qwen/qwen2.5-72b-instruct`, `qwen/qwen2.5-coder-32b-instruct`.
+- **Mistral**: `mistralai/mistral-large-2-instruct`, `mistralai/mixtral-8x22b-instruct`.
+
+**Client Configuration Reference**
+
+**OpenCode (`~/.config/opencode/opencode.json`)**
+```json
+{
+  "provider": {
+    "nvidia-gateway": {
+      "type": "openai-compatible",
+      "options": {
+        "baseURL": "http://127.0.0.1:12004/v1",
+        "apiKey": "local-nv-gateway"
+      }
+    }
+  }
+}
+```
+
+**Cline / Roo Code**
+- API Provider: `OpenAI Compatible`
+- Base URL: `http://127.0.0.1:12004/v1`
+- API Key: `local-nv-gateway`
+
+**Aider**
+- Environment: `OPENAI_API_BASE=http://127.0.0.1:12004/v1`, `OPENAI_API_KEY=local-nv-gateway`
+- Command: `aider --model openai/z-ai/glm-5.2`
+
+**Continue (`~/.continue/config.json`)**
+- Provider: `openai`
+- `apiBase`: `http://127.0.0.1:12004/v1`
+- `apiKey`: `local-nv-gateway`
+
+**Security & Privacy**
+- Runs exclusively on local loopback interface (`127.0.0.1`).
+- Key storage is encrypted with Windows DPAPI (`%APPDATA%\NV-Gateway\keys.json`).
+- Zero telemetry tracking. Log scrubbing automatically redacts keys, auth tokens, and sensitive query strings.
+
+## Docs
+
+- [README](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md): overview, install, integrations
+- [AGENTS.md](https://github.com/HaYkMnE/NV-Gateway/blob/main/AGENTS.md): operational constraints and architectural invariants for AI coding agents
+- [CONTRIBUTING.md](https://github.com/HaYkMnE/NV-Gateway/blob/main/CONTRIBUTING.md): development workflow, code style, and PR guidelines
+- [SECURITY.md](https://github.com/HaYkMnE/NV-Gateway/blob/main/SECURITY.md): security policy, threat model, and vulnerability reporting
+
+## Integrations
+
+- [OpenCode](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md#1-opencode): provider config block with baseURL
+- [Cline / Roo Code](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md#2-cline--roo-code-vs-code-extension): OpenAI-compatible provider setup, model IDs
+- [Cursor](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md#3-cursor): custom OpenAI base URL and API key
+- [Aider](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md#4-aider): terminal env vars and --model flag
+- [Continue](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md#5-continue-vs-code--jetbrains): config.json model entries
+- [Windsurf](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md#6-windsurf--openclaw): OpenAI provider base URL and key
+- [OpenClaw](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md#6-windsurf--openclaw): OpenAI provider base URL and key
+
+## Optional
+
+- [MIT License](https://github.com/HaYkMnE/NV-Gateway/blob/main/LICENSE): license terms

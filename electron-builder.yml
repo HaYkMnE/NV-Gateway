@@ -1,0 +1,60 @@
+appId: com.haykmne.nvgateway
+productName: NV-Gateway
+directories:
+  output: dist
+files:
+  - build/src/main/**/*
+  - build/src/test-support/**/*
+  - "!build/src/test-support/**/*"
+  - build/src/preload/**/*
+  - build/renderer/**/*
+  - package.json
+extraResources:
+  - from: src/gateway
+    to: gateway
+  - from: src/shared
+    to: shared
+  - from: build/assets
+    to: assets
+    filter:
+      - icon.png
+      - tray-*.svg
+      - tray-*-16.png
+      - tray-*-32.png
+win:
+  icon: build/assets/icon.png
+  target:
+    - nsis
+    - portable
+  forceCodeSigning: false
+  signAndEditExecutable: true
+nsis:
+  # Per-user install into %LOCALAPPDATA%\Programs\NV-Gateway. The installer GUID
+  # is derived from appId by electron-builder (not hardcoded here), so upgrades
+  # from the same appId reuse one install location.
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: false
+  createDesktopShortcut: true
+  shortcutName: NV-Gateway
+  runAfterFinish: true
+  deleteAppDataOnUninstall: false
+  # Explicit, stable artifact naming (product + version). The portable target
+  # naming is intentionally left at its default ("NV-Gateway <version>.exe").
+  artifactName: ${productName}-Setup-${version}.${ext}
+# GitHub Releases auto-update source: the PUBLIC source repository itself
+# (github.com/HaYkMnE/NV-Gateway) — Releases ship from the repo that holds the
+# code; there is no separate releases-showcase repository.
+# Both values are build-time env substitutions — electron-builder expands
+# ${env.NAME} when it resolves the publish config and the EXPANDED values are
+# baked into resources/app-update.yml, the file electron-updater reads at
+# runtime; this substitution is therefore NOT runtime-configurable.
+# NVGW_GH_OWNER is required at package time (scripts/run-electron-builder.mjs
+# fails fast when it is missing); NVGW_GH_REPO defaults to NV-Gateway
+# in the same wrapper. releaseType: release means only full stable releases are
+# served, never drafts/prereleases.
+publish:
+  - provider: github
+    owner: ${env.NVGW_GH_OWNER}
+    repo: ${env.NVGW_GH_REPO}
+    releaseType: release

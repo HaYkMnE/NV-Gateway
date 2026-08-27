@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "module": "CommonJS",
+    "moduleResolution": "node",
+    "allowSyntheticDefaultImports": true,
+    "outDir": "./build",
+    "skipLibCheck": true,
+    "target": "ES2022"
+  },
+  "include": ["vite.config.ts", "src/main/**/*", "src/preload/**/*", "src/test-support/**/*", "src/renderer/lib/frontend-behavior.ts"]
+}

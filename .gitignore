@@ -1,0 +1,32 @@
+# Runtime keys and user-specific state. DO NOT COMMIT.
+keys.json
+/config.json
+/config/config.json
+!/config/config.example.json
+telemetry-bundle.json
+runtime/
+logs/
+*.log
+*.jsonl
+node_modules/
+dist/
+build/out/
+.env
+.DS_Store
+.env*
+dist-electron/
+release/
+.wrangler/
+coverage/
+
+# A test must never create a literal "NUL" directory in the repo root
+# (Windows device-name hazard — keeps git status clean on Windows).
+NUL
+
+# TypeScript build bookkeeping and generated compiler/bundler output
+# (build/assets/ stays committed: it holds the checked-in icon sources/PNGs).
+*.tsbuildinfo
+build/vite.config.js
+build/vite.config.d.ts
+build/src/
+build/renderer/
