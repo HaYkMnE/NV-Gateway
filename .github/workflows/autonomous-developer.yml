@@ -1,0 +1,58 @@
+name: Autonomous Developer
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  develop:
+    runs-on: ubuntu-latest
+    if: ${{ vars.AUTONOMOUS_LOOP_ENABLED == 'true' && (github.event.issue.author_association == 'OWNER' || github.event.issue.author_association == 'MEMBER' || github.event.issue.author_association == 'COLLABORATOR') }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Guard — Reject Jules/ directory case violation
+        run: |
+          if [ -d "Jules" ] || find . -maxdepth 2 -type d -name "Jules" -not -path "./.git/*" | grep -q .; then
+            echo "::error::STRUCTURAL_DIRECTORY_ERROR: Found 'Jules/' directory instead of '.jules/'. Rename to lowercase '.jules/'."
+            exit 1
+          fi
+          echo "OK: No 'Jules/' directory case violations found."
+
+      - name: Guard — Reject committed review metadata
+        run: |
+          if find . -maxdepth 3 -type f \( -name "result.json" -o -name "*.verdict.json" \) -not -path "./.git/*" | grep -q .; then
+            echo "::error::COMMITTED-REVIEW-METADATA: Found committed review metadata files. These should not be in the repo."
+            exit 1
+          fi
+          echo "OK: No committed review metadata found."
+
+      - name: Check for duplicate open PRs
+        id: dup_check
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.JULES_GITHUB_PAT }}
+        run: |
+          ISSUE_NUM="${{ github.event.issue.number }}"
+
+          # Check if an open PR already references this issue.
+          # Hardened: (1) no `head -1` (avoids EPIPE/pipefail abort when >=2 match);
+          # (2) anchored `#N\b` so #4 does not match #40; (3) `2>/dev/null || echo ""`
+          # makes a transient gh failure fail-open (proceed; a real dup is caught later).
+          EXISTING=$(gh pr list --state open --json number,title,body \
+            --jq "[.[] | select(.body | test(\"#${ISSUE_NUM}\\\\b\"))] | .[0].number // empty" 2>/dev/null || echo "")
+          
+          if [ -n "$EXISTING" ]; then
+            echo "::warning::Duplicate PR detected: #${EXISTING} already references issue #${ISSUE_NUM}. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run Developer Agent
+        if: ${{ steps.dup_check.outputs.skip != 'true' }}
+        uses: google-labs-code/jules-action@v1.0.0
+        with:
+          prompt: 'Read .jules/roles/developer.md and act as the Developer. Read issue #${{ github.event.issue.number }}. CRITICAL: Do NOT create a directory named "Jules/" — use ".jules/" (lowercase, dot-prefixed) only. Do NOT commit review metadata files (result.json, *.verdict.json) to the repo. Write regression tests, implement the fix, and create a Pull Request with your changes. Do not merge it. Provide exact-SHA evidence.'
+          jules_api_key: ${{ secrets.JULES_DEVELOPER_API_KEY }}

@@ -1,0 +1,118 @@
+name: Autonomous Analysis
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */1 * * *'
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    if: ${{ vars.AUTONOMOUS_LOOP_ENABLED == 'true' }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Run Telemetry Collector
+        run: |
+          npm install tsx
+          npx tsx scripts/telemetry/collect-minimized-logs.ts
+
+      - name: Quota-Aware Autonomous Loop (Jules Analyst)
+        env:
+          GH_TOKEN: ${{ secrets.JULES_GITHUB_PAT }}
+          JULES_KEY: ${{ secrets.JULES_LOG_ANALYST_API_KEY }}
+          REPO_FULL: ${{ github.repository }}
+        run: |
+          set -u
+          TODAY=$(date -u +%Y-%m-%d)
+          STATE_FILE=".jules/state/quota-state.json"
+          mkdir -p .jules/state
+
+          # Daily Analyst target on Jules Pro subscription (100 calls/day).
+          DAILY_TARGET=100
+          # Per-run safety cap; the hourly cron resumes the loop across runs.
+          MAX_SESSIONS=50
+
+          # ---------------------------------------------------------------------------
+          # MODEL NOTE (Gemini 3.1 Pro):
+          #   As of March 2026, Jules Pro subscription uses Gemini 3.1 Pro as the
+          #   flagship model.
+          #   The Jules REST API (POST /v1alpha/sessions) does NOT accept a `model`
+          #   field in the request body — documented fields are only:
+          #     prompt, title, sourceContext, requirePlanApproval, automationMode.
+          #   Source: https://developers.google.com/jules/api/reference/rest/v1alpha/sessions
+          #           https://jules.google/docs/api/reference/sessions/
+          #   The google-labs-code/jules-invoke@v1.0.0 action likewise has no
+          #   `model` input (see action.yaml inputs: prompt, jules_api_key,
+          #   starting_branch, include_last_commit, include_commit_log).
+          #   Pro account defaults to Gemini 3.1 Pro per Jules Pro subscription:
+          #   https://blog.google/innovation-and-ai/models-and-research/google-labs/jules-now-available/
+          #   ("Jules now uses the advanced thinking capabilities of Gemini 3.1 Pro")
+          #   So every session implicitly runs on Gemini 3.1 Pro automatically without a payload flag.
+          # ---------------------------------------------------------------------------
+
+          # --- Load or initialize state ---
+          if [ -f "$STATE_FILE" ]; then
+            EXHAUSTED=$(jq -r '.exhausted_date // "null"' "$STATE_FILE" 2>/dev/null || echo "null")
+            SESSIONS_TODAY=$(jq -r '.sessions_today // 0' "$STATE_FILE" 2>/dev/null || echo "0")
+            echo "quota-state.json present. exhausted_date=$EXHAUSTED sessions_today=$SESSIONS_TODAY today=$TODAY"
+          else
+            EXHAUSTED="null"
+            SESSIONS_TODAY=0
+            echo "quota-state.json missing — first run. Proceeding."
+          fi
+
+          # If the recorded exhaustion date is strictly older than TODAY, the UTC
+          # date rolled over but the watchdog hasn't reset the file yet. Treat the
+          # counter as fresh to avoid carrying yesterday's count into today.
+          if [ "$EXHAUSTED" != "null" ] && [ "$EXHAUSTED" != "$TODAY" ]; then
+            echo "Stale exhausted_date ($EXHAUSTED < $TODAY) — resetting in-memory counter to 0 (watchdog will persist)."
+            EXHAUSTED="null"
+            SESSIONS_TODAY=0
+          fi
+
+          # --- Early exit if quota already exhausted today (UTC) ---
+          if [ "$EXHAUSTED" = "$TODAY" ]; then
+            echo "Daily Jules quota already exhausted for $TODAY (UTC). Skipping this run."
+            exit 0
+          fi
+
+          # --- Early exit if daily target already reached (100/UTC day) ---
+          if [ "$SESSIONS_TODAY" -ge "$DAILY_TARGET" ]; then
+            echo "Daily target ($DAILY_TARGET) already reached for $TODAY (UTC). Marking done for today."
+            jq -n --arg d "$TODAY" --argjson s "$SESSIONS_TODAY" \
+              '{exhausted_date: $d, sessions_today: $s}' > "$STATE_FILE"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add "$STATE_FILE"
+            git commit -m "chore(jules): daily target reached ${TODAY} (${SESSIONS_TODAY}/${DAILY_TARGET})" || true
+            git push || { echo "WARN: failed to push target-reached commit; next runs may retry."; }
+            exit 0
+          fi
+
+          # --- Build the Analyst prompt once (identical contract as before) ---
+          cat << 'EOF' > prompt.txt
+          Read .jules/roles/log-analyst.md and act as the Log Analyst.
+          STAGE 1 (FIRST PRIORITY): Read and analyze telemetry-bundle.json for errors (e.g. 500/502/504 timeouts, uncaught exceptions).
+          STAGE 2 (PROACTIVE SCAN): If logs are clean or empty, perform a deep codebase audit. Look for bugs, performance bottlenecks, non-optimal algorithms, architectural technical debt, and optimization opportunities.
+          Format your output strictly as a JSON handoff adhering to .jules/schemas/analyst-to-developer.schema.json.
+          EOF
+
+          REMAINING=$(( DAILY_TARGET - SESSIONS_TODAY ))
+          # Never exceed the per-run safety cap, nor the remaining daily budget.
+          if [ "$MAX_SESSIONS" -lt "$REMAINING" ]; then
+            RUN_CAP="$MAX_SESSIONS"
+          else
+            RUN_CAP="$REMAINING"
+          fi
+          echo "Starting autonomous loop: up to $RUN_CAP sessions this run (sessions_today=$SESSIONS_TODAY, daily_target=$DAILY_TARGET, max_per_run=$MAX_SESSIONS). Running on Gemini 3.1 Pro (Pro subscription default)."
+
+          # Local mutable counter for THIS run (start from the persisted value).
+          COUNT="$SESSIONS_TODAY"
+
+          commit_state() {\n            # Persist current {exhausted_date, sessions_today} to the state file.\n            # $1 = exhausted_date value (TODAY or \"null\"), $2 = sessions_today (int).\n            local EXH=\"$1\"; local ST=\"$2\"\n            git config user.name \"github-actions[bot]\"\n            git config user.email \"github-actions[bot]@users.noreply.github.com\"\n            git add \"$STATE_FILE\"\n            git commit -m \"chore(jules): update quota state (exhausted=$EXH, sessions_today=$ST)\" >/dev/null 2>&1 || true\n            git push >/dev/null 2>&1 || { echo \"WARN: failed to push quota-state commit; next runs may retry.\"; }\n          }\n\n          for i in $(seq 1 \"$RUN_CAP\"); do\n            echo \"----- Iteration $i / $RUN_CAP  (today count: $COUNT / $DAILY_TARGET) -----\"\n\n            # Build payload identical to the previous single-shot flow.\n            # NOTE: no `model` field — see MODEL NOTE above. Defaults to Gemini 3.1 Pro.\n            jq -n --arg jules_prompt \"$(cat prompt.txt)\" \\\n                  --arg starting_branch \"main\" \\\n                  --arg repo_full_name \"${REPO_FULL}\" \\\n                  '{\n                    prompt: $jules_prompt,\n                    sourceContext: {\n                      source: (\"sources/github/\" + $repo_full_name),\n                      githubRepoContext: { startingBranch: $starting_branch }\n                    },\n                    requirePlanApproval: true\n                  }' > payload.json\n\n            RESPONSE=$(curl -s --max-time 60 --retry 2 -w \"\\n%{http_code}\" -X POST \"https://jules.googleapis.com/v1alpha/sessions\" \\\n              -H \"Content-Type: application/json\" \\\n              -H \"X-Goog-Api-Key: ${JULES_KEY}\" \\\n              -d @payload.json)\n\n            HTTP_CODE=$(echo \"$RESPONSE\" | tail -1)\n            BODY=$(echo \"$RESPONSE\" | sed '$d')\n            echo \"Iteration $i: HTTP $HTTP_CODE\"\n            echo \"Body: $BODY\"\n\n            # --- Quota exhaustion detection (HTTP 429/403 or quota signals in body) ---\n            if [ \"$HTTP_CODE\" = \"429\" ] || [ \"$HTTP_CODE\" = \"403\" ] || \\\n               echo \"$BODY\" | grep -qiE \"RESOURCE_EXHAUSTED|quota|rateLimitExceeded|daily.*limit|RATE_LIMIT_EXCEEDED\"; then\n              echo \"Quota exhausted (HTTP $HTTP_CODE). Stopping loop and recording exhaustion date $TODAY (UTC, sessions_today=$COUNT).\"\n              jq -n --arg d \"$TODAY\" --argjson s \"$COUNT\" \\\n                '{exhausted_date: $d, sessions_today: $s}' > \"$STATE_FILE\"\n              commit_state \"$TODAY\" \"$COUNT\"\n              break\n            fi\n\n            # --- Session created successfully ---\n            SESSION_NAME=$(echo \"$BODY\" | jq -r '.name // empty' 2>/dev/null || echo \"\")\n            if [ -n \"$SESSION_NAME\" ]; then\n              COUNT=$(( COUNT + 1 ))\n              echo \"Session $SESSION_NAME created. Incremented sessions_today -> $COUNT / $DAILY_TARGET.\"\n              # Persist the incremented counter after every successful session, so a\n              # killed/cancelled run still leaves an honest persisted count.\n              jq -n --arg d \"null\" --argjson s \"$COUNT\" \\\n                '{exhausted_date: $d, sessions_today: $s}' > \"$STATE_FILE\"\n              commit_state \"null\" \"$COUNT\"\n\n              TITLE=\"[Analyst Task] $(date -u +'%Y-%m-%d %H:%M') #${COUNT} Log & Codebase Audit\"\n              BODY_ISSUE=\"Jules Session: $SESSION_NAME. Handoff payload pending in session. (sessions_today=$COUNT/$DAILY_TARGET)\"\n              gh issue create --title \"$TITLE\" --body \"$BODY_ISSUE\" --label \"enhancement\" \\\n                || echo \"WARN: gh issue create failed on iteration $i (continuing loop).\"\n\n              # Stop as soon as we hit the daily target for this UTC day.\n              if [ \"$COUNT\" -ge \"$DAILY_TARGET\" ]; then\n                echo \"Daily target reached ($COUNT/$DAILY_TARGET). Marking done for today ($TODAY UTC) and stopping loop.\"\n                jq -n --arg d \"$TODAY\" --argjson s \"$COUNT\" \\\n                  '{exhausted_date: $d, sessions_today: $s}' > \"$STATE_FILE\"\n                commit_state \"$TODAY\" \"$COUNT\"\n                break\n              fi\n            else\n              echo \"Iteration $i: empty session name (transient?). Body: $BODY. Continuing.\"\n            fi\n\n            # Throttle: concurrent cap is 15/account; we use 1 at a time, sleep 30s.\n            sleep 30\n          done\n\n          echo \"Autonomous loop finished for this run. Final sessions_today=$COUNT / $DAILY_TARGET.\"\n

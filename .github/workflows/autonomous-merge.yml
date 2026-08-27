@@ -1,0 +1,75 @@
+name: Autonomous Merge
+
+on:
+  workflow_run:
+    workflows: ["Autonomous Change"]
+    types: [completed]
+  schedule:
+    - cron: '*/30 * * * *'
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    environment: jules-publish
+    if: ${{ vars.AUTONOMOUS_LOOP_ENABLED == 'true' && vars.AUTONOMOUS_MERGE_ENABLED == 'true' }}
+    steps:
+      - name: Autonomous merge gate
+        env:
+          GH_TOKEN: ${{ secrets.JULES_GITHUB_PAT }}
+        run: |
+          set -u
+          echo "Auto-merge gate (UTC $(date -u +%FT%TZ))"
+          MAX_MERGES=5
+          MERGED=0
+          PRS=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --json number,headRefName,isCrossRepository \
+            --jq '[.[] | select(.headRefName | startswith("jules-")) | select(.isCrossRepository == false) | .number] | .[]')
+          for PR in $PRS; do
+            if [ "$MERGED" -ge "$MAX_MERGES" ]; then
+              echo "Per-run cap reached ($MAX_MERGES). Stop."
+              break
+            fi
+            echo "----- PR #$PR -----"
+            DATA=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" \
+              --json reviewDecision,mergeable,headRefName,headRefOid,headRepositoryOwner)
+            REVIEW=$(echo "$DATA" | jq -r '.reviewDecision')
+            MERGEABLE=$(echo "$DATA" | jq -r '.mergeable')
+            HEAD_REF=$(echo "$DATA" | jq -r '.headRefName')
+            HEAD_SHA=$(echo "$DATA" | jq -r '.headRefOid')
+            HEAD_OWNER=$(echo "$DATA" | jq -r '.headRepositoryOwner.login')
+            echo "review=$REVIEW mergeable=$MERGEABLE head=$HEAD_REF sha=$HEAD_SHA owner=$HEAD_OWNER"
+
+            case "$HEAD_REF" in jules-*) ;; *)
+              echo "SKIP: human-branch protection ($HEAD_REF)." ; continue ;; esac
+
+            # A fork can name its branch "jules-*" — never merge cross-repo heads.
+            if [ "$HEAD_OWNER" != "$GITHUB_REPOSITORY_OWNER" ]; then
+              echo "SKIP: cross-repository head ($HEAD_OWNER != $GITHUB_REPOSITORY_OWNER)." ; continue
+            fi
+
+            if [ "$REVIEW" != "APPROVED" ]; then
+              echo "SKIP: review=$REVIEW (need APPROVED)." ; continue
+            fi
+            if [ "$MERGEABLE" != "MERGEABLE" ]; then
+              echo "SKIP: mergeable=$MERGEABLE." ; continue
+            fi
+
+            CHECKS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/check-runs" \
+              --jq '.check_runs')
+            TOTAL=$(echo "$CHECKS" | jq 'length')
+            if [ "$TOTAL" -eq 0 ]; then echo "SKIP: no check runs on $HEAD_SHA." ; continue; fi
+            FAIL=$(echo "$CHECKS" | jq '[.[] | select(.conclusion != "success" and .conclusion != "neutral" and .conclusion != "skipped")] | length')
+            if [ "$FAIL" -gt 0 ]; then echo "SKIP: $FAIL failing/missing check run(s)." ; continue; fi
+
+            echo "PASS all gates. Squash-merging #$PR..."
+            if gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --squash --delete-branch; then
+              MERGED=$((MERGED + 1)); echo "MERGED #$PR."
+            else
+              echo "WARN: merge failed for #$PR (race/stale). Continue."
+            fi
+          done
+          echo "Done. Merged $MERGED PR(s)."

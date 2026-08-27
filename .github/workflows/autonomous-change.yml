@@ -1,0 +1,51 @@
+name: Autonomous Change
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+      # PLACEHOLDER-DEFAULT-BRANCH
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    if: ${{ vars.AUTONOMOUS_LOOP_ENABLED == 'true' }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Create Sandbox Dir
+        shell: pwsh
+        run: New-Item -ItemType Directory -Path "C:\OPENCODE-SANDBOX" -Force -ErrorAction SilentlyContinue
+
+      - name: Run Tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  bug-hunter-review:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: always() && vars.AUTONOMOUS_LOOP_ENABLED == 'true' && github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Bug Hunter Evaluation
+        uses: google-labs-code/jules-action@v1.0.0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          prompt: 'Read .jules/roles/bug-hunter.md and act as the Bug Hunter. Review PR #${{ github.event.pull_request.number }}. Read the CI test results. Enforce the 2 CLEAN passes rule. If the code is flawed or tests failed, use the GitHub CLI to leave a review requesting changes. If everything is perfect, approve the PR. Output a JSON verdict matching bug-hunter-verdict.schema.json.'
+          jules_api_key: ${{ secrets.JULES_BUG_HUNTER_API_KEY }}
