@@ -327,35 +327,4 @@ export async function handleAdminRequest(req, res, overrides = {}) {
                 // Timestamp advanced → the NGC fetch succeeded. Mirrors the
                 // existing success body ({ data: { size }, cached: false }) with
                 // the additive fetchedAt ISO (backwards-compatible).
-                return sendJson(res, 200, {
-                    data: { size: sizeAfter },
-                    cached: false,
-                    fetchedAt: fetchedAtAfter !== null ? new Date(fetchedAtAfter).toISOString() : null
-                });
-            }
-
-            // Timestamp UNCHANGED → NGC was unreachable (or threw during fetch);
-            // refreshCatalog returned the stale cache (or an empty Map on a cold
-            // start) WITHOUT poisoning the cache. Surfaces 503 so the operator
-            // sees the failure; clients still get size + the (stale) fetchedAt.
-            return sendJson(res, 503, {
-                error: 'Sync failed: NGC unreachable, stale cache served',
-                cached: true,
-                fetchedAt: fetchedAtBefore !== null ? new Date(fetchedAtBefore).toISOString() : null,
-                size: sizeBefore
-            });
-        } catch (err) {
-            // refreshCatalog is defensive (never throws a search-level error), so
-            // this branch is only reachable on a true unhandled runtime fault.
-            // Surface the actual error message for parity with /admin/models/refresh.
-            return sendJson(res, 500, { error: `Failed to sync catalog: ${err && err.message ? err.message : String(err)}` });
-        }
-    }
-
-    return sendJson(res, 404, { error: 'Not Found' });
-}
-
-function sanitizeAdminValidationResult(result) {
-    const safe = sanitizeValidationResult(result);
-    return redact(safe);
-}
+                return sendJson(res, 200, {\n                    data: { size: sizeAfter },\n                    cached: false,\n                    fetchedAt: fetchedAtAfter !== null ? new Date(fetchedAtAfter).toISOString() : null\n                });\n            }\n\n            // Timestamp UNCHANGED → NGC was unreachable (or threw during fetch);\n            // refreshCatalog returned the stale cache (or an empty Map on a cold\n            // start) WITHOUT poisoning the cache. Surfaces 503 so the operator\n            // sees the failure; clients still get size + the (stale) fetchedAt.\n            return sendJson(res, 503, {\n                error: 'Sync failed: NGC unreachable, stale cache served',\n                cached: true,\n                fetchedAt: fetchedAtBefore !== null ? new Date(fetchedAtBefore).toISOString() : null,\n                size: sizeBefore\n            });\n        } catch (err) {\n            // refreshCatalog is defensive (never throws a search-level error), so\n            // this branch is only reachable on a true unhandled runtime fault.\n            // Surface the actual error message for parity with /admin/models/refresh.\n            return sendJson(res, 500, { error: `Failed to sync catalog: ${err && err.message ? err.message : String(err)}` });\n        }\n    }\n\n    return sendJson(res, 404, { error: 'Not Found' });\n}\n\nfunction sanitizeAdminValidationResult(result) {\n    const safe = sanitizeValidationResult(result);\n    return redact(safe);\n}\n
