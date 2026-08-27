@@ -7,3 +7,4 @@ export async function verifyCleanPasses(passCount: number): Promise<boolean> {
   // TODO: Check against historical pass data
   return passCount >= 2;
 }
+

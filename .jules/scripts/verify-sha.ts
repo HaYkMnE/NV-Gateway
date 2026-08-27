@@ -7,3 +7,4 @@ export async function verifyExactSha(expectedSha: string, actualSha: string): Pr
   // TODO: Implement precise SHA verification
   return expectedSha === actualSha;
 }
+

@@ -1,4 +1,4 @@
-## Evidence Gate Policy
+﻿## Evidence Gate Policy
 
 To pass the evidence gate for an autonomous merge, the following must be verified against an exact HEAD SHA:
 

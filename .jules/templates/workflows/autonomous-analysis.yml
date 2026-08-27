@@ -33,7 +33,14 @@ jobs:
           jq -n --arg jules_prompt "$(cat prompt.txt)" \
                 --arg starting_branch "main" \
                 --arg repo_full_name "${{ github.repository }}" \
-                '{\n                  prompt: $jules_prompt,\n                  sourceContext: {\n                    source: ("sources/github/" + $repo_full_name),\n                    githubRepoContext: { startingBranch: $starting_branch }\n                  },\n                  requirePlanApproval: true\n                }' > payload.json
+                '{
+                  prompt: $jules_prompt,
+                  sourceContext: {
+                    source: ("sources/github/" + $repo_full_name),
+                    githubRepoContext: { startingBranch: $starting_branch }
+                  },
+                  requirePlanApproval: true
+                }' > payload.json
 
           RESPONSE=$(curl -s -X POST "https://jules.googleapis.com/v1alpha/sessions" \
             -H "Content-Type: application/json" \
@@ -52,3 +59,4 @@ jobs:
             echo "Failed to create Jules session: $RESPONSE"
             exit 1
           fi
+
