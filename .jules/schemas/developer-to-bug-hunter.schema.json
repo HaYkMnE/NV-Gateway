@@ -1,0 +1,10 @@
+{
+  "schema_version": "1",
+  "base_commit_sha": "0ce8042131c44238ec6d9cdc4ef215b6a33ac57e",
+  "head_commit_sha": "PLACEHOLDER-40-HEX-SHA",
+  "finding_id": "PLACEHOLDER-FINDING-ID",
+  "changed_paths": ["PLACEHOLDER-REPOSITORY-PATH"],
+  "commands": ["npm test", "npm run build"],
+  "evidence_refs": ["PLACEHOLDER-CI-ARTIFACT-REF"],
+  "known_tradeoffs": ["PLACEHOLDER-TRADEOFF"]
+}

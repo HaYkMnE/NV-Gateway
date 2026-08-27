@@ -1,0 +1,16 @@
+{
+  "schema_version": "1",
+  "reviewed_commit_sha": "PLACEHOLDER-40-HEX-SHA",
+  "pass_number": 1,
+  "tree_unchanged_since_previous_pass": false,
+  "verdict": "CORRECTION_REQUIRED",
+  "findings": [
+    {
+      "id": "PLACEHOLDER-BUG-ID",
+      "severity": "PLACEHOLDER-SEVERITY",
+      "path": "PLACEHOLDER-REPOSITORY-PATH",
+      "evidence_ref": "PLACEHOLDER-EVIDENCE-REF",
+      "required_test": "PLACEHOLDER-REGRESSION-TEST"
+    }
+  ]
+}

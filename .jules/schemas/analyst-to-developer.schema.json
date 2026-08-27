@@ -1,0 +1,10 @@
+{
+  "schema_version": "1",
+  "source_commit_sha": "0ce8042131c44238ec6d9cdc4ef215b6a33ac57e",
+  "telemetry_opt_in": true,
+  "finding_id": "PLACEHOLDER-FINDING-ID",
+  "symptom": "PLACEHOLDER-SANITIZED-SYMPTOM",
+  "evidence_refs": ["PLACEHOLDER-EVIDENCE-REF"],
+  "constraints": ["NO_SECRET_DATA"],
+  "acceptance_tests": ["PLACEHOLDER-VERIFIABLE-TEST"]
+}

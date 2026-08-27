@@ -1,0 +1,19 @@
+name: Autonomous Developer
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  develop:
+    runs-on: ubuntu-latest
+    if: ${{ vars.AUTONOMOUS_LOOP_ENABLED == 'true' && (github.event.issue.author_association == 'OWNER' || github.event.issue.author_association == 'MEMBER' || github.event.issue.author_association == 'COLLABORATOR') }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Run Developer Agent
+        uses: google-labs-code/jules-action@v1.0.0
+        with:
+          prompt: 'Read .jules/roles/developer.md and act as the Developer. Read issue #${{ github.event.issue.number }}. Act as the Developer. Write regression tests, implement the fix, and create a Pull Request with your changes. Do not merge it. Provide exact-SHA evidence.'
+          jules_api_key: ${{ secrets.JULES_DEVELOPER_API_KEY }}

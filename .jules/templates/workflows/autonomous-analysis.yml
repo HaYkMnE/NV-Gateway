@@ -1,0 +1,54 @@
+name: Autonomous Analysis
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    if: ${{ vars.AUTONOMOUS_LOOP_ENABLED == 'true' }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Run Telemetry Collector
+        run: |
+          npm install tsx
+          npx tsx scripts/telemetry/collect-minimized-logs.ts
+
+      - name: Invoke Jules Analyst (Report Only)
+        env:
+          GH_TOKEN: ${{ secrets.JULES_GITHUB_PAT }}
+          JULES_KEY: ${{ secrets.JULES_LOG_ANALYST_API_KEY }}
+        run: |
+          cat << 'EOF' > prompt.txt
+          Read .jules/roles/log-analyst.md and act as the Log Analyst.
+          Analyze telemetry-bundle.json in the repository root for errors (e.g. 502/504 timeouts).
+          If clean, explore the codebase for technical debt and performance optimizations.
+          Format your output strictly as a JSON handoff adhering to .jules/schemas/analyst-to-developer.schema.json.
+          EOF
+
+          jq -n --arg jules_prompt "$(cat prompt.txt)" \
+                --arg starting_branch "main" \
+                --arg repo_full_name "${{ github.repository }}" \
+                '{\n                  prompt: $jules_prompt,\n                  sourceContext: {\n                    source: ("sources/github/" + $repo_full_name),\n                    githubRepoContext: { startingBranch: $starting_branch }\n                  },\n                  requirePlanApproval: true\n                }' > payload.json
+
+          RESPONSE=$(curl -s -X POST "https://jules.googleapis.com/v1alpha/sessions" \
+            -H "Content-Type: application/json" \
+            -H "X-Goog-Api-Key: ${JULES_KEY}" \
+            -d @payload.json)
+
+          echo "Jules Response: $RESPONSE"
+          SESSION_NAME=$(echo "$RESPONSE" | jq -r '.name // empty')
+
+          if [ -n "$SESSION_NAME" ]; then
+            gh issue create \
+              --title "[Analyst Task] $(date +'%Y-%m-%d %H:%M') Log & Codebase Audit" \
+              --body "Jules Session Created: $SESSION_NAME. Handoff payload pending in session." \
+              --label "enhancement"
+          else
+            echo "Failed to create Jules session: $RESPONSE"
+            exit 1
+          fi
