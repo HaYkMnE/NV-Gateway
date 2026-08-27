@@ -233,4 +233,129 @@ export async function handleAdminRequest(req, res, overrides = {}) {
             const catalogMeta = await getAllModelMetadata();
             const data = models
                 .filter((m) => m && typeof m === 'object' && !Array.isArray(m) && typeof m.id === 'string')
-                .map((m) => {\n                    const limits = getModelLimits(m.id);\n                    const meta = catalogMeta && typeof catalogMeta.get === 'function'\n                        ? catalogMeta.get(m.id)\n                        : catalogMeta?.[m.id];\n                    const labels = meta && Array.isArray(meta.labels) ? meta.labels : [];\n                    // Parity with GET /v1/models (server.mjs): static family\n                    // capabilities, then the LIVE-probed reasoning override when a\n                    // cached probe result exists for this exact model id.\n                    const capabilities = getCapabilityMetadata(m.id);\n                    mergeProbedReasoning(capabilities, m.id);\n                    return {\n                        id: m.id,\n                        context_length: limits.context,\n                        max_completion_tokens: limits.output,\n                        capabilities,\n                        enabled: !disabledIds.has(m.id.toLowerCase()),\n                        // Phase 5 enrichment (all optional, backwards-compatible):\n                        // The 5 fields above are unchanged; the 10 below are ADDITIVE.\n                        provider: meta?.publisher ?? null,\n                        publisher: meta?.publisher ?? null,\n                        shortDescription: meta?.shortDescription ?? '',\n                        category: labels.length > 0 ? labels[0] : null,\n                        labels,\n                        popularity: meta && typeof meta.popularity === 'number' ? meta.popularity : 0,\n                        lastUpdated: meta?.lastUpdated ?? null,\n                        logoUrl: meta?.logoUrl ?? null,\n                        downloadable: meta?.downloadable === true,\n                        freeEndpoint: meta?.freeEndpoint === true\n                    };\n                });\n            return sendJson(res, 200, { data });\n        } catch (err) {\n            return sendJson(res, 500, { error: 'Failed to retrieve models catalog' });\n        }\n    }\n\n    // POST /admin/models/refresh — admin-only manual re-discovery trigger,\n    // mirrored from the main-port POST /v1/models/refresh (server.mjs:1201).\n    // Exposed on the ADMIN port so the main process can reach it over the\n    // admin channel (port+1 + admin token) without a gateway module import —\n    // the main process talks to the gateway via HTTP on the admin port ONLY\n    // (the admin server (server.mjs:1414) only forwards /admin/* requests, so\n    // /v1/models/refresh is unreachable from port+1). Returns the freshly\n    // fetched RAW upstream catalog ({ data, cached: false }); the main process\n    // re-fetches GET /admin/models for the enriched + `enabled` view it maps\n    // to ModelConfig. NOTE: refreshModels() re-fetches NVIDIA (up to 30s\n    // upstream); the admin-client (admin-client.ts) caps the socket at 5s, so\n    // a slow upstream surfaces here as a timeout (handled by the caller).\n    if (req.method === \"POST\" && req.url === '/admin/models/refresh') {\n        try {\n            const all = await refreshModels();\n            return sendJson(res, 200, { data: all, cached: false });\n        } catch (err) {\n            return sendJson(res, 500, { error: 'Failed to refresh models' });\n        }\n    }\n\n    // POST /admin/catalog/sync — admin-only manual NGC catalog re-sync trigger\n    // (bypasses the 24h TTL of getAllModelMetadata). Powers the future \"Sync\n    // Catalog\" button in the V2 Models panel. refreshCatalog is defensive (never\n    // throws a search-level error), so the catch branch below is essentially\n    // unreachable in practice; it is kept as a belt-and-suspenders guard for\n    // parity with /admin/models/refresh above (500 + the actual error in body).\n    //\n    // FAILURE-SURFACING CONTRACT (Phase 5 backend review, MAJOR #1): a sync that\n    // fails to ADVANCE the cache MUST surface a 5xx — returning 200 when NGC is\n    // unreachable would be a lie. We snapshot getCatalogCacheInfo() BEFORE and\n    // AFTER refreshCatalog() and compare fetchedAt:\n    //   * ADVANCED (null → now, OR stale-t1 → fresh-t2) → 200 with the existing\n    //     success body shape ({ data: { size } }, cached: false) plus a human-\n    //     readable fetchedAt ISO so the UI can show \"last synced at …\".\n    //   * UNCHANGED (null === null on a COLD-START failure, OR stale-t1 ===\n    //     stale-t1 when refreshCatalog caught the search-level throw and returned\n    //     the stale cache defensively — see nvidia-catalog-sync.mjs:339-346) →\n    //     503 Service Unavailable. We still mirror size + cached:true in the body\n    //     so clients can degrade gracefully (the cached catalog is still available\n    //     for `/admin/models` reads; only the SYNC failed).\n    if (req.method === \"POST\" && req.url === '/admin/catalog/sync') {\n        try {\n            const before = getCatalogCacheInfo();\n            const fetchedAtBefore = before.fetchedAt;\n            const sizeBefore = before.size;\n\n            await refreshCatalog();\n\n            const after = getCatalogCacheInfo();\n            const fetchedAtAfter = after.fetchedAt;\n            const sizeAfter = after.size;\n\n            if (fetchedAtBefore !== fetchedAtAfter) {\n                // Timestamp advanced → the NGC fetch succeeded. Mirrors the\n                // existing success body ({ data: { size }, cached: false }) with\n                // the additive fetchedAt ISO (backwards-compatible).\n                return sendJson(res, 200, {\n                    data: { size: sizeAfter },\n                    cached: false,\n                    fetchedAt: fetchedAtAfter !== null ? new Date(fetchedAtAfter).toISOString() : null\n                });\n            }\n\n            // Timestamp UNCHANGED → NGC was unreachable (or threw during fetch);\n            // refreshCatalog returned the stale cache (or an empty Map on a cold\n            // start) WITHOUT poisoning the cache. Surfaces 503 so the operator\n            // sees the failure; clients still get size + the (stale) fetchedAt.\n            return sendJson(res, 503, {\n                error: 'Sync failed: NGC unreachable, stale cache served',\n                cached: true,\n                fetchedAt: fetchedAtBefore !== null ? new Date(fetchedAtBefore).toISOString() : null,\n                size: sizeBefore\n            });\n        } catch (err) {\n            // refreshCatalog is defensive (never throws a search-level error), so\n            // this branch is only reachable on a true unhandled runtime fault.\n            // Surface the actual error message for parity with /admin/models/refresh.\n            return sendJson(res, 500, { error: `Failed to sync catalog: ${err && err.message ? err.message : String(err)}` });\n        }\n    }\n\n    return sendJson(res, 404, { error: 'Not Found' });\n}\n\nfunction sanitizeAdminValidationResult(result) {\n    const safe = sanitizeValidationResult(result);\n    return redact(safe);\n}\n
+                .map((m) => {
+                    const limits = getModelLimits(m.id);
+                    const meta = catalogMeta && typeof catalogMeta.get === 'function'
+                        ? catalogMeta.get(m.id)
+                        : catalogMeta?.[m.id];
+                    const labels = meta && Array.isArray(meta.labels) ? meta.labels : [];
+                    // Parity with GET /v1/models (server.mjs): static family
+                    // capabilities, then the LIVE-probed reasoning override when a
+                    // cached probe result exists for this exact model id.
+                    const capabilities = getCapabilityMetadata(m.id);
+                    mergeProbedReasoning(capabilities, m.id);
+                    return {
+                        id: m.id,
+                        context_length: limits.context,
+                        max_completion_tokens: limits.output,
+                        capabilities,
+                        enabled: !disabledIds.has(m.id.toLowerCase()),
+                        // Phase 5 enrichment (all optional, backwards-compatible):
+                        // The 5 fields above are unchanged; the 10 below are ADDITIVE.
+                        provider: meta?.publisher ?? null,
+                        publisher: meta?.publisher ?? null,
+                        shortDescription: meta?.shortDescription ?? '',
+                        category: labels.length > 0 ? labels[0] : null,
+                        labels,
+                        popularity: meta && typeof meta.popularity === 'number' ? meta.popularity : 0,
+                        lastUpdated: meta?.lastUpdated ?? null,
+                        logoUrl: meta?.logoUrl ?? null,
+                        downloadable: meta?.downloadable === true,
+                        freeEndpoint: meta?.freeEndpoint === true
+                    };
+                });
+            return sendJson(res, 200, { data });
+        } catch (err) {
+            return sendJson(res, 500, { error: 'Failed to retrieve models catalog' });
+        }
+    }
+
+    // POST /admin/models/refresh — admin-only manual re-discovery trigger,
+    // mirrored from the main-port POST /v1/models/refresh (server.mjs:1201).
+    // Exposed on the ADMIN port so the main process can reach it over the
+    // admin channel (port+1 + admin token) without a gateway module import —
+    // the main process talks to the gateway via HTTP on the admin port ONLY
+    // (the admin server (server.mjs:1414) only forwards /admin/* requests, so
+    // /v1/models/refresh is unreachable from port+1). Returns the freshly
+    // fetched RAW upstream catalog ({ data, cached: false }); the main process
+    // re-fetches GET /admin/models for the enriched + `enabled` view it maps
+    // to ModelConfig. NOTE: refreshModels() re-fetches NVIDIA (up to 30s
+    // upstream); the admin-client (admin-client.ts) caps the socket at 5s, so
+    // a slow upstream surfaces here as a timeout (handled by the caller).
+    if (req.method === "POST" && req.url === '/admin/models/refresh') {
+        try {
+            const all = await refreshModels();
+            return sendJson(res, 200, { data: all, cached: false });
+        } catch (err) {
+            return sendJson(res, 500, { error: 'Failed to refresh models' });
+        }
+    }
+
+    // POST /admin/catalog/sync — admin-only manual NGC catalog re-sync trigger
+    // (bypasses the 24h TTL of getAllModelMetadata). Powers the future "Sync
+    // Catalog" button in the V2 Models panel. refreshCatalog is defensive (never
+    // throws a search-level error), so the catch branch below is essentially
+    // unreachable in practice; it is kept as a belt-and-suspenders guard for
+    // parity with /admin/models/refresh above (500 + the actual error in body).
+    //
+    // FAILURE-SURFACING CONTRACT (Phase 5 backend review, MAJOR #1): a sync that
+    // fails to ADVANCE the cache MUST surface a 5xx — returning 200 when NGC is
+    // unreachable would be a lie. We snapshot getCatalogCacheInfo() BEFORE and
+    // AFTER refreshCatalog() and compare fetchedAt:
+    //   * ADVANCED (null → now, OR stale-t1 → fresh-t2) → 200 with the existing
+    //     success body shape ({ data: { size } }, cached: false) plus a human-
+    //     readable fetchedAt ISO so the UI can show "last synced at …".
+    //   * UNCHANGED (null === null on a COLD-START failure, OR stale-t1 ===
+    //     stale-t1 when refreshCatalog caught the search-level throw and returned
+    //     the stale cache defensively — see nvidia-catalog-sync.mjs:339-346) →
+    //     503 Service Unavailable. We still mirror size + cached:true in the body
+    //     so clients can degrade gracefully (the cached catalog is still available
+    //     for `/admin/models` reads; only the SYNC failed).
+    if (req.method === "POST" && req.url === '/admin/catalog/sync') {
+        try {
+            const before = getCatalogCacheInfo();
+            const fetchedAtBefore = before.fetchedAt;
+            const sizeBefore = before.size;
+
+            await refreshCatalog();
+
+            const after = getCatalogCacheInfo();
+            const fetchedAtAfter = after.fetchedAt;
+            const sizeAfter = after.size;
+
+            if (fetchedAtBefore !== fetchedAtAfter) {
+                // Timestamp advanced → the NGC fetch succeeded. Mirrors the
+                // existing success body ({ data: { size }, cached: false }) with
+                // the additive fetchedAt ISO (backwards-compatible).
+                return sendJson(res, 200, {
+                    data: { size: sizeAfter },
+                    cached: false,
+                    fetchedAt: fetchedAtAfter !== null ? new Date(fetchedAtAfter).toISOString() : null
+                });
+            }
+
+            // Timestamp UNCHANGED → NGC was unreachable (or threw during fetch);
+            // refreshCatalog returned the stale cache (or an empty Map on a cold
+            // start) WITHOUT poisoning the cache. Surfaces 503 so the operator
+            // sees the failure; clients still get size + the (stale) fetchedAt.
+            return sendJson(res, 503, {
+                error: 'Sync failed: NGC unreachable, stale cache served',
+                cached: true,
+                fetchedAt: fetchedAtBefore !== null ? new Date(fetchedAtBefore).toISOString() : null,
+                size: sizeBefore
+            });
+        } catch (err) {
+            // refreshCatalog is defensive (never throws a search-level error), so
+            // this branch is only reachable on a true unhandled runtime fault.
+            // Surface the actual error message for parity with /admin/models/refresh.
+            return sendJson(res, 500, { error: `Failed to sync catalog: ${err && err.message ? err.message : String(err)}` });
+        }
+    }
+
+    return sendJson(res, 404, { error: 'Not Found' });
+}
+
+function sanitizeAdminValidationResult(result) {
+    const safe = sanitizeValidationResult(result);
+    return redact(safe);
+}
