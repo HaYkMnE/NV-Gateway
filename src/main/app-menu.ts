@@ -280,7 +280,7 @@ export const MENU_STRINGS: Record<AppLanguage, MenuTranslation> = {
     zoom: "تكبير",
     bring_all_to_front: "إحضار الكل للمقدمة",
     help: "مساعدة",
-    check_updates: "التحقق من وجود تحديثات…",
+    check_updates: "التحقق من وجود تحديثات…" ,
     send_feedback: "إرسال ملاحظات…",
     about: "حول NVIDIA Gateway",
     show_app: "إظهار التطبيق",

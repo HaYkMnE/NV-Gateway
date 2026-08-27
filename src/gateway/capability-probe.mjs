@@ -453,4 +453,276 @@ async function probeCandidatesIndividually(model, deps) {
  * Discover the reasoning modes a specific model actually accepts.
  *
  * @param {string} model Full model ID (e.g. "stepfun-ai/step-3.7-flash").
- * @param {{\n *   apiKey?: string,\n *   candidates?: string[],\n *   timeoutMs?: number,\n *   requestImpl?: (args: { apiKey: string, body: string, timeoutMs: number }) => Promise<{status: number, text: string, parsed: *}>,\n *   logger?: (outcome: object) => void,\n *   now?: () => number\n * }} [options]\n * @returns {Promise<null | object>} Cache entry, or null when inconclusive\n *   (caller must fall back to the static capability registry).\n */\nexport async function discoverReasoningModes(model, options = {}) {\n    if (typeof model !== \"string\" || model.trim().length === 0) return null;\n    const apiKey = typeof options.apiKey === \"string\" ? options.apiKey : \"\";\n    if (!apiKey) return null;\n    const deps = {\n        apiKey,\n        candidates: Array.isArray(options.candidates) && options.candidates.length > 0 ? options.candidates : PROBE_CANDIDATES,\n        timeoutMs: Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? options.timeoutMs : DEFAULT_PROBE_TIMEOUT_MS,\n        requestImpl: typeof options.requestImpl === \"function\" ? options.requestImpl : httpsJsonPost,\n        logger: typeof options.logger === \"function\" ? options.logger : () => {},\n        now: typeof options.now === \"function\" ? options.now : Date.now\n    };\n    try {\n        // FAST PATH — one request with the sentinel value; a 400 usually lists\n        // the allowed reasoning_effort values right in the error message.\n        const first = await deps.requestImpl({ apiKey, body: buildProbeBody(model, PROBE_SENTINEL), timeoutMs: deps.timeoutMs });\n        if (first.status >= 200 && first.status < 300) {\n            // Field accepted unvalidated → cannot enumerate from an error.\n            // Detect implicit reasoning support, then enumerate via candidates.\n            const entry = await probeCandidatesIndividually(model, deps);\n            return entry;\n        }\n        if (first.status === 400 || first.status === 422) {\n            const message = extractErrorMessage(first);\n            const listed = parseAllowedValuesFromError(message, { sentinels: [PROBE_SENTINEL] });\n            if (listed.length > 0) {\n                // The listing reflects the ENDPOINT enum union, not per-model\n                // acceptance — verify each listed value with a tiny request so\n                // the advertised set is what THIS model actually accepts.\n                deps.logger(redact({ step: \"probe\", model, result: \"listed_by_validation_error\", status: first.status, listed: normalizeDiscoveredModes(listed) }));\n                return await probeCandidatesIndividually(model, {\n                    ...deps,\n                    candidates: normalizeDiscoveredModes(listed),\n                    methodLabel: \"validation_error+verified\",\n                    baseEvidence: message\n                });\n            }\n            deps.logger(redact({ step: \"probe\", model, result: \"unparseable_validation_error\", status: first.status }));\n            return await probeCandidatesIndividually(model, deps);\n        }\n        // 401/403/429/5xx/… — inconclusive; static registry remains authoritative.\n        deps.logger(redact({ step: \"probe\", model, result: \"inconclusive_status\", status: first.status }));\n        return null;\n    } catch (err) {\n        deps.logger(redact({ step: \"probe\", model, result: \"failed\", error: String(err?.message || err) }));\n        return null;\n    }\n}\n\n// ---------------------------------------------------------------------------\n// Gateway-state cache (TTL + persistence + concurrency guard)\n// ---------------------------------------------------------------------------\n\nfunction positiveIntEnv(raw, fallback) {\n    const n = Number.parseInt(String(raw ?? \"\"), 10);\n    return Number.isSafeInteger(n) && n > 0 ? n : fallback;\n}\n\n/** Mutable so tests can shorten the window via resetCapabilityProbeState(). */\nlet ttlMs = positiveIntEnv(process.env.GATEWAY_CAPABILITY_PROBE_TTL_MS, DEFAULT_TTL_MS);\n\n/** @type {{ cachePath: string | null | undefined, loaded: boolean, lastSweepAt: number }} */\nlet state = {\n    // Resolved ONCE from env at import (the gateway child's env is fixed for\n    // its lifetime); resetCapabilityProbeState may override it for tests.\n    cachePath: resolveCapabilityCachePath(),\n    loaded: false,\n    lastSweepAt: 0\n};\n\n/** @type {Map<string, object>} model id -> cached entry */\nconst capabilityCache = new Map();\n\n/** @type {Map<string, Promise<object | null>>} model id -> in-flight probe */\nconst inFlightProbes = new Map();\n\n/**\n * Resolve where the persistent cache lives. Preference order:\n *   GATEWAY_CAPABILITY_CACHE_PATH → dirname(GATEWAY_CONFIG_PATH) → parent of\n *   dirname(GATEWAY_LOG_PATH) (logs dir is <userData>/logs, so its parent is\n *   the same APPDATA userData dir that already holds config.json/keys.json).\n * Returns null when nothing is known → memory-only caching.\n * @param {NodeJS.ProcessEnv} [env]\n * @returns {string | null}\n */\nexport function resolveCapabilityCachePath(env = process.env) {\n    if (typeof env.GATEWAY_CAPABILITY_CACHE_PATH === \"string\" && env.GATEWAY_CAPABILITY_CACHE_PATH.trim()) {\n        return env.GATEWAY_CAPABILITY_CACHE_PATH;\n    }\n    if (typeof env.GATEWAY_CONFIG_PATH === \"string\" && env.GATEWAY_CONFIG_PATH.trim()) {\n        return path.join(path.dirname(env.GATEWAY_CONFIG_PATH), CACHE_FILENAME);\n    }\n    if (typeof env.GATEWAY_LOG_PATH === \"string\" && env.GATEWAY_LOG_PATH.trim()) {\n        return path.join(path.dirname(path.dirname(env.GATEWAY_LOG_PATH)), CACHE_FILENAME);\n    }\n    return null;\n}\n\nfunction isValidEntry(value) {\n    return Boolean(\n        value && typeof value === \"object\" && !Array.isArray(value)\n        && Array.isArray(value.modes)\n        && value.modes.every((m) => typeof m === \"string\")\n        && Number.isFinite(value.probedAt)\n        && (value.source === \"probed\" || value.source === \"fallback\")\n    );\n}\n\nfunction ensureCacheLoaded() {\n    if (state.loaded) return;\n    state.loaded = true;\n    if (!state.cachePath) return;\n    let raw;\n    try {\n        raw = fs.readFileSync(state.cachePath, \"utf8\");\n    } catch {\n        return; // absent / unreadable — start empty\n    }\n    try {\n        const parsed = JSON.parse(raw.replace(/^\\uFEFF/, \"\"));\n        // CACHE_FORMAT_VERSION 2 adds per-mode verification evidence + hysteresis\n        // stamps; v1 payloads are migrated verbatim (their entries keep serving\n        // until the next refresh). Unknown FUTURE versions are ignored rather\n        // than misread.\n        if (!parsed || typeof parsed !== \"object\"\n            || (parsed.version !== 1 && parsed.version !== CACHE_FORMAT_VERSION)) return;\n        const entries = parsed && typeof parsed === \"object\" ? parsed.entries : null;\n        if (entries && typeof entries === \"object\") {\n            for (const [model, entry] of Object.entries(entries)) {\n                if (typeof model === \"string\" && isValidEntry(entry)) {\n                    capabilityCache.set(model, entry);\n                }\n            }\n        }\n    } catch {\n        // Corrupt cache file — ignore it; probes will repopulate.\n    }\n}\n\nfunction persistCache() {\n    if (!state.cachePath) return;\n    const payload = {\n        version: CACHE_FORMAT_VERSION,\n        savedAt: new Date().toISOString(),\n        entries: Object.fromEntries(capabilityCache)\n    };\n    const tmpPath = `${state.cachePath}.tmp`;\n    try {\n        fs.mkdirSync(path.dirname(state.cachePath), { recursive: true });\n        fs.writeFileSync(tmpPath, JSON.stringify(payload, null, 2), \"utf8\");\n        fs.renameSync(tmpPath, state.cachePath);\n    } catch {\n        // Persistence is best-effort; the in-memory cache keeps working.\n    }\n}\n\nfunction cloneEntry(entry) {\n    return structuredClone(entry);\n}\n\n/**\n * Get the cached probed capability for a model (fresh OR stale — stale data is\n * still better advertising material than a static family guess; freshness only\n * drives background refresh).\n * @param {unknown} modelId\n * @returns {object | null} Deep clone of the entry, or null.\n */\nexport function getCachedReasoningCapability(modelId) {\n    ensureCacheLoaded();\n    if (typeof modelId !== \"string\" || modelId.length === 0) return null;\n    const entry = capabilityCache.get(modelId);\n    return entry ? cloneEntry(entry) : null;\n}\n\n/**\n * True when a cached entry exists and is inside the TTL window.\n * Exported for tests.\n */\nexport function isEntryFresh(entry, nowMs = Date.now()) {\n    return Boolean(entry && Number.isFinite(entry.probedAt) && (nowMs - entry.probedAt) < ttlMs);\n}\n\n/**\n * HYSTERESIS (stability-audit fix #3): dropping a PREVIOUSLY-verified mode\n * requires TWO consecutive adverse probes. The first probe that fails to see\n * a previously-listed mode stamps it into the cache entry's `rejectedOnce`\n * map and KEEPS it advertised for one more cycle; only a second consecutive\n * absence removes it. Any fresh acceptance clears the stamp immediately.\n *\n * Applies only when the previous entry came from a real probe\n * (source === 'probed'); static-fallback guesses get no grace period.\n *\n * The per-mode verification evidence from the fresh probe is preserved so the\n * advertised entry always shows WHY a mode is currently held or dropped.\n *\n * @param {object | null} existing Previously cached entry (may be stale).\n * @param {object} fresh Entry produced by discoverReasoningModes.\n * @param {number} nowMs Current clock for rejectedOnce stamps.\n * @returns {object} The entry to cache (fresh as-is, or reconciled).\n */\nfunction reconcileWithPrevious(existing, fresh, nowMs) {\n    if (!existing || existing.source !== \"probed\" || !Array.isArray(existing.modes)) return fresh;\n    const previousModes = existing.modes.filter((m) => typeof m === \"string\");\n    if (previousModes.length === 0) return fresh;\n\n    const verification = { ...(fresh.verification ?? {}) };\n    const rejectedOnce = { ...(existing.rejectedOnce ?? {}) };\n    const graceKept = [];\n    let changed = false;\n    for (const mode of previousModes) {\n        if (fresh.modes.includes(mode)) {\n            // Still verified — any outstanding stamp is cleared by acceptance.\n            if (Object.prototype.hasOwnProperty.call(rejectedOnce, mode)) {\n                delete rejectedOnce[mode];\n                changed = true;\n            }\n            continue;\n        }\n        if (Object.prototype.hasOwnProperty.call(rejectedOnce, mode)) {\n            // SECOND consecutive absence → drop for good this time.\n            delete rejectedOnce[mode];\n            changed = true;\n            continue;\n        }\n        // FIRST absence → one-cycle grace: keep advertising, stamp, annotate.\n        const verdict = verification[mode];\n        rejectedOnce[mode] = nowMs;\n        graceKept.push(mode);\n        verification[mode] = {\n            ...(verdict ?? {}),\n            result: verdict?.result ?? \"rejected\",\n            heldByHysteresis: true,\n            ...(verdict?.evidence ? {} : { evidence: \"mode absent from fresh probe; held by hysteresis\" }),\n            checkedAt: Number.isFinite(verdict?.checkedAt) ? verdict.checkedAt : nowMs\n        };\n        changed = true;\n    }\n    if (!changed && graceKept.length === 0 && Object.keys(rejectedOnce).length === 0 && !existing.rejectedOnce) {\n        return fresh;\n    }\n\n    const merged = finalizeEntry({\n        modes: [...fresh.modes, ...graceKept],\n        supported: fresh.supported,\n        controlKey: fresh.controlKey ?? undefined,\n        source: fresh.source,\n        method: fresh.method,\n        status: fresh.status,\n        evidence: fresh.evidence,\n        verification,\n        now: () => nowMs\n    });\n    if (Object.keys(rejectedOnce).length > 0) merged.rejectedOnce = rejectedOnce;\n    return merged;\n}\n\n/**\n * Probe a model (with per-model concurrency guard + TTL skip) and cache the\n * result on success. Failures return null and leave any previous entry intact.\n *\n * @param {string} modelId\n * @param {{\n *   force?: boolean,\n *   apiKey?: string,\n *   requestImpl?: Function,\n *   logger?: (outcome: object) => void,\n *   now?: () => number\n * }} [options]\n * @returns {Promise<object | null>} The (new or existing) cached entry, or null.\n */\nexport async function probeAndCacheReasoningModes(modelId, options = {}) {\n    ensureCacheLoaded();\n    if (typeof modelId !== \"string\" || modelId.length === 0) return null;\n    const now = typeof options.now === \"function\" ? options.now : Date.now;\n    const existing = capabilityCache.get(modelId) ?? null;\n    if (!options.force && existing && isEntryFresh(existing, now())) {\n        return cloneEntry(existing);\n    }\n    const pending = inFlightProbes.get(modelId);\n    if (pending) return pending;\n\n    const promise = (async () => {\n        const entry = await discoverReasoningModes(modelId, {\n            apiKey: typeof options.apiKey === \"string\" ? options.apiKey : \"\",\n            requestImpl: /** @type {*} */ (options.requestImpl),\n            logger: typeof options.logger === \"function\" ? options.logger : () => {},\n            now\n        });\n        if (entry) {\n            const reconciled = reconcileWithPrevious(existing, entry, now());\n            capabilityCache.set(modelId, reconciled);\n            persistCache();\n            return cloneEntry(reconciled);\n        }\n        return null;\n    })().finally(() => {\n        if (inFlightProbes.get(modelId) === promise) inFlightProbes.delete(modelId);\n    });\n    inFlightProbes.set(modelId, promise);\n    return promise;\n}\n\n/**\n * Background sweep triggered by /v1/models traffic: refresh stale/missing\n * models SEQUENTIALLY (bounded load), fire-and-forget — the HTTP response is\n * served from cache/static immediately and never waits on this.\n *\n * Scheduling gate mirrors the established project convention (model-discovery\n * warm guard): enabled by default in production, disabled under the\n * GATEWAY_TEST_LOCAL_UPSTREAM_PORT test sentinel unless explicitly force-\n * enabled, and hard-disabled via GATEWAY_CAPABILITY_PROBE_DISABLE=1.\n *\n * @param {unknown} modelIds Model ids from the freshly served catalog.\n * @param {{\n *   logger?: (outcome: object) => void,\n *   keyProvider?: () => string | null,\n *   requestImpl?: Function,\n *   force?: boolean\n * }} [options]\n * @returns {number} How many probes were queued this sweep (0 = skipped).\n */\nexport function scheduleCapabilityRefresh(modelIds, options = {}) {\n    const env = process.env;\n    const enabled = env.GATEWAY_CAPABILITY_PROBE_ENABLE === \"1\"\n        || (env.GATEWAY_CAPABILITY_PROBE_DISABLE !== \"1\" && !env.GATEWAY_TEST_LOCAL_UPSTREAM_PORT);\n    if (!enabled) return 0;\n    ensureCacheLoaded();\n\n    const nowMs = Date.now();\n    if (!options.force && (nowMs - state.lastSweepAt) < SWEEP_COOLDOWN_MS) return 0;\n    state.lastSweepAt = nowMs;\n\n    const maxPerSweep = positiveIntEnv(env.GATEWAY_CAPABILITY_PROBE_MAX_PER_SWEEP, 25);\n    const ids = [...new Set(\n        (Array.isArray(modelIds) ? modelIds : [])\n            .filter((id) => typeof id === \"string\" && id.includes(\"/\"))\n    )]\n        .filter((id) => {\n            const entry = capabilityCache.get(id);\n            return !isEntryFresh(entry, nowMs);\n        })\n        .sort()\n        .slice(0, maxPerSweep);\n    if (ids.length === 0) return 0;\n\n    const logger = typeof options.logger === \"function\" ? options.logger : () => {};\n    const keyProvider = typeof options.keyProvider === \"function\" ? options.keyProvider : null;\n\n    void (async () => {\n        for (const id of ids) {\n            try {\n                // Inside the try: a throwing keyProvider must degrade to a\n                // logged \"failed\" sweep step, never escape as an\n                // unhandledRejection (which would crash the gateway child).\n                const apiKey = keyProvider ? keyProvider() : \"\";\n                const entry = await probeAndCacheReasoningModes(id, {\n                    apiKey: apiKey ?? \"\",\n                    requestImpl: /** @type {*} */ (options.requestImpl),\n                    logger\n                });\n                logger(redact({\n                    step: \"sweep\", model: id,\n                    result: entry ? \"cached\" : \"inconclusive_static_fallback\",\n                    modes: entry ? entry.modes : undefined\n                }));\n            } catch (err) {\n                logger(redact({ step: \"sweep\", model: id, result: \"failed\", error: String(err?.message || err) }));\n            }\n        }\n    })();\n\n    return ids.length;\n}\n\n/**\n * Apply a cached probed result OVER the static family metadata for /v1/models\n * advertisement. Mutates `capabilities.reasoning` in place when a probed entry\n * exists; otherwise leaves the static metadata untouched. Tools/vision/audio\n * and the static shape are never altered.\n *\n * @param {{ reasoning?: object }} capabilities Output of getCapabilityMetadata().\n * @param {string} modelId\n * @returns {{ reasoning?: object }} Same object, for chaining.\n */\nexport function mergeProbedReasoning(capabilities, modelId) {\n    if (!capabilities || typeof capabilities !== \"object\") return capabilities;\n    const entry = getCachedReasoningCapability(modelId);\n    if (!entry) return capabilities;\n    const reasoning = capabilities.reasoning;\n    if (!reasoning || typeof reasoning !== \"object\") return capabilities;\n    reasoning.supported = Boolean(entry.supported);\n    reasoning.modes = Array.isArray(entry.modes) ? [...entry.modes] : [];\n    reasoning.controlKey = typeof entry.controlKey === \"string\" && entry.controlKey ? entry.controlKey : null;\n    reasoning.defaultMode = typeof entry.defaultMode === \"string\" && entry.defaultMode\n        ? entry.defaultMode\n        : (reasoning.modes.length > 0 ? reasoning.modes[reasoning.modes.length - 1] : null);\n    return capabilities;\n}\n\n/**\n * Reset all probe/cache state. Used by tests; accepts overrides so unit tests\n * can inject a deterministic clock / cache path without touching process.env.\n * The next cache access re-loads from disk, which is exactly what a process\n * restart does — pass a fresh path for a clean slate.\n *\n * @param {{ cachePath?: string | null, ttlMs?: number }} [overrides]\n * @returns {void}\n */\nexport function resetCapabilityProbeState(overrides = {}) {\n    capabilityCache.clear();\n    inFlightProbes.clear();\n    if (Number.isSafeInteger(overrides.ttlMs) && overrides.ttlMs > 0) {\n        ttlMs = overrides.ttlMs;\n    } else {\n        ttlMs = positiveIntEnv(process.env.GATEWAY_CAPABILITY_PROBE_TTL_MS, DEFAULT_TTL_MS);\n    }\n    state = {\n        // Explicit null ⇒ memory-only; undefined ⇒ derive from env once.\n        cachePath: overrides.cachePath !== undefined ? overrides.cachePath : resolveCapabilityCachePath(),\n        loaded: false,\n        lastSweepAt: 0\n    };\n}\n
+ * @param {{
+ *   apiKey?: string,
+ *   candidates?: string[],
+ *   timeoutMs?: number,
+ *   requestImpl?: (args: { apiKey: string, body: string, timeoutMs: number }) => Promise<{status: number, text: string, parsed: *}>,
+ *   logger?: (outcome: object) => void,
+ *   now?: () => number
+ * }} [options]
+ * @returns {Promise<null | object>} Cache entry, or null when inconclusive
+ *   (caller must fall back to the static capability registry).
+ */
+export async function discoverReasoningModes(model, options = {}) {
+    if (typeof model !== "string" || model.trim().length === 0) return null;
+    const apiKey = typeof options.apiKey === "string" ? options.apiKey : "";
+    if (!apiKey) return null;
+    const deps = {
+        apiKey,
+        candidates: Array.isArray(options.candidates) && options.candidates.length > 0 ? options.candidates : PROBE_CANDIDATES,
+        timeoutMs: Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? options.timeoutMs : DEFAULT_PROBE_TIMEOUT_MS,
+        requestImpl: typeof options.requestImpl === "function" ? options.requestImpl : httpsJsonPost,
+        logger: typeof options.logger === "function" ? options.logger : () => {},
+        now: typeof options.now === "function" ? options.now : Date.now
+    };
+    try {
+        // FAST PATH — one request with the sentinel value; a 400 usually lists
+        // the allowed reasoning_effort values right in the error message.
+        const first = await deps.requestImpl({ apiKey, body: buildProbeBody(model, PROBE_SENTINEL), timeoutMs: deps.timeoutMs });
+        if (first.status >= 200 && first.status < 300) {
+            // Field accepted unvalidated → cannot enumerate from an error.
+            // Detect implicit reasoning support, then enumerate via candidates.
+            const entry = await probeCandidatesIndividually(model, deps);
+            return entry;
+        }
+        if (first.status === 400 || first.status === 422) {
+            const message = extractErrorMessage(first);
+            const listed = parseAllowedValuesFromError(message, { sentinels: [PROBE_SENTINEL] });
+            if (listed.length > 0) {
+                // The listing reflects the ENDPOINT enum union, not per-model
+                // acceptance — verify each listed value with a tiny request so
+                // the advertised set is what THIS model actually accepts.
+                deps.logger(redact({ step: "probe", model, result: "listed_by_validation_error", status: first.status, listed: normalizeDiscoveredModes(listed) }));
+                return await probeCandidatesIndividually(model, {
+                    ...deps,
+                    candidates: normalizeDiscoveredModes(listed),
+                    methodLabel: "validation_error+verified",
+                    baseEvidence: message
+                });
+            }
+            deps.logger(redact({ step: "probe", model, result: "unparseable_validation_error", status: first.status }));
+            return await probeCandidatesIndividually(model, deps);
+        }
+        // 401/403/429/5xx/… — inconclusive; static registry remains authoritative.
+        deps.logger(redact({ step: "probe", model, result: "inconclusive_status", status: first.status }));
+        return null;
+    } catch (err) {
+        deps.logger(redact({ step: "probe", model, result: "failed", error: String(err?.message || err) }));
+        return null;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gateway-state cache (TTL + persistence + concurrency guard)
+// ---------------------------------------------------------------------------
+
+function positiveIntEnv(raw, fallback) {
+    const n = Number.parseInt(String(raw ?? ""), 10);
+    return Number.isSafeInteger(n) && n > 0 ? n : fallback;
+}
+
+/** Mutable so tests can shorten the window via resetCapabilityProbeState(). */
+let ttlMs = positiveIntEnv(process.env.GATEWAY_CAPABILITY_PROBE_TTL_MS, DEFAULT_TTL_MS);
+
+/** @type {{ cachePath: string | null | undefined, loaded: boolean, lastSweepAt: number }} */
+let state = {
+    // Resolved ONCE from env at import (the gateway child's env is fixed for
+    // its lifetime); resetCapabilityProbeState may override it for tests.
+    cachePath: resolveCapabilityCachePath(),
+    loaded: false,
+    lastSweepAt: 0
+};
+
+/** @type {Map<string, object>} model id -> cached entry */
+const capabilityCache = new Map();
+
+/** @type {Map<string, Promise<object | null>>} model id -> in-flight probe */
+const inFlightProbes = new Map();
+
+/**
+ * Resolve where the persistent cache lives. Preference order:
+ *   GATEWAY_CAPABILITY_CACHE_PATH → dirname(GATEWAY_CONFIG_PATH) → parent of
+ *   dirname(GATEWAY_LOG_PATH) (logs dir is <userData>/logs, so its parent is
+ *   the same APPDATA userData dir that already holds config.json/keys.json).
+ * Returns null when nothing is known → memory-only caching.
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {string | null}
+ */
+export function resolveCapabilityCachePath(env = process.env) {
+    if (typeof env.GATEWAY_CAPABILITY_CACHE_PATH === "string" && env.GATEWAY_CAPABILITY_CACHE_PATH.trim()) {
+        return env.GATEWAY_CAPABILITY_CACHE_PATH;
+    }
+    if (typeof env.GATEWAY_CONFIG_PATH === "string" && env.GATEWAY_CONFIG_PATH.trim()) {
+        return path.join(path.dirname(env.GATEWAY_CONFIG_PATH), CACHE_FILENAME);
+    }
+    if (typeof env.GATEWAY_LOG_PATH === "string" && env.GATEWAY_LOG_PATH.trim()) {
+        return path.join(path.dirname(path.dirname(env.GATEWAY_LOG_PATH)), CACHE_FILENAME);
+    }
+    return null;
+}
+
+function isValidEntry(value) {
+    return Boolean(
+        value && typeof value === "object" && !Array.isArray(value)
+        && Array.isArray(value.modes)
+        && value.modes.every((m) => typeof m === "string")
+        && Number.isFinite(value.probedAt)
+        && (value.source === "probed" || value.source === "fallback")
+    );
+}
+
+function ensureCacheLoaded() {
+    if (state.loaded) return;
+    state.loaded = true;
+    if (!state.cachePath) return;
+    let raw;
+    try {
+        raw = fs.readFileSync(state.cachePath, "utf8");
+    } catch {
+        return; // absent / unreadable — start empty
+    }
+    try {
+        const parsed = JSON.parse(raw.replace(/^\uFEFF/, ""));
+        // CACHE_FORMAT_VERSION 2 adds per-mode verification evidence + hysteresis
+        // stamps; v1 payloads are migrated verbatim (their entries keep serving
+        // until the next refresh). Unknown FUTURE versions are ignored rather
+        // than misread.
+        if (!parsed || typeof parsed !== "object"
+            || (parsed.version !== 1 && parsed.version !== CACHE_FORMAT_VERSION)) return;
+        const entries = parsed && typeof parsed === "object" ? parsed.entries : null;
+        if (entries && typeof entries === "object") {
+            for (const [model, entry] of Object.entries(entries)) {
+                if (typeof model === "string" && isValidEntry(entry)) {
+                    capabilityCache.set(model, entry);
+                }
+            }
+        }
+    } catch {
+        // Corrupt cache file — ignore it; probes will repopulate.
+    }
+}
+
+function persistCache() {
+    if (!state.cachePath) return;
+    const payload = {
+        version: CACHE_FORMAT_VERSION,
+        savedAt: new Date().toISOString(),
+        entries: Object.fromEntries(capabilityCache)
+    };
+    const tmpPath = `${state.cachePath}.tmp`;
+    try {
+        fs.mkdirSync(path.dirname(state.cachePath), { recursive: true });
+        fs.writeFileSync(tmpPath, JSON.stringify(payload, null, 2), "utf8");
+        fs.renameSync(tmpPath, state.cachePath);
+    } catch {
+        // Persistence is best-effort; the in-memory cache keeps working.
+    }
+}
+
+function cloneEntry(entry) {
+    return structuredClone(entry);
+}
+
+/**
+ * Get the cached probed capability for a model (fresh OR stale — stale data is
+ * still better advertising material than a static family guess; freshness only
+ * drives background refresh).
+ * @param {unknown} modelId
+ * @returns {object | null} Deep clone of the entry, or null.
+ */
+export function getCachedReasoningCapability(modelId) {
+    ensureCacheLoaded();
+    if (typeof modelId !== "string" || modelId.length === 0) return null;
+    const entry = capabilityCache.get(modelId);
+    return entry ? cloneEntry(entry) : null;
+}
+
+/**
+ * True when a cached entry exists and is inside the TTL window.
+ * Exported for tests.
+ */
+export function isEntryFresh(entry, nowMs = Date.now()) {
+    return Boolean(entry && Number.isFinite(entry.probedAt) && (nowMs - entry.probedAt) < ttlMs);
+}
+
+/**
+ * HYSTERESIS (stability-audit fix #3): dropping a PREVIOUSLY-verified mode
+ * requires TWO consecutive adverse probes. The first probe that fails to see
+ * a previously-listed mode stamps it into the cache entry's `rejectedOnce`
+ * map and KEEPS it advertised for one more cycle; only a second consecutive
+ * absence removes it. Any fresh acceptance clears the stamp immediately.
+ *
+ * Applies only when the previous entry came from a real probe
+ * (source === 'probed'); static-fallback guesses get no grace period.
+ *
+ * The per-mode verification evidence from the fresh probe is preserved so the
+ * advertised entry always shows WHY a mode is currently held or dropped.
+ *
+ * @param {object | null} existing Previously cached entry (may be stale).
+ * @param {object} fresh Entry produced by discoverReasoningModes.
+ * @param {number} nowMs Current clock for rejectedOnce stamps.
+ * @returns {object} The entry to cache (fresh as-is, or reconciled).
+ */
+function reconcileWithPrevious(existing, fresh, nowMs) {
+    if (!existing || existing.source !== "probed" || !Array.isArray(existing.modes)) return fresh;
+    const previousModes = existing.modes.filter((m) => typeof m === "string");
+    if (previousModes.length === 0) return fresh;
+
+    const verification = { ...(fresh.verification ?? {}) };
+    const rejectedOnce = { ...(existing.rejectedOnce ?? {}) };
+    const graceKept = [];
+    let changed = false;
+    for (const mode of previousModes) {
+        if (fresh.modes.includes(mode)) {
+            // Still verified — any outstanding stamp is cleared by acceptance.
+            if (Object.prototype.hasOwnProperty.call(rejectedOnce, mode)) {
+                delete rejectedOnce[mode];
+                changed = true;
+            }
+            continue;
+        }
+        if (Object.prototype.hasOwnProperty.call(rejectedOnce, mode)) {
+            // SECOND consecutive absence → drop for good this time.
+            delete rejectedOnce[mode];
+            changed = true;
+            continue;
+        }
+        // FIRST absence → one-cycle grace: keep advertising, stamp, annotate.
+        const verdict = verification[mode];
+        rejectedOnce[mode] = nowMs;
+        graceKept.push(mode);
+        verification[mode] = {
+            ...(verdict ?? {}),
+            result: verdict?.result ?? "rejected",
+            heldByHysteresis: true,
+            ...(verdict?.evidence ? {} : { evidence: "mode absent from fresh probe; held by hysteresis" }),
+            checkedAt: Number.isFinite(verdict?.checkedAt) ? verdict.checkedAt : nowMs
+        };
+        changed = true;
+    }
+    if (!changed && graceKept.length === 0 && Object.keys(rejectedOnce).length === 0 && !existing.rejectedOnce) {
+        return fresh;
+    }
+
+    const merged = finalizeEntry({
+        modes: [...fresh.modes, ...graceKept],
+        supported: fresh.supported,
+        controlKey: fresh.controlKey ?? undefined,
+        source: fresh.source,
+        method: fresh.method,
+        status: fresh.status,
+        evidence: fresh.evidence,
+        verification,
+        now: () => nowMs
+    });
+    if (Object.keys(rejectedOnce).length > 0) merged.rejectedOnce = rejectedOnce;
+    return merged;
+}
+
+/**
+ * Probe a model (with per-model concurrency guard + TTL skip) and cache the
+ * result on success. Failures return null and leave any previous entry intact.
+ *
+ * @param {string} modelId
+ * @param {{\n *   force?: boolean,\n *   apiKey?: string,\n *   requestImpl?: Function,\n *   logger?: (outcome: object) => void,\n *   now?: () => number\n * }} [options]\n * @returns {Promise<object | null>} The (new or existing) cached entry, or null.\n */\nexport async function probeAndCacheReasoningModes(modelId, options = {}) {\n    ensureCacheLoaded();\n    if (typeof modelId !== \"string\" || modelId.length === 0) return null;\n    const now = typeof options.now === \"function\" ? options.now : Date.now;\n    const existing = capabilityCache.get(modelId) ?? null;\n    if (!options.force && existing && isEntryFresh(existing, now())) {\n        return cloneEntry(existing);\n    }\n    const pending = inFlightProbes.get(modelId);\n    if (pending) return pending;\n\n    const promise = (async () => {\n        const entry = await discoverReasoningModes(modelId, {\n            apiKey: typeof options.apiKey === \"string\" ? options.apiKey : \"\",\n            requestImpl: /** @type {*} */ (options.requestImpl),\n            logger: typeof options.logger === \"function\" ? options.logger : () => {},\n            now\n        });\n        if (entry) {\n            const reconciled = reconcileWithPrevious(existing, entry, now());\n            capabilityCache.set(modelId, reconciled);\n            persistCache();\n            return cloneEntry(reconciled);\n        }\n        return null;\n    })().finally(() => {\n        if (inFlightProbes.get(modelId) === promise) inFlightProbes.delete(modelId);\n    });\n    inFlightProbes.set(modelId, promise);\n    return promise;\n}\n\n/**\n * Background sweep triggered by /v1/models traffic: refresh stale/missing\n * models SEQUENTIALLY (bounded load), fire-and-forget — the HTTP response is\n * served from cache/static immediately and never waits on this.\n *\n * Scheduling gate mirrors the established project convention (model-discovery\n * warm guard): enabled by default in production, disabled under the\n * GATEWAY_TEST_LOCAL_UPSTREAM_PORT test sentinel unless explicitly force-\n * enabled, and hard-disabled via GATEWAY_CAPABILITY_PROBE_DISABLE=1.\n *\n * @param {unknown} modelIds Model ids from the freshly served catalog.\n * @param {{\n *   logger?: (outcome: object) => void,\n *   keyProvider?: () => string | null,\n *   requestImpl?: Function,\n *   force?: boolean\n * }} [options]\n * @returns {number} How many probes were queued this sweep (0 = skipped).\n */\nexport function scheduleCapabilityRefresh(modelIds, options = {}) {\n    const env = process.env;\n    const enabled = env.GATEWAY_CAPABILITY_PROBE_ENABLE === \"1\"\n        || (env.GATEWAY_CAPABILITY_PROBE_DISABLE !== \"1\" && !env.GATEWAY_TEST_LOCAL_UPSTREAM_PORT);\n    if (!enabled) return 0;\n    ensureCacheLoaded();\n\n    const nowMs = Date.now();\n    if (!options.force && (nowMs - state.lastSweepAt) < SWEEP_COOLDOWN_MS) return 0;\n    state.lastSweepAt = nowMs;\n\n    const maxPerSweep = positiveIntEnv(env.GATEWAY_CAPABILITY_PROBE_MAX_PER_SWEEP, 25);\n    const ids = [...new Set(\n        (Array.isArray(modelIds) ? modelIds : [])\n            .filter((id) => typeof id === \"string\" && id.includes(\"/\"))\n    )]\n        .filter((id) => {\n            const entry = capabilityCache.get(id);\n            return !isEntryFresh(entry, nowMs);\n        })\n        .sort()\n        .slice(0, maxPerSweep);\n    if (ids.length === 0) return 0;\n\n    const logger = typeof options.logger === \"function\" ? options.logger : () => {};\n    const keyProvider = typeof options.keyProvider === \"function\" ? options.keyProvider : null;\n\n    void (async () => {\n        for (const id of ids) {\n            try {\n                // Inside the try: a throwing keyProvider must degrade to a\n                // logged \"failed\" sweep step, never escape as an\n                // unhandledRejection (which would crash the gateway child).\n                const apiKey = keyProvider ? keyProvider() : \"\";\n                const entry = await probeAndCacheReasoningModes(id, {\n                    apiKey: apiKey ?? \"\",\n                    requestImpl: /** @type {*} */ (options.requestImpl),\n                    logger\n                });\n                logger(redact({\n                    step: \"sweep\", model: id,\n                    result: entry ? \"cached\" : \"inconclusive_static_fallback\",\n                    modes: entry ? entry.modes : undefined\n                }));\n            } catch (err) {\n                logger(redact({ step: \"sweep\", model: id, result: \"failed\", error: String(err?.message || err) }));\n            }\n        }\n    })();\n\n    return ids.length;\n}\n\n/**\n * Apply a cached probed result OVER the static family metadata for /v1/models\n * advertisement. Mutates `capabilities.reasoning` in place when a probed entry\n * exists; otherwise leaves the static metadata untouched. Tools/vision/audio\n * and the static shape are never altered.\n *\n * @param {{ reasoning?: object }} capabilities Output of getCapabilityMetadata().\n * @param {string} modelId\n * @returns {{ reasoning?: object }} Same object, for chaining.\n */\nexport function mergeProbedReasoning(capabilities, modelId) {\n    if (!capabilities || typeof capabilities !== \"object\") return capabilities;\n    const entry = getCachedReasoningCapability(modelId);\n    if (!entry) return capabilities;\n    const reasoning = capabilities.reasoning;\n    if (!reasoning || typeof reasoning !== \"object\") return capabilities;\n    reasoning.supported = Boolean(entry.supported);\n    reasoning.modes = Array.isArray(entry.modes) ? [...entry.modes] : [];\n    reasoning.controlKey = typeof entry.controlKey === \"string\" && entry.controlKey ? entry.controlKey : null;\n    reasoning.defaultMode = typeof entry.defaultMode === \"string\" && entry.defaultMode\n        ? entry.defaultMode\n        : (reasoning.modes.length > 0 ? reasoning.modes[reasoning.modes.length - 1] : null);\n    return capabilities;\n}\n\n/**\n * Reset all probe/cache state. Used by tests; accepts overrides so unit tests\n * can inject a deterministic clock / cache path without touching process.env.\n * The next cache access re-loads from disk, which is exactly what a process\n * restart does — pass a fresh path for a clean slate.\n *\n * @param {{ cachePath?: string | null, ttlMs?: number }} [overrides]\n * @returns {void}\n */\nexport function resetCapabilityProbeState(overrides = {}) {\n    capabilityCache.clear();\n    inFlightProbes.clear();\n    if (Number.isSafeInteger(overrides.ttlMs) && overrides.ttlMs > 0) {\n        ttlMs = overrides.ttlMs;\n    } else {\n        ttlMs = positiveIntEnv(process.env.GATEWAY_CAPABILITY_PROBE_TTL_MS, DEFAULT_TTL_MS);\n    }\n    state = {\n        // Explicit null ⇒ memory-only; undefined ⇒ derive from env once.\n        cachePath: overrides.cachePath !== undefined ? overrides.cachePath : resolveCapabilityCachePath(),\n        loaded: false,\n        lastSweepAt: 0\n    };\n}\n
