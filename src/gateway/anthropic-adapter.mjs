@@ -341,4 +341,172 @@ export async function* translateAnthropicSseStream(openaiSseChunks, requestId, m
 
   // Build the message_start event. modelHint is the model field observed on the
   // current data chunk (used only when the caller-supplied `model` param is empty).
-  const emitMessageStart = (modelHint) => formatSse('message_start', {\n    type: 'message_start',\n    message: {\n      id: requestId || ('msg_' + Date.now()),\n      type: 'message',\n      role: 'assistant',\n      model: model || modelHint || '',\n      content: [],\n      stop_reason: null,\n      stop_sequence: null,\n      usage: { input_tokens: inputTokens, output_tokens: 0 },\n    },\n  });\n\n  // Close the open content block (if any) and reset block tracking.\n  const closeContentBlock = () => formatSse('content_block_stop', { index: currentBlockIndex });\n\n  for await (const chunk of openaiSseChunks) {\n    // F5: a single physical chunk may carry multiple SSE events (TCP coalescing).\n    // Parse every `data:` line into an ordered item list instead of stopping at\n    // the first. Each `[DONE]` becomes a string sentinel; parsed payloads become\n    // objects. Non-`data:` lines (comments, blank separators) are ignored.\n    const items = [];\n    if (typeof chunk === 'string') {\n      const lines = chunk.split('\\n');\n      for (const line of lines) {\n        if (!line.startsWith('data: ')) continue;\n        const payload = line.slice(6).trim();\n        if (payload === '') continue;\n        if (payload === '[DONE]') {\n          items.push('[DONE]');\n          continue;\n        }\n        try {\n          items.push(JSON.parse(payload));\n        } catch (e) {\n          // skip a malformed data line without dropping the rest of the chunk\n        }\n      }\n    } else if (chunk !== null && typeof chunk === 'object') {\n      items.push(chunk);\n    }\n\n    if (items.length === 0) continue;\n\n    for (const item of items) {\n      // F4: [DONE] handling lives inside the item loop so message_start is\n      // guaranteed to have been emitted before message_delta/message_stop.\n      if (item === '[DONE]') {\n        if (!started) {\n          started = true;\n          yield emitMessageStart(undefined);\n        }\n        if (contentBlockStarted) {\n          yield closeContentBlock();\n          contentBlockStarted = false;\n          currentBlockType = null;\n          activeToolCallIndex = null;\n        }\n        yield formatSse('message_delta', { stop_reason: stopReason, stop_sequence: null, usage: { output_tokens: outputTokens } });\n        yield formatSse('message_stop', {});\n        return;\n      }\n      if (!item || typeof item !== 'object') continue;\n\n      const data = item;\n      if (!started) {\n        started = true;\n        yield emitMessageStart(data.model);\n      }\n\n      if (data.choices && data.choices[0]) {\n        const choice = data.choices[0];\n        if (choice.delta) {\n          // ---- text content (-> text block) ----\n          if (choice.delta.content) {\n            // F1: text_delta must be emitted inside a *text* block. If the open\n            // block is a thinking or tool_use block, close it before opening text.\n            if (currentBlockType !== 'text') {\n              if (contentBlockStarted) {\n                yield closeContentBlock();\n                contentBlockStarted = false;\n                currentBlockType = null;\n              }\n              currentBlockIndex++;\n              contentBlockStarted = true;\n              currentBlockType = 'text';\n              yield formatSse('content_block_start', { index: currentBlockIndex, content_block: { type: 'text', text: '' } });\n            }\n            yield formatSse('content_block_delta', { index: currentBlockIndex, delta: { type: 'text_delta', text: choice.delta.content } });\n            outputTokens++;\n          }\n          // ---- reasoning content (-> thinking block) ----\n          if (choice.delta.reasoning_content) {\n            // F2: only open a NEW thinking block when the open block is NOT\n            // already thinking. Same-type (thinking -> thinking) deltas therefore\n            // accumulate inside the single block instead of fragmenting it.\n            if (currentBlockType !== 'thinking') {\n              if (contentBlockStarted) {\n                yield closeContentBlock();\n                contentBlockStarted = false;\n                currentBlockType = null;\n              }\n              currentBlockIndex++;\n              contentBlockStarted = true;\n              currentBlockType = 'thinking';\n              yield formatSse('content_block_start', { index: currentBlockIndex, content_block: { type: 'thinking', thinking: '' } });\n            }\n            yield formatSse('content_block_delta', { index: currentBlockIndex, delta: { type: 'thinking_delta', thinking: choice.delta.reasoning_content } });\n          }\n          // ---- tool calls (-> tool_use block) ----\n          if (choice.delta.tool_calls) {\n            for (const tc of choice.delta.tool_calls) {\n              const tcIndex = (typeof tc.index === 'number') ? tc.index : 0;\n              // F3: a fresh tool_use block is required when no tool_use block is\n              // open, OR when the open tool_use block belongs to a different tool\n              // call (tc.index changed). Any open text/thinking block is closed\n              // first so the tool call is never dropped into the wrong block.\n              if (currentBlockType !== 'tool_use' || activeToolCallIndex !== tcIndex) {\n                if (contentBlockStarted) {\n                  yield closeContentBlock();\n                  contentBlockStarted = false;\n                  currentBlockType = null;\n                  activeToolCallIndex = null;\n                }\n                currentBlockIndex++;\n                contentBlockStarted = true;\n                currentBlockType = 'tool_use';\n                activeToolCallIndex = tcIndex;\n                yield formatSse('content_block_start', {\n                  index: currentBlockIndex,\n                  content_block: { type: 'tool_use', id: tc.id || ('toolu_' + Date.now()), name: tc.function?.name || '', input: {} },\n                });\n              }\n              if (tc.function?.arguments) {\n                yield formatSse('content_block_delta', {\n                  index: currentBlockIndex,\n                  delta: { type: 'input_json_delta', partial_json: tc.function.arguments },\n                });\n              }\n            }\n          }\n        }\n        if (choice.finish_reason) {\n          stopReason = stopReasonMap[choice.finish_reason] || 'end_turn';\n        }\n      }\n      if (data.usage) {\n        inputTokens = data.usage.prompt_tokens || inputTokens;\n        outputTokens = data.usage.completion_tokens || outputTokens;\n      }\n    }\n  }\n\n  // F4: tail block. If the stream produced no data chunks at all (empty stream,\n  // or only keep-alive lines), message_start was never emitted — emit it here\n  // before the terminal message_delta/message_stop so the stream is well-formed.\n  if (!started) {\n    started = true;\n    yield emitMessageStart(undefined);\n  }\n  if (contentBlockStarted) {\n    yield closeContentBlock();\n    contentBlockStarted = false;\n    currentBlockType = null;\n  }\n  yield formatSse('message_delta', { stop_reason: stopReason, stop_sequence: null, usage: { output_tokens: outputTokens } });\n  yield formatSse('message_stop', {});\n}\n
+  const emitMessageStart = (modelHint) => formatSse('message_start', {
+    type: 'message_start',
+    message: {
+      id: requestId || ('msg_' + Date.now()),
+      type: 'message',
+      role: 'assistant',
+      model: model || modelHint || '',
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: inputTokens, output_tokens: 0 },
+    },
+  });
+
+  // Close the open content block (if any) and reset block tracking.
+  const closeContentBlock = () => formatSse('content_block_stop', { index: currentBlockIndex });
+
+  for await (const chunk of openaiSseChunks) {
+    // F5: a single physical chunk may carry multiple SSE events (TCP coalescing).
+    // Parse every `data:` line into an ordered item list instead of stopping at
+    // the first. Each `[DONE]` becomes a string sentinel; parsed payloads become
+    // objects. Non-`data:` lines (comments, blank separators) are ignored.
+    const items = [];
+    if (typeof chunk === 'string') {
+      const lines = chunk.split('\n');
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const payload = line.slice(6).trim();
+        if (payload === '') continue;
+        if (payload === '[DONE]') {
+          items.push('[DONE]');
+          continue;
+        }
+        try {
+          items.push(JSON.parse(payload));
+        } catch (e) {
+          // skip a malformed data line without dropping the rest of the chunk
+        }
+      }
+    } else if (chunk !== null && typeof chunk === 'object') {
+      items.push(chunk);
+    }
+
+    if (items.length === 0) continue;
+
+    for (const item of items) {
+      // F4: [DONE] handling lives inside the item loop so message_start is
+      // guaranteed to have been emitted before message_delta/message_stop.
+      if (item === '[DONE]') {
+        if (!started) {
+          started = true;
+          yield emitMessageStart(undefined);
+        }
+        if (contentBlockStarted) {
+          yield closeContentBlock();
+          contentBlockStarted = false;
+          currentBlockType = null;
+          activeToolCallIndex = null;
+        }
+        yield formatSse('message_delta', { stop_reason: stopReason, stop_sequence: null, usage: { output_tokens: outputTokens } });
+        yield formatSse('message_stop', {});
+        return;
+      }
+      if (!item || typeof item !== 'object') continue;
+
+      const data = item;
+      if (!started) {
+        started = true;
+        yield emitMessageStart(data.model);
+      }
+
+      if (data.choices && data.choices[0]) {
+        const choice = data.choices[0];
+        if (choice.delta) {
+          // ---- text content (-> text block) ----
+          if (choice.delta.content) {
+            // F1: text_delta must be emitted inside a *text* block. If the open
+            // block is a thinking or tool_use block, close it before opening text.
+            if (currentBlockType !== 'text') {
+              if (contentBlockStarted) {
+                yield closeContentBlock();
+                contentBlockStarted = false;
+                currentBlockType = null;
+              }
+              currentBlockIndex++;
+              contentBlockStarted = true;
+              currentBlockType = 'text';
+              yield formatSse('content_block_start', { index: currentBlockIndex, content_block: { type: 'text', text: '' } });
+            }
+            yield formatSse('content_block_delta', { index: currentBlockIndex, delta: { type: 'text_delta', text: choice.delta.content } });
+            outputTokens++;
+          }
+          // ---- reasoning content (-> thinking block) ----
+          if (choice.delta.reasoning_content) {
+            // F2: only open a NEW thinking block when the open block is NOT
+            // already thinking. Same-type (thinking -> thinking) deltas therefore
+            // accumulate inside the single block instead of fragmenting it.
+            if (currentBlockType !== 'thinking') {
+              if (contentBlockStarted) {
+                yield closeContentBlock();
+                contentBlockStarted = false;
+                currentBlockType = null;
+              }
+              currentBlockIndex++;
+              contentBlockStarted = true;
+              currentBlockType = 'thinking';
+              yield formatSse('content_block_start', { index: currentBlockIndex, content_block: { type: 'thinking', thinking: '' } });
+            }
+            yield formatSse('content_block_delta', { index: currentBlockIndex, delta: { type: 'thinking_delta', thinking: choice.delta.reasoning_content } });
+          }
+          // ---- tool calls (-> tool_use block) ----
+          if (choice.delta.tool_calls) {
+            for (const tc of choice.delta.tool_calls) {
+              const tcIndex = (typeof tc.index === 'number') ? tc.index : 0;
+              // F3: a fresh tool_use block is required when no tool_use block is
+              // open, OR when the open tool_use block belongs to a different tool
+              // call (tc.index changed). Any open text/thinking block is closed
+              // first so the tool call is never dropped into the wrong block.
+              if (currentBlockType !== 'tool_use' || activeToolCallIndex !== tcIndex) {
+                if (contentBlockStarted) {
+                  yield closeContentBlock();
+                  contentBlockStarted = false;
+                  currentBlockType = null;
+                  activeToolCallIndex = null;
+                }
+                currentBlockIndex++;
+                contentBlockStarted = true;
+                currentBlockType = 'tool_use';
+                activeToolCallIndex = tcIndex;
+                yield formatSse('content_block_start', {
+                  index: currentBlockIndex,
+                  content_block: { type: 'tool_use', id: tc.id || ('toolu_' + Date.now()), name: tc.function?.name || '', input: {} },
+                });
+              }
+              if (tc.function?.arguments) {
+                yield formatSse('content_block_delta', {
+                  index: currentBlockIndex,
+                  delta: { type: 'input_json_delta', partial_json: tc.function.arguments },
+                });
+              }
+            }
+          }
+        }
+        if (choice.finish_reason) {
+          stopReason = stopReasonMap[choice.finish_reason] || 'end_turn';
+        }
+      }
+      if (data.usage) {
+        inputTokens = data.usage.prompt_tokens || inputTokens;
+        outputTokens = data.usage.completion_tokens || outputTokens;
+      }
+    }
+  }
+
+  // F4: tail block. If the stream produced no data chunks at all (empty stream,
+  // or only keep-alive lines), message_start was never emitted — emit it here
+  // before the terminal message_delta/message_stop so the stream is well-formed.
+  if (!started) {
+    started = true;
+    yield emitMessageStart(undefined);
+  }
+  if (contentBlockStarted) {
+    yield closeContentBlock();
+    contentBlockStarted = false;
+    currentBlockType = null;
+  }
+  yield formatSse('message_delta', { stop_reason: stopReason, stop_sequence: null, usage: { output_tokens: outputTokens } });
+  yield formatSse('message_stop', {});
+}

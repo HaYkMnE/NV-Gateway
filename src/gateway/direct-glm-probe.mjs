@@ -273,7 +273,7 @@ export function createDirectGlmProbeScheduler({ probe, logger = () => {} } = {})
             if (started) return undefined;
             started = true;
             Promise.resolve().then(() => probe()).catch(() => {
-                try { logger(safeOutcome({ step: "internal", durationMs: 0, result: "indeterminate" })); } catch {};
+                try { logger(safeOutcome({ step: "internal", durationMs: 0, result: "indeterminate" })); } catch {}
             });
             return undefined;
         }

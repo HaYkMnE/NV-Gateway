@@ -308,4 +308,145 @@ export function buildApplicationMenu(options: ApplicationMenuOptions): Menu {
   const t = getMenuStrings(language);
 
   const template: MenuItemConstructorOptions[] = [
-    {\n      label: t.file,\n      submenu: [\n        ...(onOpenSettings\n          ? [\n              {\n                label: t.settings,\n                accelerator: \"CmdOrCtrl+,\",\n                click: () => onOpenSettings()\n              },\n              { type: \"separator\" as const }\n            ]\n          : []),\n        {\n          label: t.close_window,\n          role: \"close\"\n        },\n        { type: \"separator\" },\n        {\n          label: t.quit,\n          accelerator: process.platform === \"darwin\" ? \"Cmd+Q\" : \"Alt+F4\",\n          click: () => app.quit()\n        }\n      ]\n    },\n    {\n      label: t.edit,\n      submenu: [\n        { label: t.undo, role: \"undo\" },\n        { label: t.redo, role: \"redo\" },\n        { type: \"separator\" },\n        { label: t.cut, role: \"cut\" },\n        { label: t.copy, role: \"copy\" },\n        { label: t.paste, role: \"paste\" },\n        { label: t.select_all, role: \"selectAll\" }\n      ]\n    },\n    {\n      label: t.view,\n      submenu: [\n        { label: t.reload, role: \"reload\" },\n        { label: t.force_reload, role: \"forceReload\" },\n        { label: t.toggle_devtools, role: \"toggleDevTools\" },\n        { type: \"separator\" },\n        { label: t.actual_size, role: \"resetZoom\" },\n        { label: t.zoom_in, role: \"zoomIn\" },\n        { label: t.zoom_out, role: \"zoomOut\" },\n        { type: \"separator\" },\n        { label: t.toggle_fullscreen, role: \"togglefullscreen\" }\n      ]\n    },\n    {\n      label: t.window,\n      submenu: [\n        { label: t.minimize, role: \"minimize\" },\n        { label: t.zoom, role: \"zoom\" },\n        ...(process.platform === \"darwin\"\n          ? [\n              { type: \"separator\" as const },\n              { label: t.bring_all_to_front, role: \"front\" as const }\n            ]\n          : [])\n      ]\n    },\n    {\n      label: t.help,\n      submenu: [\n        ...(onCheckUpdates\n          ? [\n              {\n                label: t.check_updates,\n                click: () => onCheckUpdates()\n              },\n              { type: \"separator\" as const }\n            ]\n          : []),\n        {\n          label: t.send_feedback,\n          click: () => {\n            const focusedWindow = BrowserWindow.getFocusedWindow();\n            if (focusedWindow) {\n              focusedWindow.webContents.send(\"navigate-feedback\");\n            }\n          }\n        },\n        { type: \"separator\" as const },\n        {\n          label: t.about,\n          click: () => {\n            const focusedWindow = BrowserWindow.getFocusedWindow();\n            if (focusedWindow) {\n              focusedWindow.webContents.send(\"navigate-about\");\n            }\n          }\n        }\n      ]\n    }\n  ];\n\n  return Menu.buildFromTemplate(template);\n}\n\nexport function buildContextMenu(\n  language: AppLanguage,\n  params: {\n    isEditable: boolean;\n    editFlags: {\n      canCut: boolean;\n      canCopy: boolean;\n      canPaste: boolean;\n      canSelectAll: boolean;\n    };\n  }\n): Menu {\n  const t = getMenuStrings(language);\n\n  return Menu.buildFromTemplate([\n    {\n      label: t.cut,\n      role: \"cut\",\n      enabled: params.editFlags.canCut,\n      visible: params.isEditable\n    },\n    {\n      label: t.copy,\n      role: \"copy\",\n      enabled: params.editFlags.canCopy\n    },\n    {\n      label: t.paste,\n      role: \"paste\",\n      enabled: params.editFlags.canPaste,\n      visible: params.isEditable\n    },\n    { type: \"separator\" },\n    {\n      label: t.select_all,\n      role: \"selectAll\",\n      enabled: params.editFlags.canSelectAll\n    }\n  ]);\n}\n
+    {
+      label: t.file,
+      submenu: [
+        ...(onOpenSettings
+          ? [
+              {
+                label: t.settings,
+                accelerator: "CmdOrCtrl+,",
+                click: () => onOpenSettings()
+              },
+              { type: "separator" as const }
+            ]
+          : []),
+        {
+          label: t.close_window,
+          role: "close"
+        },
+        { type: "separator" },
+        {
+          label: t.quit,
+          accelerator: process.platform === "darwin" ? "Cmd+Q" : "Alt+F4",
+          click: () => app.quit()
+        }
+      ]
+    },
+    {
+      label: t.edit,
+      submenu: [
+        { label: t.undo, role: "undo" },
+        { label: t.redo, role: "redo" },
+        { type: "separator" },
+        { label: t.cut, role: "cut" },
+        { label: t.copy, role: "copy" },
+        { label: t.paste, role: "paste" },
+        { label: t.select_all, role: "selectAll" }
+      ]
+    },
+    {
+      label: t.view,
+      submenu: [
+        { label: t.reload, role: "reload" },
+        { label: t.force_reload, role: "forceReload" },
+        { label: t.toggle_devtools, role: "toggleDevTools" },
+        { type: "separator" },
+        { label: t.actual_size, role: "resetZoom" },
+        { label: t.zoom_in, role: "zoomIn" },
+        { label: t.zoom_out, role: "zoomOut" },
+        { type: "separator" },
+        { label: t.toggle_fullscreen, role: "togglefullscreen" }
+      ]
+    },
+    {
+      label: t.window,
+      submenu: [
+        { label: t.minimize, role: "minimize" },
+        { label: t.zoom, role: "zoom" },
+        ...(process.platform === "darwin"
+          ? [
+              { type: "separator" as const },
+              { label: t.bring_all_to_front, role: "front" as const }
+            ]
+          : [])
+      ]
+    },
+    {
+      label: t.help,
+      submenu: [
+        ...(onCheckUpdates
+          ? [
+              {
+                label: t.check_updates,
+                click: () => onCheckUpdates()
+              },
+              { type: "separator" as const }
+            ]
+          : []),
+        {
+          label: t.send_feedback,
+          click: () => {
+            const focusedWindow = BrowserWindow.getFocusedWindow();
+            if (focusedWindow) {
+              focusedWindow.webContents.send("navigate-feedback");
+            }
+          }
+        },
+        { type: "separator" as const },
+        {
+          label: t.about,
+          click: () => {
+            const focusedWindow = BrowserWindow.getFocusedWindow();
+            if (focusedWindow) {
+              focusedWindow.webContents.send("navigate-about");
+            }
+          }
+        }
+      ]
+    }
+  ];
+
+  return Menu.buildFromTemplate(template);
+}
+
+export function buildContextMenu(
+  language: AppLanguage,
+  params: {
+    isEditable: boolean;
+    editFlags: {
+      canCut: boolean;
+      canCopy: boolean;
+      canPaste: boolean;
+      canSelectAll: boolean;
+    };
+  }
+): Menu {
+  const t = getMenuStrings(language);
+
+  return Menu.buildFromTemplate([
+    {
+      label: t.cut,
+      role: "cut",
+      enabled: params.editFlags.canCut,
+      visible: params.isEditable
+    },
+    {
+      label: t.copy,
+      role: "copy",
+      enabled: params.editFlags.canCopy
+    },
+    {
+      label: t.paste,
+      role: "paste",
+      enabled: params.editFlags.canPaste,
+      visible: params.isEditable
+    },
+    { type: "separator" },
+    {
+      label: t.select_all,
+      role: "selectAll",
+      enabled: params.editFlags.canSelectAll
+    }
+  ]);
+}
