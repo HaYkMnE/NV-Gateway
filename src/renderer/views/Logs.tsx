@@ -308,7 +308,8 @@ function SendErrorsDialog({ count, preview, previewLoading, sending, onClose, on
         <p className="text-sm mb-4">{t('errors_confirmBody', { count })}</p>
 
         <div className="border border-border bg-surface p-3 mb-6 max-h-64 overflow-y-auto">
-          {previewLoading ? (\n            <div role="status" className="text-sm text-textMuted">
+          {previewLoading ? (
+            <div role="status" className="text-sm text-textMuted">
               {t('loading')}
             </div>
           ) : preview && preview.length > 0 ? (
