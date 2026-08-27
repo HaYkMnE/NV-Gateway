@@ -60,41 +60,11 @@ export function prepareAppConfigMigrationWrite(configPath: string, update: Parti
       if (!same(readCurrent(configPath), original)) fail("MIGRATION_CONFIG_CONCURRENT_MODIFICATION");
     } catch (error) {
       if (error instanceof Error && error.message === "MIGRATION_CONFIG_CONCURRENT_MODIFICATION") throw error;
-      try { if (same(readCurrent(configPath), original)) retainProtectedRecovery(protectFile); } catch {}\r
+      try { if (same(readCurrent(configPath), original)) retainProtectedRecovery(protectFile); } catch {}
       fail("MIGRATION_APP_CONFIG_ROLLBACK_FAILED");
     } finally { removeTemporaryIfOwned(temporary, original); }
   };
-  return {\r
+  return {
     original,
     candidate: written,
-    writeIfCurrent(protectFile: (filePath: string) => void, hooks?: AppConfigWriteHooks & { afterReplaceBeforeVerify?: () => void }): void {
-      const temporary = `${configPath}.migration-write.${crypto.randomUUID()}.tmp`;
-      let replaced = false;
-      try {
-        const beforeReplacement = snapshot(configPath);
-        if (same(beforeReplacement.content, written)) { hooks?.afterReplaceBeforeVerify?.(); if (!same(readCurrent(configPath), written)) fail("MIGRATION_CONFIG_CONCURRENT_MODIFICATION"); return; }
-        if (!same(beforeReplacement.content, original)) fail("MIGRATION_CONFIG_CONCURRENT_MODIFICATION");
-        hooks?.beforeTemporaryCreate?.(temporary);
-        writeProtectedExclusive(temporary, written, protectFile);
-        if (!same(readCurrent(temporary), written)) fail("MIGRATION_CONFIG_CONCURRENT_MODIFICATION");
-        if (!sameSnapshot(beforeReplacement, snapshot(configPath))) fail("MIGRATION_CONFIG_CONCURRENT_MODIFICATION");
-        hooks?.afterCandidateVerifiedBeforeReplace?.(temporary);
-        if (!same(readCurrent(temporary), written)) fail("MIGRATION_CONFIG_CONCURRENT_MODIFICATION");
-        if (!sameSnapshot(beforeReplacement, snapshot(configPath))) fail("MIGRATION_CONFIG_CONCURRENT_MODIFICATION");
-        replaced = true; fs.renameSync(temporary, configPath); protectFile(configPath);
-        hooks?.afterReplaceBeforeVerify?.();
-        if (!same(readCurrent(configPath), written)) fail("MIGRATION_CONFIG_CONCURRENT_MODIFICATION");
-      } catch (error) {\r
-        if (replaced) {\r
-          try { restoreOwned(protectFile); } catch (restoreError) {\r
-            if (restoreError instanceof Error && restoreError.message === "MIGRATION_CONFIG_CONCURRENT_MODIFICATION") throw restoreError;\r
-            fail("MIGRATION_APP_CONFIG_ROLLBACK_FAILED");\r
-          }\r
-        }\r
-        if (error instanceof Error && /^MIGRATION_(?:CONFIG_CONCURRENT_MODIFICATION|APP_CONFIG_WRITE_FAILED)$/.test(error.message)) throw error;\r
-        fail("MIGRATION_APP_CONFIG_WRITE_FAILED");\r
-      } finally { removeTemporaryIfOwned(temporary, written); }\r
-    },\r
-    restoreIfOwned(protectFile: (filePath: string) => void): void { restoreOwned(protectFile); }\r
-  };\r
-}\r
+    writeIfCurrent(protectFile: (filePath: string) => void, hooks?: AppConfigWriteHooks & { afterReplaceBeforeVerify?: () => void }): void {\n      const temporary = `${configPath}.migration-write.${crypto.randomUUID()}.tmp`;\n      let replaced = false;\n      try {\n        const beforeReplacement = snapshot(configPath);\n        if (same(beforeReplacement.content, written)) { hooks?.afterReplaceBeforeVerify?.(); if (!same(readCurrent(configPath), written)) fail(\"MIGRATION_CONFIG_CONCURRENT_MODIFICATION\"); return; }\n        if (!same(beforeReplacement.content, original)) fail(\"MIGRATION_CONFIG_CONCURRENT_MODIFICATION\");\n        hooks?.beforeTemporaryCreate?.(temporary);\n        writeProtectedExclusive(temporary, written, protectFile);\n        if (!same(readCurrent(temporary), written)) fail(\"MIGRATION_CONFIG_CONCURRENT_MODIFICATION\");\n        if (!sameSnapshot(beforeReplacement, snapshot(configPath))) fail(\"MIGRATION_CONFIG_CONCURRENT_MODIFICATION\");\n        hooks?.afterCandidateVerifiedBeforeReplace?.(temporary);\n        if (!same(readCurrent(temporary), written)) fail(\"MIGRATION_CONFIG_CONCURRENT_MODIFICATION\");\n        if (!sameSnapshot(beforeReplacement, snapshot(configPath))) fail(\"MIGRATION_CONFIG_CONCURRENT_MODIFICATION\");\n        replaced = true; fs.renameSync(temporary, configPath); protectFile(configPath);\n        hooks?.afterReplaceBeforeVerify?.();\n        if (!same(readCurrent(configPath), written)) fail(\"MIGRATION_CONFIG_CONCURRENT_MODIFICATION\");\n      } catch (error) {\n        if (replaced) {\n          try { restoreOwned(protectFile); } catch (restoreError) {\n            if (restoreError instanceof Error && restoreError.message === \"MIGRATION_CONFIG_CONCURRENT_MODIFICATION\") throw restoreError;\n            fail(\"MIGRATION_APP_CONFIG_ROLLBACK_FAILED\");\n          }\n        }\n        if (error instanceof Error && /^MIGRATION_(?:CONFIG_CONCURRENT_MODIFICATION|APP_CONFIG_WRITE_FAILED)$/.test(error.message)) throw error;\n        fail(\"MIGRATION_APP_CONFIG_WRITE_FAILED\");\n      } finally { removeTemporaryIfOwned(temporary, written); }\n    },\n    restoreIfOwned(protectFile: (filePath: string) => void): void { restoreOwned(protectFile); }\n  };\n}\n
