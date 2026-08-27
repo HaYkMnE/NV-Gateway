@@ -248,7 +248,7 @@ export function Models() {
       }
     });
     return sorted;
-  }, [models, query, deferredQuery, sortBy, companyFilter]);
+  }, [models, deferredQuery, query, companyFilter, sortBy]);
 
   const state = classifyDataState({
     pending: modelsQuery.isPending,
@@ -257,74 +257,114 @@ export function Models() {
     stale: modelsQuery.isError && Boolean(modelsQuery.data),
   });
 
+  const invalidate = () => client.invalidateQueries({ queryKey: queryKeys.models });
+
   const toggleMutation = useMutation({
-    mutationFn: (vars: { id: string; enabled: boolean }) => window.electronAPI.toggleModel(vars.id, vars.enabled),
-    onSuccess: (_data, vars) => {
-      setMutationError(null);
-      void client.invalidateQueries({ queryKey: queryKeys.models });
-      const prev = useModelsStore.getState().models;
-      useModelsStore.getState().setModels(prev.map((m) => (m.id === vars.id ? { ...m, enabled: vars.enabled } : m)));
+    mutationFn: async ({ id, enabled }: { id: string; enabled: boolean }) => {
+      return window.electronAPI.toggleModel(id, enabled);
     },
-    onError: (err) => setMutationError(t('models_toggle_error', { error: safeError(err, t('unknown_error')) })),
+    onMutate: async ({ id, enabled }) => {
+      setMutationError(null);
+      await client.cancelQueries({ queryKey: queryKeys.models });
+      const previous = client.getQueryData(queryKeys.models);
+      client.setQueryData(queryKeys.models, (old: { models?: ModelConfig[] } | undefined) => {
+        if (!old?.models) return old;
+        return {
+          ...old,
+          models: old.models.map((m) => (m.id === id ? { ...m, enabled } : m)),
+        };
+      });
+      return { previous };
+    },
+    onError: (error, _variables, context) => {
+      if (context?.previous) client.setQueryData(queryKeys.models, context.previous);
+      setMutationError(safeError(error, t('unknown_error')));
+    },
+    onSettled: invalidate,
   });
 
   const modeMutation = useMutation({
-    mutationFn: (vars: { id: string; mode: ModelMode }) => window.electronAPI.updateModelSettings(vars.id, { mode: vars.mode }),
-    onSuccess: (_data, vars) => {
-      setMutationError(null);
-      void client.invalidateQueries({ queryKey: queryKeys.models });
-      const prev = useModelsStore.getState().models;
-      useModelsStore.getState().setModels(prev.map((m) => (m.id === vars.id ? { ...m, mode: vars.mode } : m)));
+    mutationFn: async ({ id, mode }: { id: string; mode: ModelMode }) => {
+      return window.electronAPI.updateModelSettings(id, { mode });
     },
-    onError: (err) => setMutationError(t('models_mode_error', { error: safeError(err, t('unknown_error')) })),
+    onMutate: async ({ id, mode }) => {
+      setMutationError(null);
+      await client.cancelQueries({ queryKey: queryKeys.models });
+      const previous = client.getQueryData(queryKeys.models);
+      client.setQueryData(queryKeys.models, (old: { models?: ModelConfig[] } | undefined) => {
+        if (!old?.models) return old;
+        return {
+          ...old,
+          models: old.models.map((m) => (m.id === id ? { ...m, mode } : m)),
+        };
+      });
+      return { previous };
+    },
+    onError: (error, _variables, context) => {
+      if (context?.previous) client.setQueryData(queryKeys.models, context.previous);
+      setMutationError(safeError(error, t('unknown_error')));
+    },
+    onSettled: invalidate,
   });
 
-  const handleRefresh = () => {
+  const bulkToggleMutation = useMutation({
+    mutationFn: async (enabled: boolean) => {
+      return window.electronAPI.bulkToggleModels(enabled);
+    },
+    onMutate: async (enabled) => {
+      setMutationError(null);
+      await client.cancelQueries({ queryKey: queryKeys.models });
+      const previous = client.getQueryData(queryKeys.models);
+      client.setQueryData(queryKeys.models, (old: { models?: ModelConfig[] } | undefined) => {
+        if (!old?.models) return old;
+        return {
+          ...old,
+          models: old.models.map((m) => ({ ...m, enabled })),
+        };
+      });
+      return { previous };
+    },
+    onError: (error, _variables, context) => {
+      if (context?.previous) client.setQueryData(queryKeys.models, context.previous);
+      setMutationError(safeError(error, t('unknown_error')));
+    },
+    onSettled: invalidate,
+  });
+
+  const handleRefresh = async () => {
     setRefreshPending(true);
-    void api
-      .refreshModels()
-      .then(() => {
-        setMutationError(null);
-        void client.invalidateQueries({ queryKey: queryKeys.models });
-      })
-      .catch((err) => setMutationError(t('models_refresh_error', { error: safeError(err, t('unknown_error')) })))
-      .finally(() => setRefreshPending(false));
+    setMutationError(null);
+    try {
+      await api.refreshModels();
+      await invalidate();
+    } catch (err) {
+      setMutationError(safeError(err, t('unknown_error')));
+    } finally {
+      setRefreshPending(false);
+    }
   };
 
-  const handleToggleAll = async (enabled: boolean) => {
-    const toToggle = models.filter((m) => m.enabled !== enabled);
-    if (toToggle.length === 0) return;
+  const handleToggleAll = async (targetState: boolean) => {
     setToggleAllPending(true);
     try {
-      const updatedModels = await window.electronAPI.bulkToggleModels(enabled);
-      if (Array.isArray(updatedModels)) {
-        useModelsStore.getState().setModels(updatedModels);
-        client.setQueryData(queryKeys.models, { models: updatedModels });
-      }
-      void client.invalidateQueries({ queryKey: queryKeys.models });
-      setMutationError(null);
-    } catch (err) {
-      setMutationError(t('models_toggle_error', { error: safeError(err, t('unknown_error')) }));
+      await bulkToggleMutation.mutateAsync(targetState);
     } finally {
       setToggleAllPending(false);
     }
   };
 
-  const toggleExpanded = (id: string) => {
+  const toggleExpand = (id: string) => {
     setExpandedIds((prev) => {
       const next = new Set(prev);
-      if (next.has(id)) {
-        next.delete(id);
-      } else {
-        next.add(id);
-      }
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
       return next;
     });
   };
 
-  const copy = async (text: string, id: string) => {
+  const copyId = async (id: string) => {
     try {
-      await navigator.clipboard.writeText(text);
+      await navigator.clipboard.writeText(id);
       setCopiedId(id);
       window.setTimeout(() => setCopiedId(null), 2000);
     } catch {
@@ -341,485 +381,386 @@ export function Models() {
     );
   }
 
+  const allActive = models.length > 0 && activeCount === models.length;
+
   return (
     <div className="flex flex-col h-full p-4 sm:p-8 min-w-0 overflow-y-auto">
-      {/* Header Hub */}
+      {/* Header with Title + Action Buttons */}
       <div className="flex flex-wrap items-center justify-between gap-4 mb-6">
         <div>
-          <div className="flex items-center gap-3">
-            <h2 className="text-2xl font-bold text-textMain tracking-tight">{t('models_title')}</h2>
-            <div className="flex items-center gap-2">
-              <span className="px-2.5 py-0.5 text-xs font-mono font-semibold bg-accent-neon/15 text-accent-neon border border-accent-neon/30 rounded-full">
-                {t('models_active_count', { count: activeCount })}
-              </span>
-              <span className="px-2.5 py-0.5 text-xs font-mono text-textMuted bg-surface border border-border rounded-full">
-                {t('models_total_count', { count: models.length })}
-              </span>
-            </div>
-          </div>
+          <h2 className="text-2xl font-bold tracking-tight text-textMain">{t('models_title')}</h2>
+          <p className="text-xs text-textMuted mt-1 font-mono">
+            {activeCount}/{models.length} {t('models_active_count')}
+          </p>
         </div>
-
-        <div className="flex flex-wrap items-center gap-3">
+        <div className="flex flex-wrap gap-2">
           <button
-            onClick={handleRefresh}
-            disabled={state === 'loading' || refreshPending}
-            className="flex items-center gap-2 bg-nvidia text-bg px-4 py-2 text-sm font-semibold rounded hover:brightness-110 active:scale-95 disabled:opacity-50 transition-all cursor-pointer shadow-[0_0_12px_rgba(118,185,0,0.3)] animate-tactile-tick"
+            type="button"
+            onClick={() => handleToggleAll(!allActive)}
+            disabled={toggleAllPending || models.length === 0}
+            className="px-3.5 py-2 border border-border hover:border-accent-neon/60 bg-surface hover:bg-bg text-textMain text-xs font-semibold rounded-lg transition-all cursor-pointer disabled:opacity-50 animate-tactile-tick"
           >
-            <RefreshCw aria-hidden size={16} className={refreshPending ? 'animate-spin' : ''} />
+            {allActive ? t('models_disable_all') : t('models_enable_all')}
+          </button>
+          <button
+            type="button"
+            onClick={handleRefresh}
+            disabled={refreshPending}
+            className="px-3.5 py-2 border border-border hover:border-accent-neon/60 bg-surface hover:bg-bg text-accent-neon text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-50 animate-tactile-tick"
+          >
+            <RefreshCw size={14} className={refreshPending ? 'animate-spin' : ''} />
             <span>{t('models_refresh')}</span>
           </button>
         </div>
       </div>
 
+      {/* Mutation Error Toast */}
       {mutationError && (
-        <div role="alert" className="border border-error bg-error/10 text-error p-3 mb-4 break-words rounded">
+        <div role="alert" className="border border-error bg-error/10 text-error p-3.5 mb-4 rounded-lg text-xs break-words">
           {mutationError}
         </div>
       )}
 
-      {state === 'loading' && (
-        <div role="status" className="flex-1 grid place-items-center text-textMuted font-mono">
-          <div className="flex items-center gap-3">
-            <RefreshCw className="animate-spin text-accent-neon" size={20} />
-            <span>{t('loading')}</span>
+      {/* Search Bar + Sort Dropdown */}
+      <div className="flex flex-col sm:flex-row gap-3 mb-4">
+        {/* Search Input */}
+        <div className="relative flex-1">
+          <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-textMuted" />
+          <input
+            ref={searchRef}
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder={`${t('models_search_placeholder')} (${searchShortcut})`}
+            className="w-full bg-surface border border-border focus:border-accent-neon pl-9 pr-8 py-2 text-xs text-textMain rounded-lg outline-none placeholder:text-textMuted font-mono transition-colors"
+          />
+          {query && (
+            <button
+              type="button"
+              onClick={() => setQuery('')}
+              className="absolute right-2.5 top-1/2 -translate-y-1/2 text-textMuted hover:text-textMain p-0.5"
+            >
+              <X size={14} />
+            </button>
+          )}
+        </div>
+
+        {/* Sort Controls */}
+        <div className="flex items-center gap-2 shrink-0">
+          <span className="text-xs text-textMuted font-medium">{t('models_sort_by')}:</span>
+          <div className="inline-flex rounded-lg border border-border bg-surface p-0.5 text-xs">
+            <button
+              type="button"
+              onClick={() => setSortBy('popular')}
+              className={`px-2.5 py-1 rounded-md transition-colors ${
+                sortBy === 'popular' ? 'bg-bg text-accent-neon font-semibold' : 'text-textMuted hover:text-textMain'
+              }`}
+            >
+              {t('models_sort_popular')}
+            </button>
+            <button
+              type="button"
+              onClick={() => setSortBy('name')}
+              className={`px-2.5 py-1 rounded-md transition-colors ${
+                sortBy === 'name' ? 'bg-bg text-accent-neon font-semibold' : 'text-textMuted hover:text-textMain'
+              }`}
+            >
+              {t('models_sort_name')}
+            </button>
+            <button
+              type="button"
+              onClick={() => setSortBy('updated')}
+              className={`px-2.5 py-1 rounded-md transition-colors ${
+                sortBy === 'updated' ? 'bg-bg text-accent-neon font-semibold' : 'text-textMuted hover:text-textMain'
+              }`}
+            >
+              {t('models_sort_updated')}
+            </button>
           </div>
         </div>
-      )}
+      </div>
 
-      {state === 'error' && (
-        <div role="alert" className="border border-error bg-error/10 text-error p-4 mb-4 break-words rounded-lg">
-          <div className="font-semibold mb-1">{t('models_error')}</div>
-          <div className="font-mono text-xs break-all text-error/90 mb-3">{safeError(modelsQuery.error, t('unknown_error'))}</div>
+      {/* Company / Provider Filter Chips */}
+      {companies.length > 1 && (
+        <div className="flex flex-wrap items-center gap-1.5 mb-5 pb-3 border-b border-border/60">
           <button
-            onClick={() => void modelsQuery.refetch()}
-            className="text-xs font-semibold px-3 py-1.5 bg-error/20 hover:bg-error/30 text-white rounded transition-colors"
+            type="button"
+            onClick={() => setCompanyFilter('')}
+            className={`px-2.5 py-1 rounded-md text-xs transition-all cursor-pointer font-medium ${
+              companyFilter === ''
+                ? 'bg-accent-neon/15 text-accent-neon border border-accent-neon/60 font-semibold'
+                : 'bg-surface/80 text-textMuted hover:text-textMain border border-border/80'
+            }`}
           >
+            {t('models_filter_all')} ({models.length})
+          </button>
+          {companies.map((slug) => {
+            const pInfo = resolveProvider(slug);
+            const count = models.filter((m) => providerSlugOf(m) === slug).length;
+            const isSelected = companyFilter === slug;
+            return (
+              <button
+                key={slug}
+                type="button"
+                onClick={() => setCompanyFilter(isSelected ? '' : slug)}
+                className={`px-2.5 py-1 rounded-md text-xs transition-all cursor-pointer flex items-center gap-1.5 border font-medium ${
+                  isSelected
+                    ? 'font-semibold'
+                    : 'bg-surface/80 text-textMuted hover:text-textMain border-border/80'
+                }`}
+                style={
+                  isSelected
+                    ? {
+                        backgroundColor: pInfo.tagBg,
+                        color: pInfo.color,
+                        borderColor: pInfo.color,
+                      }
+                    : undefined
+                }
+              >
+                <ProviderGlyph provider={slug} size={13} color={isSelected ? pInfo.color : undefined} />
+                <span>{pInfo.name}</span>
+                <span className="text-[10px] opacity-70 font-mono">({count})</span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Loading / Error States */}
+      {state === 'loading' && <div role="status" className="p-8 text-center text-textMuted">{t('loading')}</div>}
+      {state === 'error' && (
+        <div role="alert" className="border border-error p-4 rounded-lg mb-4">
+          <p className="text-error font-medium">{t('models_error')}</p>
+          <p className="text-xs text-textMuted mt-1 break-all">{safeError(modelsQuery.error, t('unknown_error'))}</p>
+          <button onClick={() => void modelsQuery.refetch()} className="mt-3 text-xs text-accent-neon hover:underline">
             {t('retry')}
           </button>
         </div>
       )}
 
-      {state === 'stale' && (
-        <div role="status" className="border border-warning/40 bg-warning/10 p-3 mb-4 text-xs text-warning rounded flex items-center justify-between">
-          <span>{t('stale')}</span>
-          <button onClick={() => void modelsQuery.refetch()} className="text-accent-neon underline hover:brightness-125">
-            {t('retry')}
-          </button>
-        </div>
-      )}
-
-      {state === 'empty' && (
-        <div className="flex-1 grid place-items-center text-textMuted py-16">
-          <div className="text-center space-y-3">
-            <Cpu size={40} className="mx-auto text-textMuted/60" />
-            <p className="text-base">{t('models_available')}</p>
-          </div>
-        </div>
-      )}
-
+      {/* Models List */}
       {(state === 'success' || state === 'stale') && (
-        <>
-          {/* Cyber Filter Toolbar */}
-          <div className="bg-surface/80 border border-border/80 rounded-xl p-3.5 mb-6 backdrop-blur-md">
-            <div className="flex flex-wrap items-center gap-3">
-              {/* Search Bar */}
-              <div className="relative flex-1 min-w-[220px]">
-                <Search aria-hidden size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-textMuted pointer-events-none" />
-                <input
-                  ref={searchRef}
-                  type="text"
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
-                  placeholder={t('models_search_placeholder')}
-                  aria-label={t('models_search_placeholder')}
-                  className="w-full bg-bg border border-border/90 pl-9 pr-16 py-2 text-sm rounded-lg focus:border-accent-neon/80 focus:shadow-[0_0_10px_rgba(89,255,0,0.2)] outline-none text-textMain transition-all"
-                />
-                {query && (
-                  <button
-                    onClick={() => setQuery('')}
-                    className="absolute right-9 top-1/2 -translate-y-1/2 text-textMuted hover:text-textMain p-1"
-                    aria-label={t('models_clear_search')}
-                  >
-                    <X aria-hidden size={14} />
-                  </button>
-                )}
-                <kbd aria-hidden="true" className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[11px] font-mono text-textMuted/70 bg-surface px-1.5 py-0.5 border border-border rounded hidden sm:block">
-                  {searchShortcut}
-                </kbd>
-              </div>
-
-              {/* Sort By */}
-              <label className="flex items-center gap-2 text-xs font-medium text-textMuted">
-                <span>{t('models_sort_label')}</span>
-                <select
-                  value={sortBy}
-                  onChange={(e) => setSortBy(e.target.value as SortBy)}
-                  className="bg-bg border border-border/90 text-textMain px-2.5 py-1.5 text-xs rounded-lg outline-none focus:border-accent-neon/60"
-                  aria-label={t('models_sort_label')}
-                >
-                  <option value="popular">{t('models_sort_popular')}</option>
-                  <option value="name">{t('models_sort_name')}</option>
-                  <option value="updated">{t('models_sort_updated')}</option>
-                </select>
-              </label>
-
-              {/* Bulk Toggle Buttons */}
-              <div className="flex items-center gap-2 ml-auto">
-                <button
-                  type="button"
-                  onClick={() => void handleToggleAll(true)}
-                  disabled={toggleAllPending}
-                  className="px-3 py-1.5 text-xs font-semibold border border-border hover:border-accent-neon/50 bg-bg hover:bg-surface text-textMain rounded-lg disabled:opacity-50 transition-all cursor-pointer animate-tactile-tick"
-                >
-                  {t('models_enable_all')}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void handleToggleAll(false)}
-                  disabled={toggleAllPending}
-                  className="px-3 py-1.5 text-xs font-semibold border border-border hover:border-error/50 bg-bg hover:bg-surface text-textMuted hover:text-error rounded-lg disabled:opacity-50 transition-all cursor-pointer animate-tactile-tick"
-                >
-                  {t('models_disable_all')}
-                </button>
-              </div>
-            </div>
-
-            {/* Interactive Company Cyber-Chips Bar */}
-            {companies.length > 0 && (
-              <div className="mt-3 pt-3 border-t border-border/50">
-                <div className="flex flex-wrap gap-1.5 items-center" role="toolbar" aria-label={t('models_company_filter')}>
-                  {/* All Companies Chip */}
-                  <button
-                    type="button"
-                    role="button"
-                    aria-pressed={companyFilter === ''}
-                    aria-label={t('models_all_companies')}
-                    onClick={() => setCompanyFilter('')}
-                    className={`group flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs transition-all cursor-pointer select-none animate-tactile-tick border ${
-                      companyFilter === ''
-                        ? 'border-accent-neon/80 bg-accent-neon/15 text-accent-neon shadow-[0_0_10px_rgba(89,255,0,0.25)] font-bold'
-                        : 'border-border/80 bg-surface/50 text-textMuted hover:text-textMain hover:border-border hover:bg-surface font-medium'
-                    }`}
-                  >
-                    <Layers size={13} className={`shrink-0 ${companyFilter === '' ? 'text-accent-neon' : 'text-textMuted group-hover:text-textMain'}`} />
-                    <span>{t('models_all_companies')}</span>
-                  </button>
-
-                  {/* Individual Company Chips */}
-                  {companies.map((slug) => {
-                    const providerInfo = resolveProvider(slug);
-                    const isSelected = companyFilter === slug;
-                    return (
-                      <button
-                        key={slug}
-                        type="button"
-                        role="button"
-                        aria-pressed={isSelected}
-                        aria-label={providerInfo.name}
-                        onClick={() => setCompanyFilter((prev) => (prev === slug ? '' : slug))}
-                        style={
-                          isSelected
-                            ? {
-                                borderColor: providerInfo.color,
-                                backgroundColor: providerInfo.tagBg,
-                                color: providerInfo.tagText,
-                                boxShadow: `0 0 10px ${providerInfo.glowColor}`,
-                              }
-                            : undefined
-                        }
-                        className={`group flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs transition-all cursor-pointer select-none animate-tactile-tick border ${
-                          isSelected
-                            ? 'font-bold'
-                            : 'border-border/80 bg-surface/50 text-textMuted hover:text-textMain hover:border-border hover:bg-surface font-medium'
-                        }`}
-                      >
-                        <ProviderGlyph provider={slug} size={14} color={providerInfo.color} />
-                        <span>{providerInfo.name}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* Catalog Grid */}
+        <div className="space-y-3 pb-8">
           {filteredModels.length === 0 ? (
-            <div className="flex-1 grid place-items-center text-textMuted py-12">
-              <p className="text-sm font-mono">{t('models_no_models_found')}</p>
+            <div className="bg-surface/60 border border-dashed border-border/80 p-8 rounded-xl text-center text-textMuted text-sm">
+              <Cpu size={32} className="mx-auto mb-2 text-textMuted/60" />
+              <p>{t('models_no_match')}</p>
             </div>
           ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 2xl:grid-cols-3 gap-4 pb-6">
-              {filteredModels.map((model) => {
-                const keysCount = keys.filter((k) => Array.isArray(k.accessibleModels) && k.accessibleModels.includes(model.id)).length;
-                const keysTotal = keys.length;
-                const providerSlug = providerSlugOf(model);
-                const providerInfo = resolveProvider(providerSlug);
-                const capabilityTags = extractCapabilities(model.id, model.labels ?? [], model.category);
-                const isExpanded = expandedIds.has(model.id);
+            filteredModels.map((m) => {
+              const slug = providerSlugOf(m);
+              const providerInfo = resolveProvider(slug);
+              const isExpanded = expandedIds.has(m.id);
+              const capabilities = extractCapabilities(m.id, m.labels, m.category);
+              const popLabel = formatPopularity(m.popularity);
+              const updatedLabel = formatLastUpdated(m.lastUpdated);
 
-                const [namespace, heroName] = model.id.includes('/')
-                  ? [model.id.split('/')[0], model.id.split('/').slice(1).join('/')]
-                  : ['', model.id];
-
-                const curlSnippet = `curl http://127.0.0.1:${gatewayPort}/v1/chat/completions \\
-  -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer $GATEWAY_TOKEN" \\
-  -d '{
-    "model": "${model.id}",
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'`;
-
-                return (
-                  <section
-                    key={model.id}
-                    className={`relative rounded-xl p-5 flex flex-col justify-between transition-all duration-200 overflow-hidden border ${
-                      model.enabled
-                        ? 'border-border/90 hover:border-accent-neon/60 shadow-lg'
-                        : 'border-border/60 bg-surface/60 opacity-80 hover:opacity-100 hover:border-border'
-                    }`}
-                    style={
-                      model.enabled
-                        ? {
-                            background: `radial-gradient(ellipse 90% 60% at 20% 0%, ${providerInfo.glowColor} 0%, rgba(13, 17, 14, 0.98) 75%), #0D110E`,
-                          }
-                        : undefined
-                    }
-                  >
-                    {/* Active model neon top accent line */}
-                    {model.enabled && (
+              return (
+                <div
+                  key={m.id}
+                  className={`bg-surface border rounded-xl transition-all ${
+                    m.enabled ? 'border-border hover:border-accent-neon/50' : 'border-border/60 opacity-75'
+                  }`}
+                >
+                  {/* Top Bar / Summary */}
+                  <div className="p-4 flex flex-col md:flex-row md:items-center justify-between gap-3">
+                    {/* Left side: Icon + Names + Tags */}
+                    <div className="flex items-start gap-3 min-w-0 flex-1">
+                      {/* Provider Glyph Badge */}
                       <div
-                        className="absolute top-0 inset-x-0 h-[2px] rounded-t-xl"
-                        style={
-                          {\n                            background: `linear-gradient(90deg, transparent 0%, ${providerInfo.borderAccent} 50%, transparent 100%)`,\n                          }
-                        }
-                      />
-                    )}
+                        className="p-2 rounded-lg border shrink-0 mt-0.5"
+                        style={{
+                          backgroundColor: providerInfo.tagBg,
+                          borderColor: `${providerInfo.color}30`,
+                        }}
+                      >
+                        <ProviderGlyph provider={slug} size={20} color={providerInfo.color} />
+                      </div>
 
-                    <div>
-                      {/* Card Header (Provider Badge + Capability Tags + Status Flags) */}
-                      <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-2 mb-3">
-                        {/* Provider Badge */}
-                        <div
-                          className="flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-[11px] font-bold tracking-wider uppercase shrink-0"
-                          style={{
-                            backgroundColor: providerInfo.tagBg,
-                            borderColor: `${providerInfo.color}40`,
-                            color: providerInfo.tagText,
-                          }}
-                        >
-                          <ProviderGlyph provider={providerSlug} size={15} color={providerInfo.color} />
-                          <span>{providerInfo.name}</span>
+                      {/* Main Info */}
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-2 mb-1">
+                          <span className="font-mono text-sm font-bold text-textMain break-all">{m.id}</span>
+                          <button
+                            type="button"
+                            onClick={() => copyId(m.id)}
+                            className="p-1 text-textMuted hover:text-accent-neon transition-colors cursor-pointer"
+                            aria-label={t('copy')}
+                            title={t('copy')}
+                          >
+                            {copiedId === m.id ? <Check size={13} className="text-accent-neon" /> : <Copy size={13} />}
+                          </button>
                         </div>
 
-                        {/* Status Badges (Free, Downloadable, Deprecated) */}
-                        <div className="flex flex-wrap items-center gap-1.5">
-                          {model.freeEndpoint && (
-                            <span className="bg-purple-950/70 text-purple-300 border border-purple-700/60 text-[10px] font-bold px-2 py-0.5 rounded-full">
+                        {/* Model Human Name */}
+                        {m.name && m.name !== m.id && (
+                          <div className="text-xs text-textMuted mb-2">{m.name}</div>
+                        )}
+
+                        {/* Capability & Metadata Badges */}
+                        <div className="flex flex-wrap items-center gap-1.5 mt-2">
+                          {/* Provider chip */}
+                          <span
+                            className="px-2 py-0.5 rounded-md text-[10px] font-semibold border"
+                            style={{
+                              backgroundColor: providerInfo.tagBg,
+                              color: providerInfo.color,
+                              borderColor: `${providerInfo.color}40`,
+                            }}
+                          >
+                            {providerInfo.name}
+                          </span>
+
+                          {/* Capabilities */}
+                          {capabilities.map((c) => (
+                            <span
+                              key={c.id}
+                              className={`px-2 py-0.5 rounded-md text-[10px] font-medium border flex items-center gap-1 ${c.colorClass} ${c.borderClass} ${c.bgClass}`}
+                            >
+                              {c.icon}
+                              <span>{t(c.labelKey)}</span>
+                            </span>
+                          ))}
+
+                          {/* Popularity metric */}
+                          {popLabel && (
+                            <span className="px-2 py-0.5 rounded-md text-[10px] font-mono font-medium text-textMuted bg-bg border border-border/70">
+                              ★ {popLabel}
+                            </span>
+                          )}
+
+                          {/* Last updated */}
+                          {updatedLabel && (
+                            <span className="px-2 py-0.5 rounded-md text-[10px] font-mono text-textMuted bg-bg border border-border/70">
+                              🕒 {updatedLabel}
+                            </span>
+                          )}
+
+                          {/* Free endpoint badge */}
+                          {m.freeEndpoint && (
+                            <span className="px-2 py-0.5 rounded-md text-[10px] font-semibold text-purple-300 bg-purple-950/50 border border-purple-800/60">
                               {t('models_free_endpoint')}
                             </span>
                           )}
-                          {model.downloadable && (
-                            <span className="bg-cyan-950/70 text-cyan-300 border border-cyan-700/60 text-[10px] font-bold px-2 py-0.5 rounded-full">
-                              {t('models_downloadable')}
-                            </span>
-                          )}
-                          {model.deprecated && (
-                            <span className="bg-amber-950/70 text-amber-300 border border-amber-700/60 text-[10px] font-bold px-2 py-0.5 rounded-full">
+
+                          {/* Deprecated warning */}
+                          {m.deprecated && (
+                            <span className="px-2 py-0.5 rounded-md text-[10px] font-semibold text-warning bg-warning/10 border border-warning/40">
                               {t('models_deprecated')}
                             </span>
                           )}
                         </div>
                       </div>
-
-                      {/* Card Title (Namespace + Crisp Bold Hero Name) */}
-                      <div className="mt-2 mb-1.5">
-                        {namespace && (
-                          <div className="text-[11px] font-mono text-textMuted tracking-wider font-semibold uppercase flex items-center gap-1 mb-0.5">
-                            <span>{namespace}</span>
-                            <span className="text-border-soft">/</span>
-                          </div>
-                        )}
-                        <h3 className="text-base sm:text-lg font-bold text-textMain tracking-tight break-words">
-                          {heroName}
-                        </h3>
-                      </div>
-
-                      {/* Card Description */}
-                      <p className="text-xs text-[#9EABB2] line-clamp-2 leading-relaxed min-h-[32px] mt-1">
-                        {model.shortDescription || t('models_default_description', { provider: providerInfo.name })}
-                      </p>
-
-                      {/* Capability & Category Tags Row */}
-                      <div className="flex flex-wrap items-center justify-between gap-2 mt-3.5 text-xs">
-                        <div className="flex flex-wrap items-center gap-1.5">
-                          {capabilityTags.map((cap) => (
-                            <span
-                              key={cap.id}
-                              className={`flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full border ${cap.bgClass} ${cap.borderClass} ${cap.colorClass}`}
-                            >
-                              {cap.icon}
-                              <span>{t(cap.labelKey as any)}</span>
-                            </span>
-                          ))}
-                        </div>
-
-                        {/* Popularity & Last Updated */}
-                        <div className="flex items-center gap-3 text-[11px] text-textMuted font-mono shrink-0 ml-auto">
-                          {model.popularity != null && <span title={t('models_popularity', { count: model.popularity })}>↓ {formatPopularity(model.popularity)}</span>}
-                          {model.lastUpdated && <span>⏱ {formatLastUpdated(model.lastUpdated)}</span>}
-                        </div>
-                      </div>
                     </div>
 
-                    {/* Card Action Controls & Expand Button */}
-                    <div className="mt-4 pt-3 border-t border-border/70">
-                      <div className="flex flex-wrap items-center justify-between gap-3">
-                        <div className="flex flex-wrap items-center gap-3">
-                          {/* Tactile Glowing Toggle Switch */}
-                          <div className="flex items-center gap-2">
-                            <button
-                              type="button"
-                              role="switch"
-                              aria-checked={model.enabled}
-                              aria-label={`${t('models_enabled')} ${model.id}`}
-                              disabled={toggleMutation.isPending}
-                              onClick={() => toggleMutation.mutate({ id: model.id, enabled: !model.enabled })}
-                              className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-all duration-200 cursor-pointer animate-tactile-tick ${
-                                model.enabled
-                                  ? 'bg-accent-neon shadow-[0_0_12px_rgba(89,255,0,0.6)]'
-                                  : 'bg-white/15 hover:bg-white/20'
-                              }`}
-                            >
-                              <span
-                                className={`inline-block h-4 w-4 transform rounded-full bg-white shadow-md transition-transform duration-200 ${
-                                  model.enabled ? 'translate-x-6 bg-black' : 'translate-x-1'
-                                }`}
-                              />
-                            </button>
-                            <span className="text-xs font-semibold text-textMuted">{t('models_enabled')}</span>
-                          </div>
+                    {/* Right side: Controls (Mode dropdown + Enabled toggle + Expand button) */}
+                    <div className="flex items-center justify-between md:justify-end gap-3 pt-3 md:pt-0 border-t md:border-t-0 border-border/60 shrink-0">
+                      {/* Performance Mode Selector */}
+                      <select
+                        value={m.mode}
+                        onChange={(e) => modeMutation.mutate({ id: m.id, mode: e.target.value as ModelMode })}
+                        disabled={modeMutation.isPending || !m.enabled}
+                        aria-label={t('models_mode_label')}
+                        className="bg-bg border border-border/80 px-2.5 py-1.5 text-xs text-textMain rounded-lg outline-none cursor-pointer disabled:opacity-40"
+                      >
+                        <option value="day">{t('mode_day')}</option>
+                        <option value="night">{t('mode_night')}</option>
+                        <option value="auto">{t('mode_auto')}</option>
+                      </select>
 
-                          {/* Day/Night/Auto Mode Selector */}
-                          <label className="flex items-center gap-1.5 text-xs text-textMuted">
-                            <select
-                              aria-label={`${t('models_mode_label')} ${model.id}`}
-                              value={model.mode}
-                              disabled={modeMutation.isPending}
-                              onChange={(e) => modeMutation.mutate({ id: model.id, mode: e.target.value as ModelMode })}
-                              className="bg-bg border border-border px-2 py-1 text-xs rounded text-textMain outline-none focus:border-accent-neon/50"
-                            >
-                              <option value="day">{t('mode_day')}</option>
-                              <option value="night">{t('mode_night')}</option>
-                              <option value="auto">{t('mode_auto')}</option>
-                            </select>
-                          </label>
+                      {/* Enable / Disable Switch */}
+                      <label className="flex items-center gap-2 cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          role="switch"
+                          checked={m.enabled}
+                          disabled={toggleMutation.isPending}
+                          onChange={(e) => toggleMutation.mutate({ id: m.id, enabled: e.target.checked })}
+                          className="sr-only peer"
+                        />
+                        <div className="w-9 h-5 bg-border/80 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-nvidia relative"></div>
+                        <span className="text-xs font-semibold text-textMain hidden sm:inline">
+                          {m.enabled ? t('models_enabled') : t('models_disabled')}
+                        </span>
+                      </label>
 
-                          {/* Key Quorum Battery / LED Meter */}
-                          <div
-                            className="flex items-center gap-1.5 px-2.5 py-1 bg-bg border border-border/80 rounded-md"
-                            title={t('models_quorum_active', { count: keysCount, total: keysTotal })}
-                          >
-                            <div className="flex items-center gap-1">
-                              {Array.from({ length: Math.max(keysTotal, 1) }).map((_, idx) => {
-                                const isLedActive = idx < keysCount;
-                                return (
-                                  <span
-                                    key={idx}
-                                    className={`w-1.5 h-2.5 rounded-xs transition-all ${
-                                      isLedActive
-                                        ? 'bg-accent-neon shadow-[0_0_6px_#59FF00]'
-                                        : 'bg-white/15'
-                                    }`}
-                                  />
-                                );
-                              })}
-                            </div>
-                            <span className="text-[11px] font-mono text-textMuted">
-                              {keysCount}/{keysTotal} {t('keys_short')}
-                            </span>
-                          </div>
-                        </div>
+                      {/* Collapsible Details Trigger */}
+                      <button
+                        type="button"
+                        onClick={() => toggleExpand(m.id)}
+                        className="p-1.5 text-textMuted hover:text-textMain rounded-lg hover:bg-bg border border-transparent hover:border-border transition-colors cursor-pointer"
+                        aria-expanded={isExpanded}
+                        aria-label={t('details')}
+                      >
+                        {isExpanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+                      </button>
+                    </div>
+                  </div>
 
-                        {/* Expand Details / Inspector Button */}
-                        <button
-                          type="button"
-                          onClick={() => toggleExpanded(model.id)}
-                          className="flex items-center gap-1 text-xs font-medium text-textMuted hover:text-accent-neon transition-colors ml-auto cursor-pointer"
-                        >
-                          <span>{isExpanded ? t('models_hide_details') : t('models_details')}</span>
-                          {isExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-                        </button>
-                      </div>
-
-                      {/* Expandable Inspector Drawer */}
-                      {isExpanded && (
-                        <div className="mt-3.5 p-3.5 bg-bg/90 border border-border/80 rounded-lg space-y-3">
-                          {/* 1-Click Copy Model ID */}
-                          <div className="flex items-center justify-between gap-2 pb-2 border-b border-border/50">
-                            <div className="min-w-0 flex-1">
-                              <div className="text-[10px] text-textMuted uppercase font-bold tracking-wider">{t('models_full_id')}</div>
-                              <code className="font-mono text-xs text-accent-neon break-all select-all">{model.id}</code>
-                            </div>
-                            <button
-                              type="button"
-                              onClick={() => copy(model.id, `model-id-${model.id}`)}
-                              className="px-2.5 py-1.5 border border-border hover:border-accent-neon/50 bg-surface hover:bg-bg text-accent-neon text-xs flex items-center gap-1.5 shrink-0 rounded transition-all cursor-pointer animate-tactile-tick"
-                            >
-                              {copiedId === `model-id-${model.id}` ? <Check size={13} /> : <Copy size={13} />}
-                              <span>{copiedId === `model-id-${model.id}` ? t('copied') : t('models_copy_id')}</span>
-                            </button>
-                          </div>
-
-                          {/* cURL Snippet Preview */}
-                          <div>
-                            <div className="flex items-center justify-between mb-1">
-                              <div className="flex items-center gap-1.5 text-[10px] text-textMuted uppercase font-bold tracking-wider">
-                                <Terminal size={12} className="text-nvidia" />
-                                <span>{t('models_curl_preview')}</span>
-                              </div>
-                              <button
-                                type="button"
-                                onClick={() => copy(curlSnippet, `curl-${model.id}`)}
-                                className="text-xs text-accent-neon hover:text-accent-neon/80 flex items-center gap-1 cursor-pointer"
-                              >
-                                {copiedId === `curl-${model.id}` ? (
-                                  <>
-                                    <Check size={12} />
-                                    <span>{t('copied')}</span>
-                                  </>
-                                ) : (
-                                  <>
-                                    <Copy size={12} />
-                                    <span>{t('models_copy_curl')}</span>
-                                  </>
-                                )}
-                              </button>
-                            </div>
-                            <pre className="bg-[#080B09] border border-border/80 p-2.5 text-[11px] font-mono text-textMuted overflow-x-auto whitespace-pre-wrap break-all rounded leading-relaxed">
-                              {curlSnippet}
-                            </pre>
-                          </div>
-
-                          {/* Model Metadata Labels */}
-                          {(model.labels?.length || 0) > 0 && (
-                            <div className="flex flex-wrap gap-1 pt-1">
-                              {model.labels?.map((labelItem, i) => (
-                                <span key={i} className="px-2 py-0.5 text-[10px] font-mono bg-white/5 border border-white/10 text-textMuted rounded">
-                                  {labelItem}
-                                </span>
-                              ))}
-                            </div>
-                          )}
+                  {/* Expanded Detail Panel */}
+                  {isExpanded && (
+                    <div className="px-4 pb-4 pt-2 border-t border-border/60 bg-bg/50 rounded-b-xl space-y-3">
+                      {/* Short Description */}
+                      {m.shortDescription && (
+                        <div>
+                          <span className="text-[11px] font-semibold uppercase tracking-wider text-textMuted block mb-1">
+                            {t('models_description')}
+                          </span>
+                          <p className="text-xs text-textMain leading-relaxed">{m.shortDescription}</p>
                         </div>
                       )}
+
+                      {/* Details Grid */}
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-2">
+                        <div className="bg-surface border border-border/70 p-2.5 rounded-lg">
+                          <span className="text-[10px] text-textMuted uppercase block">{t('models_category')}</span>
+                          <span className="text-xs font-mono font-medium text-textMain">
+                            {m.category || t('models_unknown')}
+                          </span>
+                        </div>
+                        <div className="bg-surface border border-border/70 p-2.5 rounded-lg">
+                          <span className="text-[10px] text-textMuted uppercase block">{t('models_downloadable')}</span>
+                          <span className="text-xs font-mono font-medium text-textMain">
+                            {m.downloadable ? t('yes') : t('no')}
+                          </span>
+                        </div>
+                        <div className="bg-surface border border-border/70 p-2.5 rounded-lg">
+                          <span className="text-[10px] text-textMuted uppercase block">{t('models_publisher')}</span>
+                          <span className="text-xs font-mono font-medium text-textMain">
+                            {m.publisher || providerInfo.name}
+                          </span>
+                        </div>
+                        <div className="bg-surface border border-border/70 p-2.5 rounded-lg">
+                          <span className="text-[10px] text-textMuted uppercase block">{t('models_last_updated')}</span>
+                          <span className="text-xs font-mono font-medium text-textMain">
+                            {m.lastUpdated ? new Date(m.lastUpdated).toLocaleDateString() : t('models_unknown')}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Quick cURL / OpenAI Usage Snippet */}
+                      <div className="pt-2">
+                        <span className="text-[11px] font-semibold uppercase tracking-wider text-textMuted block mb-1">
+                          {t('models_usage_example')}
+                        </span>
+                        <pre className="bg-[#080B09] border border-border p-3 text-[11px] font-mono text-accent-neon overflow-x-auto whitespace-pre-wrap rounded-lg">
+                          {`curl http://127.0.0.1:${gatewayPort}/v1/chat/completions \\
+  -H "Authorization: Bearer <GATEWAY_TOKEN>" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "${m.id}",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'`}
+                        </pre>
+                      </div>
                     </div>
-                  </section>
-                );
-              })}
-            </div>
+                  )}
+                </div>
+              );
+            })
           )}
-        </>
+        </div>
       )}
     </div>
   );

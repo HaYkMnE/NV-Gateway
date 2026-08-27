@@ -50,7 +50,15 @@ export function Wizard() {
   };
 
   const errorKey = validation ? `port_${validation}` : null;
-  const languageOptions: Array<{ value: AppLanguage; labelKey: string }> = [\n    { value: 'en', labelKey: 'english' },\n    { value: 'zh', labelKey: 'chinese' },\n    { value: 'es', labelKey: 'spanish' },\n    { value: 'hi', labelKey: 'hindi' },\n    { value: 'fr', labelKey: 'french' },\n    { value: 'ar', labelKey: 'arabic' },\n    { value: 'ru', labelKey: 'russian' }\n  ];
+  const languageOptions: Array<{ value: AppLanguage; labelKey: string }> = [
+    { value: 'en', labelKey: 'english' },
+    { value: 'zh', labelKey: 'chinese' },
+    { value: 'es', labelKey: 'spanish' },
+    { value: 'hi', labelKey: 'hindi' },
+    { value: 'fr', labelKey: 'french' },
+    { value: 'ar', labelKey: 'arabic' },
+    { value: 'ru', labelKey: 'russian' }
+  ];
   return <main className="h-full overflow-y-auto bg-bg px-4 py-4 sm:px-8 sm:py-8 flex items-start justify-center">
     <section className="bg-surface border border-border w-full min-w-0 max-w-[440px] max-h-[calc(100vh-2rem)] overflow-y-auto p-5 sm:p-8 shadow-2xl relative break-words" aria-labelledby="wizard-title">
       <div className="absolute inset-x-0 top-0 h-1 bg-accent-neon" /><Logo className="w-12 h-12 mx-auto mb-4" />
