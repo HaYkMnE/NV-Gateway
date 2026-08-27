@@ -115,4 +115,84 @@ jobs:
           # Local mutable counter for THIS run (start from the persisted value).
           COUNT="$SESSIONS_TODAY"
 
-          commit_state() {\n            # Persist current {exhausted_date, sessions_today} to the state file.\n            # $1 = exhausted_date value (TODAY or \"null\"), $2 = sessions_today (int).\n            local EXH=\"$1\"; local ST=\"$2\"\n            git config user.name \"github-actions[bot]\"\n            git config user.email \"github-actions[bot]@users.noreply.github.com\"\n            git add \"$STATE_FILE\"\n            git commit -m \"chore(jules): update quota state (exhausted=$EXH, sessions_today=$ST)\" >/dev/null 2>&1 || true\n            git push >/dev/null 2>&1 || { echo \"WARN: failed to push quota-state commit; next runs may retry.\"; }\n          }\n\n          for i in $(seq 1 \"$RUN_CAP\"); do\n            echo \"----- Iteration $i / $RUN_CAP  (today count: $COUNT / $DAILY_TARGET) -----\"\n\n            # Build payload identical to the previous single-shot flow.\n            # NOTE: no `model` field — see MODEL NOTE above. Defaults to Gemini 3.1 Pro.\n            jq -n --arg jules_prompt \"$(cat prompt.txt)\" \\\n                  --arg starting_branch \"main\" \\\n                  --arg repo_full_name \"${REPO_FULL}\" \\\n                  '{\n                    prompt: $jules_prompt,\n                    sourceContext: {\n                      source: (\"sources/github/\" + $repo_full_name),\n                      githubRepoContext: { startingBranch: $starting_branch }\n                    },\n                    requirePlanApproval: true\n                  }' > payload.json\n\n            RESPONSE=$(curl -s --max-time 60 --retry 2 -w \"\\n%{http_code}\" -X POST \"https://jules.googleapis.com/v1alpha/sessions\" \\\n              -H \"Content-Type: application/json\" \\\n              -H \"X-Goog-Api-Key: ${JULES_KEY}\" \\\n              -d @payload.json)\n\n            HTTP_CODE=$(echo \"$RESPONSE\" | tail -1)\n            BODY=$(echo \"$RESPONSE\" | sed '$d')\n            echo \"Iteration $i: HTTP $HTTP_CODE\"\n            echo \"Body: $BODY\"\n\n            # --- Quota exhaustion detection (HTTP 429/403 or quota signals in body) ---\n            if [ \"$HTTP_CODE\" = \"429\" ] || [ \"$HTTP_CODE\" = \"403\" ] || \\\n               echo \"$BODY\" | grep -qiE \"RESOURCE_EXHAUSTED|quota|rateLimitExceeded|daily.*limit|RATE_LIMIT_EXCEEDED\"; then\n              echo \"Quota exhausted (HTTP $HTTP_CODE). Stopping loop and recording exhaustion date $TODAY (UTC, sessions_today=$COUNT).\"\n              jq -n --arg d \"$TODAY\" --argjson s \"$COUNT\" \\\n                '{exhausted_date: $d, sessions_today: $s}' > \"$STATE_FILE\"\n              commit_state \"$TODAY\" \"$COUNT\"\n              break\n            fi\n\n            # --- Session created successfully ---\n            SESSION_NAME=$(echo \"$BODY\" | jq -r '.name // empty' 2>/dev/null || echo \"\")\n            if [ -n \"$SESSION_NAME\" ]; then\n              COUNT=$(( COUNT + 1 ))\n              echo \"Session $SESSION_NAME created. Incremented sessions_today -> $COUNT / $DAILY_TARGET.\"\n              # Persist the incremented counter after every successful session, so a\n              # killed/cancelled run still leaves an honest persisted count.\n              jq -n --arg d \"null\" --argjson s \"$COUNT\" \\\n                '{exhausted_date: $d, sessions_today: $s}' > \"$STATE_FILE\"\n              commit_state \"null\" \"$COUNT\"\n\n              TITLE=\"[Analyst Task] $(date -u +'%Y-%m-%d %H:%M') #${COUNT} Log & Codebase Audit\"\n              BODY_ISSUE=\"Jules Session: $SESSION_NAME. Handoff payload pending in session. (sessions_today=$COUNT/$DAILY_TARGET)\"\n              gh issue create --title \"$TITLE\" --body \"$BODY_ISSUE\" --label \"enhancement\" \\\n                || echo \"WARN: gh issue create failed on iteration $i (continuing loop).\"\n\n              # Stop as soon as we hit the daily target for this UTC day.\n              if [ \"$COUNT\" -ge \"$DAILY_TARGET\" ]; then\n                echo \"Daily target reached ($COUNT/$DAILY_TARGET). Marking done for today ($TODAY UTC) and stopping loop.\"\n                jq -n --arg d \"$TODAY\" --argjson s \"$COUNT\" \\\n                  '{exhausted_date: $d, sessions_today: $s}' > \"$STATE_FILE\"\n                commit_state \"$TODAY\" \"$COUNT\"\n                break\n              fi\n            else\n              echo \"Iteration $i: empty session name (transient?). Body: $BODY. Continuing.\"\n            fi\n\n            # Throttle: concurrent cap is 15/account; we use 1 at a time, sleep 30s.\n            sleep 30\n          done\n\n          echo \"Autonomous loop finished for this run. Final sessions_today=$COUNT / $DAILY_TARGET.\"\n
+          commit_state() {
+            # Persist current {exhausted_date, sessions_today} to the state file.
+            # $1 = exhausted_date value (TODAY or "null"), $2 = sessions_today (int).
+            local EXH="$1"; local ST="$2"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add "$STATE_FILE"
+            git commit -m "chore(jules): update quota state (exhausted=$EXH, sessions_today=$ST)" >/dev/null 2>&1 || true
+            git push >/dev/null 2>&1 || { echo "WARN: failed to push quota-state commit; next runs may retry."; }
+          }
+
+          for i in $(seq 1 "$RUN_CAP"); do
+            echo "----- Iteration $i / $RUN_CAP  (today count: $COUNT / $DAILY_TARGET) -----"
+
+            # Build payload identical to the previous single-shot flow.
+            # NOTE: no `model` field — see MODEL NOTE above. Defaults to Gemini 3.1 Pro.
+            jq -n --arg jules_prompt "$(cat prompt.txt)" \
+                  --arg starting_branch "main" \
+                  --arg repo_full_name "${REPO_FULL}" \
+                  '{\
+                    prompt: $jules_prompt,\
+                    sourceContext: {\
+                      source: ("sources/github/" + $repo_full_name),\
+                      githubRepoContext: { startingBranch: $starting_branch }\
+                    },\
+                    requirePlanApproval: true\
+                  }' > payload.json
+
+            RESPONSE=$(curl -s --max-time 60 --retry 2 -w "\n%{http_code}" -X POST "https://jules.googleapis.com/v1alpha/sessions" \
+              -H "Content-Type: application/json" \
+              -H "X-Goog-Api-Key: ${JULES_KEY}" \
+              -d @payload.json)
+
+            HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+            BODY=$(echo "$RESPONSE" | sed '$d')
+            echo "Iteration $i: HTTP $HTTP_CODE"
+            echo "Body: $BODY"
+
+            # --- Quota exhaustion detection (HTTP 429/403 or quota signals in body) ---
+            if [ "$HTTP_CODE" = "429" ] || [ "$HTTP_CODE" = "403" ] || \
+               echo "$BODY" | grep -qiE "RESOURCE_EXHAUSTED|quota|rateLimitExceeded|daily.*limit|RATE_LIMIT_EXCEEDED"; then
+              echo "Quota exhausted (HTTP $HTTP_CODE). Stopping loop and recording exhaustion date $TODAY (UTC, sessions_today=$COUNT)."
+              jq -n --arg d "$TODAY" --argjson s "$COUNT" \
+                '{exhausted_date: $d, sessions_today: $s}' > "$STATE_FILE"
+              commit_state "$TODAY" "$COUNT"
+              break
+            fi
+
+            # --- Session created successfully ---
+            SESSION_NAME=$(echo "$BODY" | jq -r '.name // empty' 2>/dev/null || echo "")
+            if [ -n "$SESSION_NAME" ]; then
+              COUNT=$(( COUNT + 1 ))
+              echo "Session $SESSION_NAME created. Incremented sessions_today -> $COUNT / $DAILY_TARGET."
+              # Persist the incremented counter after every successful session, so a
+              # killed/cancelled run still leaves an honest persisted count.
+              jq -n --arg d "null" --argjson s "$COUNT" \
+                '{exhausted_date: $d, sessions_today: $s}' > "$STATE_FILE"
+              commit_state "null" "$COUNT"
+
+              TITLE="[Analyst Task] $(date -u +'%Y-%m-%d %H:%M') #${COUNT} Log & Codebase Audit"
+              BODY_ISSUE="Jules Session: $SESSION_NAME. Handoff payload pending in session. (sessions_today=$COUNT/$DAILY_TARGET)"
+              gh issue create --title "$TITLE" --body "$BODY_ISSUE" --label "enhancement" \
+                || echo "WARN: gh issue create failed on iteration $i (continuing loop)."
+
+              # Stop as soon as we hit the daily target for this UTC day.
+              if [ "$COUNT" -ge "$DAILY_TARGET" ]; then
+                echo "Daily target reached ($COUNT/$DAILY_TARGET). Marking done for today ($TODAY UTC) and stopping loop."
+                jq -n --arg d "$TODAY" --argjson s "$COUNT" \
+                  '{exhausted_date: $d, sessions_today: $s}' > "$STATE_FILE"
+                commit_state "$TODAY" "$COUNT"
+                break
+              fi
+            else
+              echo "Iteration $i: empty session name (transient?). Body: $BODY. Continuing."
+            fi
+
+            # Throttle: concurrent cap is 15/account; we use 1 at a time, sleep 30s.
+            sleep 30
+          done
+
+          echo "Autonomous loop finished for this run. Final sessions_today=$COUNT / $DAILY_TARGET."
