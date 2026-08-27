@@ -15,7 +15,11 @@ export function runPackagedGatewayLinkSmoke({
   const server = path.join(gatewayDirectory, 'server.mjs');
   assert.equal(fs.existsSync(server), true, `PACKAGED_GATEWAY_SERVER_MISSING:${server}`);
 
-  const result = spawnSync(nodePath, ['--experimental-vm-modules', fileURLToPath(import.meta.url), childMode, server], {\n    encoding: 'utf8',\n    windowsHide: true,\n    env: {}\n  });
+  const result = spawnSync(nodePath, ['--experimental-vm-modules', fileURLToPath(import.meta.url), childMode, server], {
+    encoding: 'utf8',
+    windowsHide: true,
+    env: {}
+  });
   if (result.error) throw result.error;
   if (result.status !== 0) {
     const detail = (result.stderr || result.stdout || `exit=${result.status}`).trim();

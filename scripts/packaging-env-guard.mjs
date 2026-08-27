@@ -25,7 +25,10 @@ export const DEFAULT_RELEASE_REPOSITORY = 'NV-Gateway';
 export function resolvePublishEnvironment(env = process.env) {
   const owner = typeof env.NVGW_GH_OWNER === 'string' ? env.NVGW_GH_OWNER.trim() : '';
   if (!owner) {
-    return {\n      ok: false,\n      error: 'NVGW_GH_OWNER is required at package time: set it to the GitHub owner (user or org) of the PUBLIC releases repository the app checks for updates, for example `$env:NVGW_GH_OWNER = \"octo-org\"`. Repository name comes from NVGW_GH_REPO and defaults to \"' + DEFAULT_RELEASE_REPOSITORY + '\" when unset.'\n    };
+    return {
+      ok: false,
+      error: 'NVGW_GH_OWNER is required at package time: set it to the GitHub owner (user or org) of the PUBLIC releases repository the app checks for updates, for example `$env:NVGW_GH_OWNER = "octo-org"`. Repository name comes from NVGW_GH_REPO and defaults to "' + DEFAULT_RELEASE_REPOSITORY + '" when unset.'
+    };
   }
   const repo = typeof env.NVGW_GH_REPO === 'string' && env.NVGW_GH_REPO.trim() ? env.NVGW_GH_REPO.trim() : DEFAULT_RELEASE_REPOSITORY;
   return { ok: true, owner, repo };

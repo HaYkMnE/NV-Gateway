@@ -80,7 +80,7 @@ function extractListSection(builder, section) {
 }
 
 function extractExtraResources(builder) {
-  const match = builder.match(/^extraResources:\r?\n([\s\S]*?)(?=^[A-Za-z][^:\r\n]*:|(?![\\s\\S]))/m);
+  const match = builder.match(/^extraResources:\r?\n([\s\S]*?)(?=^[A-Za-z][^:\r\n]*:|(?!\s\S]))/m);
   assert.notEqual(match, null, 'PACKAGING_SECTION_MISSING:extraResources');
   const resources = [];
   let from = null;
