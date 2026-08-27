@@ -29,7 +29,8 @@ export function Dashboard() {
 
   const add = async () => {
     const key = newKey.trim(); setKeyError('');
-    if (!isPlausibleNvidiaKey(key)) { setKeyError(t('key_malformed')); return; }\n    addKeyMutation.mutate(key);
+    if (!isPlausibleNvidiaKey(key)) { setKeyError(t('key_malformed')); return; }
+    addKeyMutation.mutate(key);
   };
   const move = (index: number, direction: -1 | 1) => { const next = moveItem(keys, index, index + direction); if (next !== keys) reorder.mutate(next); };
   const announce = (message: string) => { setFeedback(''); window.setTimeout(() => setFeedback(message), 0); };

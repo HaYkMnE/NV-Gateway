@@ -37,7 +37,8 @@ export function AboutDialog({ isOpen, onClose }: AboutDialogProps) {
     const handler = (event: KeyboardEvent) => {
       if (event.key === 'Escape') onClose();
     };
-    document.addEventListener('keydown', handler);\n    return () => document.removeEventListener('keydown', handler);
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
   }, [isOpen, onClose]);
 
   if (!isOpen) return null;
@@ -66,7 +67,8 @@ export function AboutDialog({ isOpen, onClose }: AboutDialogProps) {
           </button>
         </div>
 
-        {error && (\n          <div role="alert" className="border border-error p-3 text-sm text-error mb-4 break-words">
+        {error && (
+          <div role="alert" className="border border-error p-3 text-sm text-error mb-4 break-words">
             {error}
           </div>
         )}

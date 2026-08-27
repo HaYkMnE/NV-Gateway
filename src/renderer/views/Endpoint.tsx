@@ -81,7 +81,8 @@ export function Endpoint() {
       label: 'OpenCode',
       lang: 'jsonc',
       content: JSON.stringify(
-        {\n          'NV-Gateway': {
+        {
+          'NV-Gateway': {
             baseURL: baseUrl,
             apiKey: gatewayToken,
             models: Object.fromEntries(
@@ -140,7 +141,7 @@ export function Endpoint() {
         '    messages=[{"role": "user", "content": "Hello!"}]',
         ')',
         'print(response.choices[0].message.content)',
-      ].join('\\n'),
+      ].join('\n'),
     },
     anthropic: {
       label: 'Anthropic',
