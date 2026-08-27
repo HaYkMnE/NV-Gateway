@@ -117,19 +117,4 @@ export default function App() {
           <Routes>
             <Route path="/" element={setupComplete ? <Navigate to="/dashboard" /> : <Navigate to="/wizard" />} />
             <Route path="/wizard" element={<Wizard />} />
-            <Route element={<Layout />}>
-              <Route path="/dashboard" element={<Dashboard />} />
-              <Route path="/models" element={<Models />} />
-              <Route path="/endpoint" element={<Endpoint />} />
-              <Route path="/logs" element={<Logs />} />
-              <Route path="/settings" element={<Settings />} />
-            </Route>
-          </Routes>
-        </Router>
-      </QueryClientProvider>
-      <FeedbackModal isOpen={feedbackModalOpen} onClose={() => setFeedbackModalOpen(false)} />
-      <AboutDialog isOpen={aboutDialogOpen} onClose={() => setAboutDialogOpen(false)} />
-      <DonationModal open={donationModalOpen} onClose={() => setDonationModalOpen(false)} onAscension={handleAscension} />
-    </ModalContext.Provider>
-  );
-}
+            <Route element={<Layout />}>\n              <Route path=\"/dashboard\" element={<Dashboard />} />\n              <Route path=\"/models\" element={<Models />} />\n              <Route path=\"/endpoint\" element={<Endpoint />} />\n              <Route path=\"/logs\" element={<Logs />} />\n              <Route path=\"/settings\" element={<Settings />} />\n            </Route>\n          </Routes>\n        </Router>\n      </QueryClientProvider>\n      <FeedbackModal isOpen={feedbackModalOpen} onClose={() => setFeedbackModalOpen(false)} />\n      <AboutDialog isOpen={aboutDialogOpen} onClose={() => setAboutDialogOpen(false)} />\n      <DonationModal open={donationModalOpen} onClose={() => setDonationModalOpen(false)} onAscension={handleAscension} />\n    </ModalContext.Provider>\n  );\n}

@@ -92,7 +92,7 @@ interface DiagnosticExportResult {
   message: string;
 }
 
-  interface AppConfig { gatewayPort: number; language: 'en' | 'ru' | 'zh' | 'hi' | 'es' | 'fr' | 'ar'; setupComplete: boolean; performanceMode: 'day' | 'night' | 'auto' }
+interface AppConfig { gatewayPort: number; language: 'en' | 'ru' | 'zh' | 'hi' | 'es' | 'fr' | 'ar'; setupComplete: boolean; performanceMode: 'day' | 'night' | 'auto' }
 interface RuntimeState extends AppConfig { status: GatewayStatus; version: string; autoLaunch: boolean }
 
 interface GatewayStatus {
@@ -114,10 +114,6 @@ interface ModelConfig {
   enabled: boolean;
   mode: 'day' | 'night' | 'auto';
   deprecated: boolean;
-  // Phase 5 catalog enrichment (all optional, backwards-compatible):
-  // Sourced from NGC catalog metadata via admin-api.mjs GET /admin/models.
-  // Absent for a pre-Phase-5 gateway, NGC-unreachable, or unlisted models — the
-  // renderer treats them as optional ('Unknown' / placeholder UI on absence).
   provider?: string | null;
   publisher?: string | null;
   shortDescription?: string;
