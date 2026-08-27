@@ -73,7 +73,8 @@ export function FeedbackModal({ isOpen, onClose }: FeedbackModalProps) {
     if (!validate()) return;
     setSubmitting(true);
     window.electronAPI.feedback
-      .save(buildData())\n      .then((result) => {
+      .save(buildData())
+      .then((result) => {
         if (result.success) {
           showToast(t('feedback_success'));
           window.setTimeout(onClose, 1200);
