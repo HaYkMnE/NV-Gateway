@@ -1,470 +1,518 @@
-import { useCallback, useEffect, useId, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Check, Copy, ExternalLink, QrCode, Sparkles, X, HeartHandshake } from 'lucide-react';
+import { X } from 'lucide-react';
+import QRCode from 'qrcode';
+import { petAudio } from './audioEngine';
 import './donation-modal.css';
+
+/**
+ * DonationModal — cyberpunk "SUPPORT NV-GATEWAY" modal.
+ *
+ * Visual design ported from nvgateway-donation-mockups/interactive-showcase.html:
+ *   - Dark CRT theme (#0A0D0B / #141A16 border / #33FF00 green / #FFD028 VIP gold / #FF3366 panic red).
+ *   - Tier selector (SUPPORTER $5 / ADVOCATE $15 / SYNDICATE $50 / SPONSOR custom)
+ *     with auto-toggling currency (Crypto USDT/BTC/ETH vs Fiat card/PayPal mock).
+ *   - Live QR code rendered to HTML canvas via `qrcode` package (SVG-free,
+ *     works without external asset fetches, safe under tight CSP).
+ *   - "Ascend to Syndicate Patron" instant VIP unlock button (persists to
+ *     localStorage nv_pet_vip, emits petAudio ascension ritual sfx, fires
+ *     onAscension callback to activate VIP state in PetWidget without reload).
+ */
 
 export interface DonationModalProps {
   open: boolean;
   onClose: () => void;
   /**
-   * Called when VIP ascension is confirmed (VIP state persisted, pet engine
-   * notified to switch to the VIP behavior suite + celebration overlay).
+   * Fired when the user clicks "Ascend to Syndicate Patron" or confirms a
+   * donation. The host should notify PetWidget so it can update VIP state
+   * immediately.
    */
   onAscension?: () => void;
 }
 
-interface CryptoTier {
+type CurrencyMode = 'crypto' | 'fiat';
+type CryptoChain = 'usdt-trc20' | 'btc' | 'eth';
+
+interface DonationTier {
   id: string;
   nameKey: string;
-  taglineKey: string;
+  usdAmount: number;
   amountLabel: string;
-  symbol: string;
-  network: string;
-  address: string;
-  accent: string;
-  glow: string;
-  qrSvg: string; // SVG path data for authentic visual QR representation
+  taglineKey: string;
+  perksKey: string;
+  vip: boolean;
 }
 
-// Curated donation addresses (EVM, BTC, SOL, TRON USDT).
-// Addresses are safe static public destination strings.
-const CRYPTO_TIERS: CryptoTier[] = [
+const TIERS: readonly DonationTier[] = [
   {
-    id: 'eth',
-    nameKey: 'donation_tier_eth_name',
-    taglineKey: 'donation_tier_eth_tag',
-    amountLabel: '0.01+ ETH / ERC-20',
-    symbol: 'ETH / USDT / USDC',
-    network: 'Ethereum (ERC-20) · Arbitrum · Base · Optimism',
-    address: '0x71C8A33190C6b62D71eb352136d8d9B7f8C733c7',
-    accent: '#59FF00',
-    glow: 'rgba(89, 255, 0, 0.4)',
-    qrSvg: 'M4 4h6v6H4zm2 2h2v2H6zm8-2h6v6h-6zm2 2h2v2h-2zM4 14h6v6H4zm2 2h2v2H6zm10 0h2v2h-2zm-2-2h2v2h-2zm4 4h2v2h-2zm-2 2h2v2h-2zm-4-4h2v2h-2zm6-2h2v2h-2zm-4-2h2v2h-2zm2-2h2v2h-2zm-6 2h2v2h-2z',
+    id: 'supporter',
+    nameKey: 'pet_tier_supporter',
+    usdAmount: 5,
+    amountLabel: '$5',
+    taglineKey: 'pet_tier_supporter_tag',
+    perksKey: 'pet_tier_supporter_perks',
+    vip: false,
   },
   {
-    id: 'sol',
-    nameKey: 'donation_tier_sol_name',
-    taglineKey: 'donation_tier_sol_tag',
-    amountLabel: '0.1+ SOL / SPL',
-    symbol: 'SOL / USDC (Solana)',
-    network: 'Solana Network',
-    address: '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin',
-    accent: '#00FFD1',
-    glow: 'rgba(0, 255, 209, 0.4)',
-    qrSvg: 'M4 4h6v6H4zm2 2h2v2H6zm8-2h6v6h-6zm2 2h2v2h-2zM4 14h6v6H4zm2 2h2v2H6zm8 2h2v2h-2zm4-4h2v2h-2zm-2 2h2v2h-2zm4 4h2v2h-2zm-6-2h2v2h-2zm4-6h2v2h-2zm-2 4h2v2h-2zm-4-4h2v2h-2z',
+    id: 'advocate',
+    nameKey: 'pet_tier_advocate',
+    usdAmount: 15,
+    amountLabel: '$15',
+    taglineKey: 'pet_tier_advocate_tag',
+    perksKey: 'pet_tier_advocate_perks',
+    vip: false,
   },
   {
-    id: 'btc',
-    nameKey: 'donation_tier_btc_name',
-    taglineKey: 'donation_tier_btc_tag',
-    amountLabel: '0.0005+ BTC',
-    symbol: 'BTC (Native SegWit)',
-    network: 'Bitcoin Mainnet (bech32)',
-    address: 'bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq',
-    accent: '#FFB020',
-    glow: 'rgba(255, 176, 32, 0.4)',
-    qrSvg: 'M4 4h6v6H4zm2 2h2v2H6zm8-2h6v6h-6zm2 2h2v2h-2zM4 14h6v6H4zm2 2h2v2H6zm8 0h4v2h-4zm2 2h2v2h-2zm2 2h2v2h-2zm-6-2h2v2h-2zm0 4h4v2h-4zm6-2h2v2h-2zm-4-6h2v2h-2z',
+    id: 'syndicate',
+    nameKey: 'pet_tier_syndicate',
+    usdAmount: 50,
+    amountLabel: '$50',
+    taglineKey: 'pet_tier_syndicate_tag',
+    perksKey: 'pet_tier_syndicate_perks',
+    vip: true,
   },
   {
-    id: 'usdt-tron',
-    nameKey: 'donation_tier_tron_name',
-    taglineKey: 'donation_tier_tron_tag',
-    amountLabel: '10+ USDT (TRC-20)',
-    symbol: 'USDT (TRC-20)',
-    network: 'TRON Network (TRC-20 / zero dust)',
-    address: 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t',
-    accent: '#FF0055',
-    glow: 'rgba(255, 0, 85, 0.4)',
-    qrSvg: 'M4 4h6v6H4zm2 2h2v2H6zm8-2h6v6h-6zm2 2h2v2h-2zM4 14h6v6H4zm2 2h2v2H6zm8 4h2v2h-2zm2-2h2v2h-2zm2 4h2v2h-2zm-4-4h2v2h-2zm6-2h2v2h-2zm-2-2h2v2h-2zm4 4h2v2h-2zm-6 2h2v2h-2z',
+    id: 'custom',
+    nameKey: 'pet_tier_custom',
+    usdAmount: 0,
+    amountLabel: 'Custom',
+    taglineKey: 'pet_tier_custom_tag',
+    perksKey: 'pet_tier_custom_perks',
+    vip: false,
   },
 ];
 
-const STORAGE_VIP_KEY = 'nv_pet_vip';
+/**
+ * Public donation destination addresses (safe static donation targets).
+ * TRON USDT (TRC-20) / BTC Native SegWit / EVM ETH.
+ */
+const CRYPTO_ADDRESSES: Record<CryptoChain, { label: string; address: string; uriPrefix: string }> = {
+  'usdt-trc20': {
+    label: 'USDT (TRC-20 / TRON)',
+    address: 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t',
+    uriPrefix: '',
+  },
+  btc: {
+    label: 'Bitcoin (BTC)',
+    address: 'bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq',
+    uriPrefix: 'bitcoin:',
+  },
+  eth: {
+    label: 'Ethereum (ETH / ERC-20)',
+    address: '0x71C8A33190C6b62D71eb352136d8d9B7f8C733c7',
+    uriPrefix: 'ethereum:',
+  },
+};
+
+const VIP_STORAGE_KEY = 'nv_pet_vip';
 
 export function DonationModal({ open, onClose, onAscension }: DonationModalProps) {
   const { t } = useTranslation();
-  const [activeTier, setActiveTier] = useState<string>('eth');
+  const [selectedTier, setSelectedTier] = useState<string>('syndicate');
+  const [currency, setCurrency] = useState<CurrencyMode>('crypto');
+  const [cryptoChain, setCryptoChain] = useState<CryptoChain>('usdt-trc20');
+  const [customUsd, setCustomUsd] = useState<string>('25');
   const [copied, setCopied] = useState<boolean>(false);
-  const [ascended, setAscended] = useState<boolean>(() => {
+  const [qrModalOpen, setQrModalOpen] = useState<boolean>(false);
+  const [isVip, setIsVip] = useState<boolean>(() => {
     try {
-      return localStorage.getItem(STORAGE_VIP_KEY) === 'true';
+      return localStorage.getItem(VIP_STORAGE_KEY) === 'true';
     } catch {
       return false;
     }
   });
-  const [qrZoomed, setQrZoomed] = useState<boolean>(false);
-  const titleId = useId();
 
-  const tier = CRYPTO_TIERS.find((t) => t.id === activeTier) ?? CRYPTO_TIERS[0];
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const qrCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // Close on Escape key
   useEffect(() => {
     if (!open) return;
-    const handler = (e: KeyboardEvent) => {
+    const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        if (qrZoomed) setQrZoomed(false);
-        else onClose();
+        if (qrModalOpen) {
+          setQrModalOpen(false);
+        } else {
+          onClose();
+        }
       }
     };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [open, qrZoomed, onClose]);
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [open, qrModalOpen, onClose]);
+
+  // Current crypto address
+  const activeCrypto = CRYPTO_ADDRESSES[cryptoChain];
+
+  // Render inline QR code when crypto tab is active
+  useEffect(() => {
+    if (!open || currency !== 'crypto') return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const uri = activeCrypto.uriPrefix + activeCrypto.address;
+    QRCode.toCanvas(canvas, uri, {
+      width: 140,
+      margin: 1,
+      color: {
+        dark: '#33FF00',
+        light: '#0A0D0B',
+      },
+    }).catch(() => {
+      /* ignore canvas errors */
+    });
+  }, [open, currency, activeCrypto]);
+
+  // Render high-res zoomed QR code in sub-modal
+  useEffect(() => {
+    if (!qrModalOpen) return;
+    const canvas = qrCanvasRef.current;
+    if (!canvas) return;
+
+    const uri = activeCrypto.uriPrefix + activeCrypto.address;
+    QRCode.toCanvas(canvas, uri, {
+      width: 260,
+      margin: 2,
+      color: {
+        dark: '#33FF00',
+        light: '#0A0D0B',
+      },
+    }).catch(() => {
+      /* ignore canvas errors */
+    });
+  }, [qrModalOpen, activeCrypto]);
 
   // Copy address to clipboard
   const handleCopy = useCallback(async () => {
     try {
-      await navigator.clipboard.writeText(tier.address);
+      await navigator.clipboard.writeText(activeCrypto.address);
       setCopied(true);
-      window.setTimeout(() => setCopied(false), 2200);
+      petAudio.playEasterEggDisk(0);
+      window.setTimeout(() => setCopied(false), 2000);
     } catch {
       /* ignore */
     }
-  }, [tier.address]);
+  }, [activeCrypto.address]);
 
-  // Unlock Syndicate Patron VIP status
+  // Ascend to VIP (persists VIP state, plays ascension ritual, fires callback)
   const handleAscend = useCallback(() => {
     try {
-      localStorage.setItem(STORAGE_VIP_KEY, 'true');
+      localStorage.setItem(VIP_STORAGE_KEY, 'true');
     } catch {
       /* ignore */
     }
-    setAscended(true);
+    setIsVip(true);
+    petAudio.playAscensionRitual();
     onAscension?.();
   }, [onAscension]);
 
   if (!open) return null;
 
+  const tier = TIERS.find((x) => x.id === selectedTier) ?? TIERS[2];
+
   return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby={titleId}
-      className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/80 backdrop-blur-md overflow-y-auto animate-fade-in"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
+    <>
       <div
-        className="relative w-full max-w-2xl my-auto bg-[#0A0E0B] border border-[#1A2E1A] rounded-2xl shadow-[0_0_50px_rgba(89,255,0,0.15)] overflow-hidden text-textMain"
-        style={{
-          boxShadow: `0 0 60px ${tier.glow}, 0 20px 40px rgba(0,0,0,0.8)`,
+        role="dialog"
+        aria-modal="true"
+        aria-label={t('pet_donation_title')}
+        className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/80 backdrop-blur-sm overflow-y-auto"
+        onClick={(e) => {
+          if (e.target === e.currentTarget) onClose();
         }}
       >
-        {/* Top cyberpunk neon laser accent */}
-        <div
-          className="h-1 w-full transition-colors duration-500"
-          style={{
-            background: `linear-gradient(90deg, transparent, ${tier.accent}, transparent)`,
-          }}
-        />
+        <div className="relative w-full max-w-xl my-auto rounded-xl border border-[#1A261C] bg-[#0A0D0B] p-5 sm:p-6 shadow-[0_0_40px_rgba(51,255,0,0.15)] text-textMain">
+          {/* Cyberpunk Top Accent Bar */}
+          <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-[#33FF00] via-[#00FFD1] to-[#FFD028] rounded-t-xl" />
 
-        {/* Header */}
-        <div className="flex items-start justify-between p-5 pb-3 border-b border-[#1A2E1A]/80">
-          <div className="flex items-center gap-3">
-            <div
-              className="p-2.5 rounded-xl border flex items-center justify-center"
-              style={{
-                backgroundColor: `${tier.accent}15`,
-                borderColor: `${tier.accent}40`,
-                color: tier.accent,
-              }}
-            >
-              <HeartHandshake size={22} className="animate-pulse" />
-            </div>
+          {/* Header */}
+          <div className="flex items-start justify-between gap-3 mb-4">
             <div>
               <div className="flex items-center gap-2">
-                <h2 id={titleId} className="text-lg font-bold tracking-tight text-textMain">
-                  {t('donation_modal_title')}
-                </h2>
-                <span
-                  className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full uppercase tracking-wider border"
-                  style={{
-                    backgroundColor: `${tier.accent}15`,
-                    borderColor: `${tier.accent}50`,
-                    color: tier.accent,
-                  }}
-                >
-                  {t('donation_modal_badge')}
+                <span className="font-mono text-xs font-bold text-accent-neon uppercase tracking-widest">
+                  [ {t('pet_donation_kicker')} ]
                 </span>
+                {isVip && (
+                  <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-[#FFD028]/20 text-[#FFD028] border border-[#FFD028]/60">
+                    👑 VIP PATRON
+                  </span>
+                )}
               </div>
-              <p className="text-xs text-textMuted mt-0.5">{t('donation_modal_subtitle')}</p>
-            </div>
-          </div>
-
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label={t('close_menu')}
-            className="p-1.5 rounded-lg text-textMuted hover:text-textMain hover:bg-white/5 transition-colors cursor-pointer"
-          >
-            <X size={18} />
-          </button>
-        </div>
-
-        {/* Modal Body */}
-        <div className="p-5 space-y-5">
-          {/* VIP Perks Hero Banner */}
-          <div className="relative p-4 rounded-xl bg-gradient-to-r from-[#0F1B12] via-[#0D2214] to-[#0A160E] border border-nvidia/30 overflow-hidden">
-            <div className="flex items-start justify-between gap-3 relative z-10">
-              <div className="space-y-1">
-                <div className="flex items-center gap-1.5 text-xs font-bold text-accent-neon tracking-wide uppercase">
-                  <Sparkles size={14} className="animate-spin text-accent-neon" style={{ animationDuration: '6s' }} />
-                  <span>{t('donation_vip_banner_title')}</span>
-                </div>
-                <p className="text-xs text-[#A0B8A4] leading-relaxed max-w-md">
-                  {t('donation_vip_banner_desc')}
-                </p>
-              </div>
-
-              {!ascended ? (
-                <button
-                  type="button"
-                  onClick={handleAscend}
-                  className="px-3.5 py-2 rounded-xl text-xs font-bold bg-accent-neon text-bg hover:brightness-110 shadow-[0_0_15px_rgba(89,255,0,0.4)] transition-all cursor-pointer shrink-0 flex items-center gap-1.5"
-                >
-                  <Sparkles size={13} />
-                  <span>{t('donation_claim_vip_btn')}</span>
-                </button>
-              ) : (
-                <div className="px-3 py-1.5 rounded-xl text-[11px] font-mono font-bold bg-nvidia/20 border border-nvidia text-accent-neon shrink-0 flex items-center gap-1.5">
-                  <Check size={13} />
-                  <span>{t('donation_vip_active')}</span>
-                </div>
-              )}
-            </div>
-          </div>
-
-          {/* Crypto Network Selector Tabs */}
-          <div>
-            <label className="block text-[11px] font-mono font-bold uppercase tracking-wider text-textMuted mb-2">
-              {t('donation_select_network')}
-            </label>
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-              {CRYPTO_TIERS.map((item) => {
-                const isActive = item.id === activeTier;
-                return (
-                  <button
-                    key={item.id}
-                    type="button"
-                    onClick={() => {
-                      setActiveTier(item.id);
-                      setCopied(false);
-                    }}
-                    className={`p-3 rounded-xl border text-left transition-all cursor-pointer relative overflow-hidden ${
-                      isActive
-                        ? 'bg-surface border-opacity-100 shadow-md font-semibold'
-                        : 'bg-surface/40 border-border/60 text-textMuted hover:text-textMain hover:border-border'
-                    }`}
-                    style={
-                      isActive
-                        ? {
-                            borderColor: item.accent,
-                            boxShadow: `0 0 16px ${item.glow}`,
-                          }
-                        : undefined
-                    }
-                  >
-                    {isActive && (
-                      <div
-                        className="absolute top-0 left-0 right-0 h-0.5"
-                        style={{ backgroundColor: item.accent }}
-                      />
-                    )}
-                    <div className="flex items-center justify-between gap-1 mb-1">
-                      <span
-                        className="text-xs font-bold"
-                        style={{ color: isActive ? item.accent : undefined }}
-                      >
-                        {item.symbol.split('/')[0].trim()}
-                      </span>
-                      {isActive && <Check size={12} style={{ color: item.accent }} />}
-                    </div>
-                    <div className="text-[10px] text-textMuted truncate font-mono">
-                      {item.amountLabel}
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* Selected Tier Card & QR Code */}
-          <div
-            className="p-4 sm:p-5 rounded-2xl border bg-surface/70 backdrop-blur space-y-4 transition-all"
-            style={{
-              borderColor: `${tier.accent}50`,
-            }}
-          >
-            {/* Header info */}
-            <div className="flex items-center justify-between gap-2 pb-3 border-b border-border/60">
-              <div>
-                <div className="text-xs font-bold text-textMain">{t(tier.nameKey)}</div>
-                <div className="text-[11px] text-textMuted">{t(tier.taglineKey)}</div>
-              </div>
-              <span
-                className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-md border"
-                style={{
-                  color: tier.accent,
-                  borderColor: `${tier.accent}50`,
-                  backgroundColor: `${tier.accent}10`,
-                }}
-              >
-                {tier.network}
-              </span>
+              <h2 className="text-xl sm:text-2xl font-bold tracking-tight text-textMain mt-1">
+                {t('pet_donation_title')}
+              </h2>
+              <p className="text-xs text-textMuted mt-1 leading-relaxed">
+                {t('pet_donation_subtitle')}
+              </p>
             </div>
 
-            {/* QR Code + Address Block */}
-            <div className="flex flex-col sm:flex-row items-center gap-4">
-              {/* Scalable High-contrast Cyber QR Visualizer */}
-              <div
-                onClick={() => setQrZoomed(true)}
-                className="relative p-2.5 rounded-xl bg-white border-2 cursor-zoom-in group shrink-0 transition-transform hover:scale-105"
-                style={{ borderColor: tier.accent }}
-                title={t('donation_click_zoom_qr')}
-              >
-                {/* Visual SVG QR Matrix */}
-                <svg
-                  viewBox="0 0 24 24"
-                  className="w-24 h-24 text-[#0A0E0B]"
-                  fill="currentColor"
-                >
-                  {/* Outer corner positioning squares */}
-                  <rect x="2" y="2" width="7" height="7" fill="none" stroke="currentColor" strokeWidth="1.5" />
-                  <rect x="4" y="4" width="3" height="3" />
-                  <rect x="15" y="2" width="7" height="7" fill="none" stroke="currentColor" strokeWidth="1.5" />
-                  <rect x="17" y="4" width="3" height="3" />
-                  <rect x="2" y="15" width="7" height="7" fill="none" stroke="currentColor" strokeWidth="1.5" />
-                  <rect x="4" y="17" width="3" height="3" />
-                  {/* Dynamic matrix payload path */}
-                  <path d={tier.qrSvg} fill="currentColor" />
-                  <circle cx="12" cy="12" r="1.5" fill={tier.accent} />
-                </svg>
-
-                {/* Cyberpunk Scan Line overlay */}
-                <div className="absolute inset-x-2.5 h-0.5 bg-gradient-to-r from-transparent via-red-500 to-transparent nv-donation-laser pointer-events-none" />
-
-                <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 flex items-center justify-center rounded-xl transition-opacity">
-                  <QrCode size={20} className="text-white" />
-                </div>
-              </div>
-
-              {/* Address input & Copy Action */}
-              <div className="min-w-0 flex-1 w-full space-y-2">
-                <div>
-                  <label className="block text-[10px] font-mono uppercase tracking-wider text-textMuted mb-1">
-                    {t('donation_destination_address')} ({tier.symbol})
-                  </label>
-                  <div className="flex items-center gap-2">
-                    <code className="flex-1 p-2.5 rounded-xl bg-bg border border-border font-mono text-xs text-textMain break-all select-all focus:border-accent-neon outline-none">
-                      {tier.address}
-                    </code>
-                    <button
-                      type="button"
-                      onClick={handleCopy}
-                      className="px-3.5 py-2.5 rounded-xl text-xs font-bold border transition-all cursor-pointer shrink-0 flex items-center gap-1.5 animate-tactile-tick"
-                      style={{
-                        backgroundColor: copied ? `${tier.accent}20` : `${tier.accent}15`,
-                        borderColor: copied ? tier.accent : `${tier.accent}50`,
-                        color: tier.accent,
-                      }}
-                      aria-label={t('copy')}
-                    >
-                      {copied ? (
-                        <>
-                          <Check size={14} />
-                          <span>{t('copied')}</span>
-                        </>
-                      ) : (
-                        <>
-                          <Copy size={14} />
-                          <span>{t('copy')}</span>
-                        </>
-                      )}
-                    </button>
-                  </div>
-                </div>
-
-                <p className="text-[11px] text-textMuted leading-relaxed">
-                  {t('donation_support_note')}
-                </p>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Footer info & GitHub repo link */}
-        <div className="flex flex-col sm:flex-row items-center justify-between gap-3 p-5 pt-3 border-t border-[#1A2E1A]/80 bg-[#080B09] text-xs text-textMuted">
-          <div className="flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-accent-neon animate-pulse" />
-            <span>{t('donation_transparency_note')}</span>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => {
-                void window.electronAPI.openExternal(
-                  'https://github.com/HaYkMnE/NV-Gateway'
-                );
-              }}
-              className="inline-flex items-center gap-1 text-textMuted hover:text-accent-neon transition-colors cursor-pointer"
-            >
-              <span>{t('donation_github_sponsor')}</span>
-              <ExternalLink size={12} />
-            </button>
-            <span className="opacity-40">·</span>
             <button
               type="button"
               onClick={onClose}
-              className="text-textMuted hover:text-textMain transition-colors cursor-pointer"
+              className="p-1.5 text-textMuted hover:text-accent-neon rounded-lg hover:bg-surface border border-transparent hover:border-border transition-colors cursor-pointer"
+              aria-label={t('close_menu')}
             >
-              {t('cancel')}
+              <X size={18} />
             </button>
+          </div>
+
+          {/* Tier Selection Grid */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-4">
+            {TIERS.map((tItem) => {
+              const isSelected = selectedTier === tItem.id;
+              return (
+                <button
+                  key={tItem.id}
+                  type="button"
+                  onClick={() => {
+                    setSelectedTier(tItem.id);
+                    petAudio.playEasterEggDisk(1);
+                  }}
+                  className={`p-3 rounded-lg border text-left transition-all cursor-pointer relative overflow-hidden ${
+                    isSelected
+                      ? tItem.vip
+                        ? 'border-[#FFD028] bg-[#FFD028]/10 shadow-[0_0_15px_rgba(255,208,40,0.25)]'
+                        : 'border-accent-neon bg-accent-neon/10 shadow-[0_0_15px_rgba(51,255,0,0.2)]'
+                      : 'border-border/60 bg-surface/60 hover:border-border hover:bg-surface text-textMuted hover:text-textMain'
+                  }`}
+                >
+                  {tItem.vip && (
+                    <div className="text-[9px] font-mono font-bold text-[#FFD028] tracking-wider uppercase mb-1">
+                      👑 VIP
+                    </div>
+                  )}
+                  <div className="font-bold text-sm text-textMain">{t(tItem.nameKey)}</div>
+                  <div
+                    className={`font-mono text-xs font-semibold mt-0.5 ${
+                      tItem.vip ? 'text-[#FFD028]' : 'text-accent-neon'
+                    }`}
+                  >
+                    {tItem.id === 'custom' ? `$${customUsd}` : tItem.amountLabel}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Selected Tier Details Callout */}
+          <div className="p-3.5 rounded-lg border border-border/80 bg-surface/50 mb-4 text-xs space-y-1">
+            <div className="flex items-center justify-between">
+              <span className="font-bold text-textMain">{t(tier.nameKey)} Tier</span>
+              {tier.vip && (
+                <span className="font-mono text-[10px] text-[#FFD028] font-bold">
+                  ★ UNLOCKS VIP MASCOT BEHAVIORS
+                </span>
+              )}
+            </div>
+            <p className="text-textMuted">{t(tier.taglineKey)}</p>
+            <p className="text-textMuted/80 text-[11px] pt-1 border-t border-border/40 font-mono">
+              {t(tier.perksKey)}
+            </p>
+          </div>
+
+          {/* Currency Toggle (Crypto vs Fiat) */}
+          <div className="flex items-center gap-2 mb-3">
+            <button
+              type="button"
+              onClick={() => setCurrency('crypto')}
+              className={`px-3 py-1.5 rounded text-xs font-semibold transition-all cursor-pointer ${
+                currency === 'crypto'
+                  ? 'bg-accent-neon text-bg font-bold shadow-[0_0_10px_rgba(51,255,0,0.3)]'
+                  : 'bg-surface border border-border text-textMuted hover:text-textMain'
+              }`}
+            >
+              ⚡ Crypto (USDT / BTC / ETH)
+            </button>
+            <button
+              type="button"
+              onClick={() => setCurrency('fiat')}
+              className={`px-3 py-1.5 rounded text-xs font-semibold transition-all cursor-pointer ${
+                currency === 'fiat'
+                  ? 'bg-accent-neon text-bg font-bold shadow-[0_0_10px_rgba(51,255,0,0.3)]'
+                  : 'bg-surface border border-border text-textMuted hover:text-textMain'
+              }`}
+            >
+              💳 Card / PayPal (Direct)
+            </button>
+          </div>
+
+          {/* Crypto Content Block */}
+          {currency === 'crypto' ? (
+            <div className="space-y-3 p-4 rounded-xl border border-border bg-bg/80">
+              {/* Chain Selection Tabs */}
+              <div className="flex flex-wrap gap-2">
+                {(['usdt-trc20', 'btc', 'eth'] as const).map((chain) => (
+                  <button
+                    key={chain}
+                    type="button"
+                    onClick={() => setCryptoChain(chain)}
+                    className={`px-2.5 py-1 rounded text-xs font-mono transition-colors cursor-pointer ${
+                      cryptoChain === chain
+                        ? 'border border-accent-neon text-accent-neon bg-accent-neon/10 font-bold'
+                        : 'border border-border/80 text-textMuted hover:text-textMain bg-surface'
+                    }`}
+                  >
+                    {CRYPTO_ADDRESSES[chain].label}
+                  </button>
+                ))}
+              </div>
+
+              {/* QR & Address View */}
+              <div className="flex flex-col sm:flex-row items-center gap-4 pt-1">
+                {/* QR Canvas */}
+                <div
+                  onClick={() => setQrModalOpen(true)}
+                  className="p-2 rounded-lg border border-accent-neon/50 bg-[#0A0D0B] shrink-0 cursor-zoom-in group relative"
+                  title="Click to Zoom QR"
+                >
+                  <canvas ref={canvasRef} className="w-[140px] h-[140px] block" />
+                  <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 flex items-center justify-center text-[10px] font-mono text-accent-neon font-bold transition-opacity rounded-lg">
+                    🔍 ZOOM
+                  </div>
+                </div>
+
+                {/* Address and Actions */}
+                <div className="min-w-0 flex-1 space-y-2 w-full">
+                  <div>
+                    <label className="block text-[10px] font-mono uppercase tracking-wider text-textMuted mb-1">
+                      {activeCrypto.label} {t('pet_donation_address')}
+                    </label>
+                    <code className="block p-2 rounded bg-surface border border-border font-mono text-xs text-textMain break-all select-all">
+                      {activeCrypto.address}
+                    </code>
+                  </div>
+
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void handleCopy()}
+                      className="px-3 py-1.5 rounded text-xs font-semibold bg-accent-neon/15 hover:bg-accent-neon/25 text-accent-neon border border-accent-neon/50 transition-colors cursor-pointer flex items-center gap-1.5"
+                    >
+                      <span>{copied ? '✓ COPIED' : '📋 COPY ADDRESS'}</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setQrModalOpen(true)}
+                      className="px-3 py-1.5 rounded text-xs font-semibold bg-surface hover:bg-border text-textMain border border-border transition-colors cursor-pointer"
+                    >
+                      🔍 EXPAND QR
+                    </button>
+                  </div>
+
+                  <p className="text-[10px] text-textMuted leading-relaxed">
+                    {t('pet_donation_crypto_note')}
+                  </p>
+                </div>
+              </div>
+            </div>
+          ) : (
+            /* Fiat / Direct Links Content Block */
+            <div className="space-y-3 p-4 rounded-xl border border-border bg-bg/80">
+              <p className="text-xs text-textMuted leading-relaxed">
+                {t('pet_donation_fiat_desc')}
+              </p>
+
+              <div className="grid sm:grid-cols-2 gap-3 pt-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    void window.electronAPI.openExternal(
+                      'https://github.com/sponsors/HaYkMnE'
+                    );
+                  }}
+                  className="p-3 rounded-lg border border-border hover:border-accent-neon bg-surface hover:bg-accent-neon/10 text-left transition-all cursor-pointer"
+                >
+                  <div className="font-bold text-xs text-textMain">★ GitHub Sponsors</div>
+                  <div className="text-[11px] text-textMuted mt-0.5">Recurring or one-time via card</div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    void window.electronAPI.openExternal(
+                      'https://github.com/HaYkMnE/NV-Gateway'
+                    );
+                  }}
+                  className="p-3 rounded-lg border border-border hover:border-[#FFD028] bg-surface hover:bg-[#FFD028]/10 text-left transition-all cursor-pointer"
+                >
+                  <div className="font-bold text-xs text-textMain">⚡ Project Repository</div>
+                  <div className="text-[11px] text-textMuted mt-0.5">Star & contribute on GitHub</div>
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Syndicate Ascension Button */}
+          <div className="mt-5 pt-4 border-t border-border flex flex-col sm:flex-row items-center justify-between gap-3">
+            <div className="text-xs text-textMuted">
+              {isVip ? (
+                <span className="text-[#FFD028] font-bold">
+                  👑 VIP Syndicate Patron Status Active
+                </span>
+              ) : (
+                <span>Unlocked instant VIP perks on donation</span>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2 w-full sm:w-auto">
+              {!isVip && (
+                <button
+                  type="button"
+                  onClick={handleAscend}
+                  className="w-full sm:w-auto px-4 py-2 rounded-lg text-xs font-bold bg-gradient-to-r from-[#FFD028] to-[#FF8C00] text-bg hover:brightness-110 shadow-[0_0_15px_rgba(255,208,40,0.4)] transition-all cursor-pointer flex items-center justify-center gap-1.5"
+                >
+                  <span>👑 ASCEND TO VIP PATRON</span>
+                </button>
+              )}
+
+              <button
+                type="button"
+                onClick={onClose}
+                className="w-full sm:w-auto px-4 py-2 rounded-lg text-xs font-medium border border-border hover:border-textMuted text-textMuted hover:text-textMain bg-surface transition-colors cursor-pointer"
+              >
+                {t('close_menu')}
+              </button>
+            </div>
           </div>
         </div>
       </div>
 
-      {/* QR Zoom Modal Backdrop */}
-      {qrZoomed && (
+      {/* High-res Zoomed QR Sub-modal */}
+      {qrModalOpen && (
         <div
-          className="fixed inset-0 z-60 bg-black/90 flex items-center justify-center p-4 cursor-zoom-out animate-fade-in"
-          onClick={() => setQrZoomed(false)}
+          role="dialog"
+          aria-modal="true"
+          aria-label="Zoomed QR Code"
+          className="fixed inset-0 z-60 flex items-center justify-center p-4 bg-black/90 backdrop-blur-md"
+          onClick={() => setQrModalOpen(false)}
         >
           <div
-            className="p-6 bg-white rounded-3xl border-4 max-w-xs text-center space-y-3"
-            style={{ borderColor: tier.accent }}
+            className="p-6 rounded-2xl border-2 border-accent-neon bg-[#0A0D0B] shadow-[0_0_50px_rgba(51,255,0,0.3)] text-center space-y-4 max-w-sm"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="text-xs font-mono font-bold text-[#0A0E0B] uppercase">
-              {tier.symbol} QR Matrix
+            <div className="text-xs font-mono font-bold text-accent-neon uppercase tracking-wider">
+              {activeCrypto.label}
             </div>
-            <svg
-              viewBox="0 0 24 24"
-              className="w-56 h-56 text-[#0A0E0B] mx-auto"
-              fill="currentColor"
-            >
-              <rect x="2" y="2" width="7" height="7" fill="none" stroke="currentColor" strokeWidth="1.5" />
-              <rect x="4" y="4" width="3" height="3" />
-              <rect x="15" y="2" width="7" height="7" fill="none" stroke="currentColor" strokeWidth="1.5" />
-              <rect x="17" y="4" width="3" height="3" />
-              <rect x="2" y="15" width="7" height="7" fill="none" stroke="currentColor" strokeWidth="1.5" />
-              <rect x="4" y="17" width="3" height="3" />
-              <path d={tier.qrSvg} fill="currentColor" />
-              <circle cx="12" cy="12" r="1.5" fill={tier.accent} />
-            </svg>
-            <div className="font-mono text-[10px] text-gray-700 break-all select-all">
-              {tier.address}
+
+            <div className="p-3 bg-[#0A0D0B] rounded-xl border border-accent-neon/40 inline-block">
+              <canvas ref={qrCanvasRef} className="w-[260px] h-[260px] block" />
             </div>
+
+            <code className="block p-2 rounded bg-surface border border-border font-mono text-[11px] text-textMain break-all select-all">
+              {activeCrypto.address}
+            </code>
+
             <button
               type="button"
-              onClick={() => setQrZoomed(false)}
-              className="w-full py-2 bg-[#0A0E0B] text-white text-xs font-bold rounded-xl"
+              onClick={() => setQrModalOpen(false)}
+              className="w-full py-2 rounded-lg bg-accent-neon text-bg font-bold text-xs hover:brightness-110 cursor-pointer"
             >
               {t('close_menu')}
             </button>
           </div>
         </div>
       )}
-    </div>
+    </>
   );
 }

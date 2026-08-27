@@ -1,379 +1,402 @@
 /*
- * NV-GATEWAY // Pet Widget Theme & Animation Stylesheet
- *
- * Source of truth: nvgateway-donation-mockups/interactive-showcase.html
- * (sections: "CSS STYLES", "SVG ASSETS & KEYFRAME ANIMATIONS").
- *
- * Key design invariants:
- *   - Dark cyber HUD palette (#060806, #0D110E, #141B15, #1E2820).
- *   - NVIDIA neon green accent (#59FF00) + Cyan glow (#00FFD1) + Warning gold (#FFB020) + Panic red (#FF0055).
- *   - Hologram flicker & scanlines overlay.
- *   - Character-specific SVG animations (cyber mascot vs pixel hacker).
- *   - Pure CSS transitions for mood lighting, aura, and dialogue bubbles.
- *   - Responsive widget container (fits sidebar, floats, or HUD views).
+ * NV-GATEWAY pet widget styles.
+ * MUST stay a static stylesheet: the renderer CSP is style-src 'self',
+ * which BLOCKS runtime-injected inline <style> blocks entirely.
+ * Extracted from PetWidget.tsx (PET_CHROME_CSS / PET_MASCOT_CSS / PET_HACKER_CSS).
  */
 
-/* ==========================================
-   1. ROOT CONTAINER & CYBER CHASSIS
-   ========================================== */
 
 .nv-pet-wrap {
+  --pet-neon: #33FF00;
+  --pet-amber: #FFB020;
+  --pet-cyan: #00FFD1;
+  --pet-bg: #0A0D0B;
+  --pet-border: #141A16;
+  --pet-grid: #0E1410;
+  --pet-text: #E0E8E2;
+  --pet-dim: #5A6E60;
+  --pet-gold: #FFD028;
   position: relative;
-  width: 100%;
-  border-radius: 12px;
-  background: linear-gradient(180deg, #0D110E 0%, #060806 100%);
-  border: 1px solid #1E2820;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.6), inset 0 1px 0 rgba(89, 255, 0, 0.1);
+  font-family: 'JetBrains Mono', 'Consolas', monospace;
+  background: var(--pet-bg);
+  border: 1px solid var(--pet-border);
+  border-radius: 4px;
   overflow: hidden;
+  box-shadow: inset 0 0 20px rgba(0,0,0,0.8), 0 0 12px rgba(51,255,0,0.06);
   user-select: none;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-  transition: border-color 0.3s ease, box-shadow 0.3s ease;
+  font-size: 11px;
+  color: var(--pet-text);
+  line-height: 1.3;
 }
-
-.nv-pet-wrap:hover {
-  border-color: #2A3A2C;
-  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.7), 0 0 12px rgba(89, 255, 0, 0.15);
+.nv-pet-wrap.vip-mode {
+  border-color: rgba(255, 208, 40, 0.45);
+  box-shadow: inset 0 0 24px rgba(255,208,40,0.08), 0 0 16px rgba(255,208,40,0.15);
 }
-
-.nv-pet-wrap.is-vip {
-  border-color: #59FF00;
-  box-shadow: 0 0 20px rgba(89, 255, 0, 0.25), inset 0 0 15px rgba(89, 255, 0, 0.08);
-}
-
-/* Cyber top status bar */
 .nv-pet-header {
   display: flex;
-  align-items: center;
   justify-content: space-between;
-  padding: 6px 10px;
-  background: rgba(13, 17, 14, 0.85);
-  border-bottom: 1px solid #1A241C;
+  align-items: center;
+  padding: 4px 8px;
+  background: #0E1310;
+  border-bottom: 1px solid var(--pet-border);
   font-size: 10px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: #6C8271;
 }
-
-.nv-pet-header-status {
+.nv-pet-title {
+  color: var(--pet-neon);
+  font-weight: 700;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
 }
-
-.nv-pet-led {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: #59FF00;
-  box-shadow: 0 0 8px #59FF00;
-  animation: nvPetLedPulse 2s infinite ease-in-out;
+.nv-pet-wrap.vip-mode .nv-pet-title {
+  color: var(--pet-gold);
 }
-
-.nv-pet-wrap.is-away .nv-pet-led {
-  background: #FFB020;
-  box-shadow: 0 0 8px #FFB020;
-}
-
-.nv-pet-wrap.is-error .nv-pet-led {
-  background: #FF0055;
-  box-shadow: 0 0 8px #FF0055;
-}
-
-/* ==========================================
-   2. HOLOGRAM VIEWPORT & SCANLINES
-   ========================================== */
-
-.nv-pet-stage {
-  position: relative;
-  width: 100%;
-  height: 150px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  overflow: hidden;
-  background: radial-gradient(circle at center, rgba(16, 26, 18, 0.6) 0%, rgba(6, 8, 6, 0.95) 75%);
-}
-
-/* Scanline grid overlay */
-.nv-pet-stage::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background: repeating-linear-gradient(
-    0deg,
-    rgba(0, 0, 0, 0.25),
-    rgba(0, 0, 0, 0.25) 1px,
-    transparent 1px,
-    transparent 2px
-  );
-  pointer-events: none;
-  opacity: 0.7;
-}
-
-/* Ambient glow orb behind the pet */
-.nv-pet-aura {
-  position: absolute;
-  width: 110px;
-  height: 110px;
-  border-radius: 50%;
-  background: radial-gradient(circle, rgba(89, 255, 0, 0.22) 0%, rgba(0, 255, 209, 0.08) 40%, transparent 70%);
-  filter: blur(14px);
-  pointer-events: none;
-  transition: all 0.5s ease;
-  animation: nvPetAuraBreath 4s ease-in-out infinite;
-}
-
-.nv-pet-wrap.is-vip .nv-pet-aura {
-  background: radial-gradient(circle, rgba(89, 255, 0, 0.4) 0%, rgba(0, 255, 209, 0.2) 50%, transparent 75%);
-  filter: blur(18px);
-}
-
-.nv-pet-wrap.is-panic .nv-pet-aura {
-  background: radial-gradient(circle, rgba(255, 0, 85, 0.4) 0%, transparent 70%);
-}
-
-/* ==========================================
-   3. DIALOGUE BUBBLE & CUE BANNER
-   ========================================== */
-
-.nv-pet-speech {
-  position: absolute;
-  top: 8px;
-  left: 8px;
-  right: 8px;
-  padding: 6px 10px;
-  background: rgba(10, 14, 11, 0.95);
-  border: 1px solid #59FF00;
-  border-radius: 6px;
-  box-shadow: 0 0 12px rgba(89, 255, 0, 0.3);
-  font-size: 11px;
-  line-height: 1.35;
-  color: #E2FCE5;
-  z-index: 10;
-  pointer-events: none;
-  animation: nvPetSpeechPop 0.25s cubic-bezier(0.18, 0.89, 0.32, 1.28) forwards;
-}
-
-.nv-pet-speech-tail {
-  position: absolute;
-  bottom: -5px;
-  left: 50%;
-  transform: translateX(-50%);
-  width: 8px;
-  height: 8px;
-  background: #0A0E0B;
-  border-right: 1px solid #59FF00;
-  border-bottom: 1px solid #59FF00;
-  transform: rotate(45deg);
-}
-
-.nv-pet-cue-banner {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  padding: 2px 6px;
-  background: #FFB020;
-  color: #060806;
+.nv-pet-wrap.vip-mode .nv-pet-title::after {
+  content: '★ VIP';
   font-size: 9px;
-  font-weight: 800;
-  letter-spacing: 0.05em;
-  border-radius: 3px;
-  box-shadow: 0 0 8px rgba(255, 176, 32, 0.8);
-  z-index: 11;
-  animation: nvPetCueFlash 0.4s ease forwards;
+  padding: 0 4px;
+  background: rgba(255, 208, 40, 0.15);
+  border: 1px solid rgba(255, 208, 40, 0.4);
+  border-radius: 2px;
+  color: var(--pet-gold);
+  margin-left: 4px;
 }
-
-/* ==========================================
-   4. CONTROL FOOTER (CYCLE, VOICE, DONATE)
-   ========================================== */
-
-.nv-pet-footer {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 6px 10px;
-  background: rgba(13, 17, 14, 0.95);
-  border-top: 1px solid #1A241C;
-  font-size: 11px;
+.nv-pet-badge {
+  font-size: 9px;
+  padding: 1px 4px;
+  background: rgba(51,255,0,0.1);
+  border: 1px solid rgba(51,255,0,0.3);
+  border-radius: 2px;
+  color: var(--pet-neon);
 }
-
-.nv-pet-act-name {
-  color: #8CA091;
-  font-size: 10px;
-  letter-spacing: 0.04em;
-  max-width: 140px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 .nv-pet-controls {
   display: flex;
-  align-items: center;
-  gap: 4px;
+  gap: 3px;
 }
-
 .nv-pet-btn {
-  background: #141B15;
-  border: 1px solid #243026;
-  color: #8CA091;
-  padding: 3px 6px;
-  border-radius: 4px;
+  background: transparent;
+  border: 1px solid var(--pet-border);
+  color: var(--pet-dim);
+  border-radius: 2px;
+  padding: 1px 5px;
+  font-size: 9px;
   cursor: pointer;
+  font-family: inherit;
+  line-height: 1.4;
+  transition: all 0.15s;
+}
+.nv-pet-btn:hover {
+  color: var(--pet-neon);
+  border-color: var(--pet-neon);
+  background: rgba(51,255,0,0.08);
+}
+.nv-pet-btn.active {
+  color: var(--pet-neon);
+  border-color: var(--pet-neon);
+  background: rgba(51,255,0,0.15);
+}
+.nv-pet-stage {
+  position: relative;
+  height: 128px;
+  background:
+    linear-gradient(rgba(14,20,16,0.5) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(14,20,16,0.5) 1px, transparent 1px),
+    radial-gradient(ellipse at center, rgba(51,255,0,0.04) 0%, transparent 70%);
+  background-size: 8px 8px, 8px 8px, 100% 100%;
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: all 0.2s ease;
+  overflow: hidden;
 }
-
-.nv-pet-btn:hover {
-  background: #1E2920;
-  border-color: #59FF00;
-  color: #59FF00;
-  box-shadow: 0 0 8px rgba(89, 255, 0, 0.3);
+.nv-pet-wrap.vip-mode .nv-pet-stage {
+  background:
+    linear-gradient(rgba(255,208,40,0.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,208,40,0.06) 1px, transparent 1px),
+    radial-gradient(ellipse at center, rgba(255,208,40,0.07) 0%, transparent 70%);
+  background-size: 8px 8px, 8px 8px, 100% 100%;
 }
-
-.nv-pet-btn.is-active {
-  background: rgba(89, 255, 0, 0.15);
-  border-color: #59FF00;
-  color: #59FF00;
-}
-
-.nv-pet-btn-donate {
-  background: linear-gradient(135deg, rgba(89, 255, 0, 0.2) 0%, rgba(0, 255, 209, 0.15) 100%);
-  border-color: #59FF00;
-  color: #59FF00;
-  font-weight: 700;
-  padding: 3px 8px;
-  gap: 4px;
-}
-
-.nv-pet-btn-donate:hover {
-  background: linear-gradient(135deg, #59FF00 0%, #00FFD1 100%);
-  color: #060806;
-  box-shadow: 0 0 14px rgba(89, 255, 0, 0.6);
-}
-
-/* ==========================================
-   5. CHARACTER GRAPHICS & KEYFRAMES
-   ========================================== */
-
-.nv-pet-svg-container {
+.nv-pet-stage-canvas {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
+  display: block;
+}
+.nv-pet-cue {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  padding: 2px 6px;
+  background: rgba(255, 176, 32, 0.15);
+  border: 1px solid var(--pet-amber);
+  color: var(--pet-amber);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  border-radius: 2px;
+  pointer-events: none;
+  animation: nv-pet-cue-pulse 1.4s ease-in-out infinite;
+  z-index: 4;
+}
+.nv-pet-hud {
+  padding: 4px 8px;
+  background: #0E1310;
+  border-top: 1px solid var(--pet-border);
   display: flex;
+  justify-content: space-between;
   align-items: center;
-  justify-content: center;
-  z-index: 2;
+  font-size: 10px;
+}
+.nv-pet-act-label {
+  color: var(--pet-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 150px;
+}
+.nv-pet-act-name {
+  color: var(--pet-text);
+  font-weight: 600;
+}
+.nv-pet-donate-link {
+  color: var(--pet-neon);
+  text-decoration: none;
+  border-bottom: 1px dashed var(--pet-neon);
   cursor: pointer;
+  font-weight: 600;
+  padding-bottom: 1px;
+}
+.nv-pet-donate-link:hover {
+  color: #fff;
+  border-bottom-style: solid;
+}
+.nv-pet-wrap.vip-mode .nv-pet-donate-link {
+  color: var(--pet-gold);
+  border-bottom-color: var(--pet-gold);
+}
+@keyframes nv-pet-cue-pulse {
+  0%, 100% { opacity: 0.9; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.97); }
 }
 
-.nv-pet-svg {
-  width: 120px;
-  height: 120px;
-  filter: drop-shadow(0 4px 10px rgba(0, 0, 0, 0.7));
-  transition: transform 0.2s ease;
-}
 
-.nv-pet-svg:hover {
-  transform: scale(1.04);
+@keyframes petFloat {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-4px); }
 }
-
-.nv-pet-svg:active {
-  transform: scale(0.96);
+@keyframes eyeScan {
+  0%, 100% { transform: translateX(0); }
+  30% { transform: translateX(-4px); }
+  70% { transform: translateX(4px); }
 }
-
-/* --- Mascot Animations --- */
-@keyframes nvPetFloat {
-  0%, 100% { transform: translateY(0px) rotate(0deg); }
-  50% { transform: translateY(-6px) rotate(1deg); }
+@keyframes eyeBlink {
+  0%, 94%, 98%, 100% { transform: scaleY(1); }
+  96% { transform: scaleY(0.08); }
 }
-
-@keyframes nvPetBlink {
-  0%, 90%, 100% { transform: scaleY(1); }
-  95% { transform: scaleY(0.1); }
+@keyframes sensorSweep {
+  0% { transform: rotate(-25deg); }
+  50% { transform: rotate(25deg); }
+  100% { transform: rotate(-25deg); }
 }
-
-@keyframes nvPetScanSweep {
-  0% { transform: translateY(-12px); opacity: 0; }
-  50% { opacity: 1; }
-  100% { transform: translateY(14px); opacity: 0; }
-}
-
-@keyframes nvPetTurbineSpin {
+@keyframes turbineSpin {
   0% { transform: rotate(0deg); }
   100% { transform: rotate(360deg); }
 }
-
-@keyframes nvPetCoffeeSteam {
-  0% { transform: translateY(0) scaleX(1); opacity: 0; }
-  50% { opacity: 0.8; }
-  100% { transform: translateY(-8px) scaleX(1.4); opacity: 0; }
+@keyframes cupSteam {
+  0% { opacity: 0; transform: translateY(0) scaleX(0.8); }
+  40% { opacity: 0.7; }
+  100% { opacity: 0; transform: translateY(-10px) scaleX(1.3); }
 }
-
-@keyframes nvPetJuggle1 {
+@keyframes juggleLeft {
   0%, 100% { transform: translate(0, 0); }
-  50% { transform: translate(-14px, -18px); }
+  50% { transform: translate(-10px, -16px); }
 }
-
-@keyframes nvPetJuggle2 {
+@keyframes juggleRight {
   0%, 100% { transform: translate(0, 0); }
-  50% { transform: translate(14px, -18px); }
+  50% { transform: translate(10px, -16px); }
 }
-
-@keyframes nvPetCodeFrenzy {
-  0%, 100% { transform: translate(0, 0); }
-  25% { transform: translate(-1px, 1px); }
-  75% { transform: translate(1px, -1px); }
-}
-
-/* --- Base Keyframes --- */
-@keyframes nvPetLedPulse {
+@keyframes visorGlitch {
   0%, 100% { opacity: 1; transform: scale(1); }
-  50% { opacity: 0.4; transform: scale(0.85); }
+  92% { opacity: 1; transform: scale(1); }
+  93% { opacity: 0.4; transform: scaleX(1.05) skewX(2deg); }
+  94% { opacity: 0.9; transform: scaleY(0.95); }
+  95% { opacity: 1; transform: scale(1); }
+}
+@keyframes earTwitchL {
+  0%, 88%, 100% { transform: rotate(0deg); }
+  92% { transform: rotate(-14deg); }
+  96% { transform: rotate(4deg); }
+}
+@keyframes earTwitchR {
+  0%, 88%, 100% { transform: rotate(0deg); }
+  92% { transform: rotate(14deg); }
+  96% { transform: rotate(-4deg); }
+}
+@keyframes zzzFloat1 {
+  0% { opacity: 0; transform: translate(0, 0) scale(0.6); }
+  30% { opacity: 0.9; }
+  100% { opacity: 0; transform: translate(10px, -18px) scale(1.1); }
+}
+@keyframes zzzFloat2 {
+  0% { opacity: 0; transform: translate(0, 0) scale(0.6); }
+  30% { opacity: 0.9; }
+  100% { opacity: 0; transform: translate(14px, -24px) scale(1.3); }
+}
+@keyframes auraPulse {
+  0%, 100% { opacity: 0.25; transform: scale(0.96); }
+  50% { opacity: 0.55; transform: scale(1.04); }
+}
+.pet-mascot-rig {
+  animation: petFloat 4.2s ease-in-out infinite;
+  transform-origin: 64px 80px;
+}
+.pet-eye-pupil {
+  animation: eyeScan 5.5s ease-in-out infinite;
+  transform-origin: 64px 44px;
+}
+.pet-eye-blink {
+  animation: eyeBlink 4.8s ease-in-out infinite;
+  transform-origin: 64px 44px;
+}
+.pet-sensor-sweep {
+  animation: sensorSweep 2.4s ease-in-out infinite;
+  transform-origin: 64px 22px;
+}
+.pet-ear-l {
+  animation: earTwitchL 6s ease-in-out infinite;
+  transform-origin: 36px 32px;
+}
+.pet-ear-r {
+  animation: earTwitchR 6s ease-in-out infinite;
+  transform-origin: 92px 32px;
+}
+.pet-turbine {
+  animation: turbineSpin 0.9s linear infinite;
+  transform-origin: 64px 72px;
+}
+.pet-steam-1 {
+  animation: cupSteam 2.2s ease-out infinite;
+}
+.pet-steam-2 {
+  animation: cupSteam 2.2s ease-out infinite 0.7s;
+}
+.pet-juggle-l {
+  animation: juggleLeft 1.4s ease-in-out infinite;
+}
+.pet-juggle-r {
+  animation: juggleRight 1.4s ease-in-out infinite 0.7s;
+}
+.pet-visor {
+  animation: visorGlitch 7s infinite;
+  transform-origin: 64px 44px;
+}
+.pet-zzz-1 {
+  animation: zzzFloat1 2.8s ease-out infinite;
+}
+.pet-zzz-2 {
+  animation: zzzFloat2 2.8s ease-out infinite 1.4s;
+}
+.pet-aura {
+  animation: auraPulse 3.2s ease-in-out infinite;
+  transform-origin: 64px 60px;
 }
 
-@keyframes nvPetAuraBreath {
-  0%, 100% { transform: scale(1); opacity: 0.8; }
-  50% { transform: scale(1.15); opacity: 1; }
-}
 
-@keyframes nvPetSpeechPop {
-  0% { transform: translateY(4px) scale(0.95); opacity: 0; }
-  100% { transform: translateY(0) scale(1); opacity: 1; }
+@keyframes crtBlink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
 }
-
-@keyframes nvPetCueFlash {
-  0% { transform: scale(0.7); opacity: 0; }
-  50% { transform: scale(1.15); }
+@keyframes codeFrenzyText {
+  0% { transform: translateY(0); }
+  100% { transform: translateY(-32px); }
+}
+@keyframes hackerBob {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-2px); }
+}
+@keyframes hackerHandsFrenzy {
+  0%, 100% { transform: translateY(0); }
+  25% { transform: translateY(-3px) translateX(1px); }
+  50% { transform: translateY(1px) translateX(-1px); }
+  75% { transform: translateY(-2px) translateX(0); }
+}
+@keyframes headNod {
+  0%, 100% { transform: rotate(0deg); }
+  35% { transform: rotate(3deg); }
+  70% { transform: rotate(-2deg); }
+}
+@keyframes greenLedPulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+@keyframes amberAlertPulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
+}
+@keyframes matrixRainDrop {
+  0% { opacity: 0; transform: translateY(-10px); }
+  40% { opacity: 0.8; }
+  100% { opacity: 0; transform: translateY(28px); }
+}
+@keyframes zeroPop {
+  0% { transform: scale(0.6); opacity: 0; }
+  60% { transform: scale(1.15); opacity: 1; }
   100% { transform: scale(1); opacity: 1; }
 }
+@keyframes floatGridPulse {
+  0%, 100% { opacity: 0.15; }
+  50% { opacity: 0.4; }
+}
+.crt-cursor {
+  animation: crtBlink 0.9s infinite;
+}
+.hacker-bob {
+  animation: hackerBob 3s ease-in-out infinite;
+  transform-origin: 64px 80px;
+}
+.hacker-head {
+  animation: headNod 4.5s ease-in-out infinite;
+  transform-origin: 64px 40px;
+}
+.hacker-hands-typing {
+  animation: hackerHandsFrenzy 0.22s steps(2, start) infinite;
+  transform-origin: 64px 72px;
+}
+.crt-led-green {
+  animation: greenLedPulse 1.6s ease-in-out infinite;
+}
+.crt-led-amber {
+  animation: amberAlertPulse 0.9s ease-in-out infinite;
+}
+.matrix-rain-1 {
+  animation: matrixRainDrop 2.4s linear infinite;
+}
+.matrix-rain-2 {
+  animation: matrixRainDrop 2.4s linear infinite 0.8s;
+}
+.matrix-rain-3 {
+  animation: matrixRainDrop 2.4s linear infinite 1.6s;
+}
+.zero-badge-pop {
+  animation: zeroPop 0.6s cubic-bezier(0.18, 0.89, 0.32, 1.28) forwards;
+  transform-origin: 96px 26px;
+}
+.float-grid-line {
+  animation: floatGridPulse 2s ease-in-out infinite;
+}
 
-/* ==========================================
-   6. ACTIVITY-SPECIFIC ANIMATION CLASSES
-   ========================================== */
-
-.act-float { animation: nvPetFloat 3.5s ease-in-out infinite; }
-.act-blink { transform-origin: center; animation: nvPetBlink 4s infinite; }
-.act-scan { animation: nvPetScanSweep 2s ease-in-out infinite; }
-.act-spin { transform-origin: center; animation: nvPetTurbineSpin 1.8s linear infinite; }
-.act-steam { animation: nvPetCoffeeSteam 2.2s ease-out infinite; }
-.act-juggle-left { animation: nvPetJuggle1 1.6s ease-in-out infinite; }
-.act-juggle-right { animation: nvPetJuggle2 1.6s ease-in-out infinite 0.8s; }
-.act-hacker-type { animation: nvPetCodeFrenzy 0.18s steps(2, start) infinite; }
-
-/* Reduced motion preference */
-@media (prefers-reduced-motion: reduce) {
-  .act-float,
-  .act-blink,
-  .act-scan,
-  .act-spin,
-  .act-steam,
-  .act-juggle-left,
-  .act-juggle-right,
-  .act-hacker-type,
-  .nv-pet-aura,
-  .nv-pet-led {
-    animation: none !important;
-  }
+.nv-pet-wrap.vip-mode .crt-screen-glow {
+  fill: #FFD028 !important;
+  opacity: 0.08 !important;
+}
+.nv-pet-wrap.vip-mode .crt-term-prompt {
+  color: #FFD028 !important;
+  text-shadow: 0 0 6px rgba(255, 208, 40, 0.8) !important;
+}
+.nv-pet-wrap.vip-mode .crt-cursor { background: #FFD028 !important; }
+.nv-pet-wrap.vip-mode .crt-led {
+  background: #FFD028 !important;
+  box-shadow: 0 0 6px #FFD028 !important;
 }
