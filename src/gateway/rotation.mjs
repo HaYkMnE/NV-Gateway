@@ -10,7 +10,7 @@ export const MAX_BACKOFF_MS = 300 * 1000;
 // only forcibly resets the soonest-backoff key when none are available), so
 // this value governs how soon the key is reusable for other loops/requests,
 // never a per-switch blocking wait. Exceeding ~20s here would needlessly stall
-// a key during a rate-limit storm — keeping it at 20s aligns with the "max ~20s\r
+// a key during a rate-limit storm — keeping it at 20s aligns with the "max ~20s
 // between key switches" contract.
 export const MAX_KEY_COOLDOWN_429_MS = 20_000;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;

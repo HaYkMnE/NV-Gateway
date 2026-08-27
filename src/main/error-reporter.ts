@@ -132,132 +132,132 @@ function withinRetention(entry: Record<string, unknown>): boolean {
 // ---- Public API ----
 
 export function init(): void {
-  if (initialized) return;\r
-  initialized = true;\r
-\r
-  try {\r
-    fs.mkdirSync(path.dirname(errorsLogPath()), { recursive: true });\r
-  } catch {\r
-    // Directory creation is best-effort.\r
-  }\r
-\r
-  try {\r
-    cleanupOldErrors();\r
-  } catch {\r
-    // Cleanup must never block startup.\r
-  }\r
-\r
-  process.on("uncaughtException", (err: unknown) => {\r
-    // The existing main-process handler owns fatal shutdown; this listener\r
-    // only records the structured error entry for the report bundle.\r
-    try {\r
-      logError({\r
-        type: "uncaughtException",\r
-        message: err instanceof Error ? err.message : String(err),\r
-        ...(err instanceof Error && err.stack ? { stack: err.stack } : {}),\r
-        source: "main"\r
-      });\r
-    } catch {\r
-      // A logger must never throw.\r
-    }\r
-  });\r
-\r
-  process.on("unhandledRejection", (reason: unknown) => {\r
-    const message = reason instanceof Error ? reason.message : String(reason);\r
-    const stack = reason instanceof Error && reason.stack ? reason.stack : undefined;\r
-    try {\r
-      logError({\r
-        type: "unhandledRejection",\r
-        message,\r
-        ...(stack ? { stack } : {}),\r
-        source: "main"\r
-      });\r
-    } catch {\r
-      // Best-effort.\r
-    }\r
-  });\r
-}\r
-\r
-export function logError(entry: Partial<ErrorEntry> & { message?: string }): void {\r
-  const source = entry && typeof entry === \"object\" ? entry : {};\r
-  const record = sanitizeEntry({\r
-    timestamp: source.timestamp || new Date().toISOString(),\r
-    type: source.type || \"renderer\",\r
-    message: typeof source.message === \"string\" ? source.message : String(source.message ?? \"\"),\r
-    ...(typeof source.stack === \"string\" && source.stack ? { stack: source.stack } : {}),\r
-    ...(typeof source.source === \"string\" && source.source ? { source: source.source } : {})\r
-  });\r
-  try {\r
-    appendEntry(record);\r
-  } catch {\r
-    // Logging must never throw into the caller.\r
-  }\r
-}\r
-\r
-export function getErrorCount(): number {\r
-  return readErrors().filter(withinRetention).length;\r
-}\r
-\r
-export function previewErrors(): ErrorEntry[] {\r
-  return readErrors().filter(withinRetention).map((entry) => sanitizeEntry(entry) as unknown as ErrorEntry);\r
-}\r
-\r
-export function cleanupOldErrors(): number {\r
-  const entries = readErrors();\r
-  const kept = entries.filter(withinRetention);\r
-  if (kept.length === entries.length) return 0;\r
-  const file = errorsLogPath();\r
-  fs.mkdirSync(path.dirname(file), { recursive: true });\r
-  const body = kept.map((entry) => JSON.stringify(entry)).join(\"\\n\");\r
-  fs.writeFileSync(file, kept.length ? body + \"\\n\" : \"\", \"utf8\");\r
-  return entries.length - kept.length;\r
-}\r
-\r
-export async function sendErrors(): Promise<ErrorReportResult> {\r
-  const errors = previewErrors();\r
-  const count = errors.length;\r
-\r
-  // ALWAYS persist a local snapshot of the report bundle — independent of\r
-  // whether the upload path is configured or succeeds, so an operator always\r
-  // has an on-disk copy to send manually.\r
-  const stamp = new Date().toISOString().replace(/[:.]/g, \"-\");\r
-  let reportPath = \"\";\r
-  try {\r
-    const dir = reportsDir();\r
-    fs.mkdirSync(dir, { recursive: true });\r
-    reportPath = path.join(dir, `report-${stamp}.json`);\r
-    fs.writeFileSync(\r
-      reportPath,\r
-      JSON.stringify({ timestamp: new Date().toISOString(), count, errors }, null, 2),\r
-      \"utf8\"\r
-    );\r
-  } catch {\r
-    // Best-effort snapshot.\r
-  }\r
-\r
-  // Network copy of the bundle — trimmed to the worker's size limit.  The\r
-  // local snapshot above intentionally keeps every entry regardless.\r
-  const report = { timestamp: new Date().toISOString(), count, errors };\r
-  fitReportForWorker(report);\r
-  try {\r
-    const response = await fetch(REPORT_ENDPOINT, {\r
-      method: \"POST\",\r
-      headers: {\r
-        \"Content-Type\": \"application/json\"\r
-      },\r
-      body: JSON.stringify({ report, appVersion: app.getVersion() || \"0.0.0\" }),\r
-      signal: AbortSignal.timeout(SEND_TIMEOUT_MS)\r
-    });\r
-    if (response.status >= 200 && response.status < 300) {\r
-      return { success: true, count, message: `Sent ${count} errors`, ...(reportPath ? { reportPath } : {}) };\r
-    }\r
-    return { success: false, count, message: `HTTP ${response.status}`, ...(reportPath ? { reportPath } : {}) };\r
-  } catch (err: unknown) {\r
-    return {\r
-      success: false,\r
-      count,\r
-      message: `HTTP request failed: ${err instanceof Error ? err.message : String(err)}`,\r
-      ...(reportPath ? { reportPath } : {})\r
-    };\r
-  }\r
-}\r
+  if (initialized) return;
+  initialized = true;
+
+  try {
+    fs.mkdirSync(path.dirname(errorsLogPath()), { recursive: true });
+  } catch {
+    // Directory creation is best-effort.
+  }
+
+  try {
+    cleanupOldErrors();
+  } catch {
+    // Cleanup must never block startup.
+  }
+
+  process.on("uncaughtException", (err: unknown) => {
+    // The existing main-process handler owns fatal shutdown; this listener
+    // only records the structured error entry for the report bundle.
+    try {
+      logError({
+        type: "uncaughtException",
+        message: err instanceof Error ? err.message : String(err),
+        ...(err instanceof Error && err.stack ? { stack: err.stack } : {}),
+        source: "main"
+      });
+    } catch {
+      // A logger must never throw.
+    }
+  });
+
+  process.on("unhandledRejection", (reason: unknown) => {
+    const message = reason instanceof Error ? reason.message : String(reason);
+    const stack = reason instanceof Error && reason.stack ? reason.stack : undefined;
+    try {
+      logError({
+        type: "unhandledRejection",
+        message,
+        ...(stack ? { stack } : {}),
+        source: "main"
+      });
+    } catch {
+      // Best-effort.
+    }
+  });
+}
+
+export function logError(entry: Partial<ErrorEntry> & { message?: string }): void {
+  const source = entry && typeof entry === "object" ? entry : {};
+  const record = sanitizeEntry({
+    timestamp: source.timestamp || new Date().toISOString(),
+    type: source.type || "renderer",
+    message: typeof source.message === "string" ? source.message : String(source.message ?? ""),
+    ...(typeof source.stack === "string" && source.stack ? { stack: source.stack } : {}),
+    ...(typeof source.source === "string" && source.source ? { source: source.source } : {})
+  });
+  try {
+    appendEntry(record);
+  } catch {
+    // Logging must never throw into the caller.
+  }
+}
+
+export function getErrorCount(): number {
+  return readErrors().filter(withinRetention).length;
+}
+
+export function previewErrors(): ErrorEntry[] {
+  return readErrors().filter(withinRetention).map((entry) => sanitizeEntry(entry) as unknown as ErrorEntry);
+}
+
+export function cleanupOldErrors(): number {
+  const entries = readErrors();
+  const kept = entries.filter(withinRetention);
+  if (kept.length === entries.length) return 0;
+  const file = errorsLogPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const body = kept.map((entry) => JSON.stringify(entry)).join("\n");
+  fs.writeFileSync(file, kept.length ? body + "\n" : "", "utf8");
+  return entries.length - kept.length;
+}
+
+export async function sendErrors(): Promise<ErrorReportResult> {
+  const errors = previewErrors();
+  const count = errors.length;
+
+  // ALWAYS persist a local snapshot of the report bundle — independent of
+  // whether the upload path is configured or succeeds, so an operator always
+  // has an on-disk copy to send manually.
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  let reportPath = "";
+  try {
+    const dir = reportsDir();
+    fs.mkdirSync(dir, { recursive: true });
+    reportPath = path.join(dir, `report-${stamp}.json`);
+    fs.writeFileSync(
+      reportPath,
+      JSON.stringify({ timestamp: new Date().toISOString(), count, errors }, null, 2),
+      "utf8"
+    );
+  } catch {
+    // Best-effort snapshot.
+  }
+
+  // Network copy of the bundle — trimmed to the worker's size limit.  The
+  // local snapshot above intentionally keeps every entry regardless.
+  const report = { timestamp: new Date().toISOString(), count, errors };
+  fitReportForWorker(report);
+  try {
+    const response = await fetch(REPORT_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ report, appVersion: app.getVersion() || "0.0.0" }),
+      signal: AbortSignal.timeout(SEND_TIMEOUT_MS)
+    });
+    if (response.status >= 200 && response.status < 300) {
+      return { success: true, count, message: `Sent ${count} errors`, ...(reportPath ? { reportPath } : {}) };
+    }
+    return { success: false, count, message: `HTTP ${response.status}`, ...(reportPath ? { reportPath } : {}) };
+  } catch (err: unknown) {
+    return {
+      success: false,
+      count,
+      message: `HTTP request failed: ${err instanceof Error ? err.message : String(err)}`,
+      ...(reportPath ? { reportPath } : {})
+    };
+  }
+}

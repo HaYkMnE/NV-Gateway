@@ -240,7 +240,7 @@ export async function runDirectGlmProbe({
         return { status, projection, failed: projection === undefined };
     };
 
-    let longPrompt;\r
+    let longPrompt;
     let longBody;
     try {
         const catalog = await request("catalog", MODELS_PATH, undefined, projectCatalog);
@@ -273,7 +273,7 @@ export function createDirectGlmProbeScheduler({ probe, logger = () => {} } = {})
             if (started) return undefined;
             started = true;
             Promise.resolve().then(() => probe()).catch(() => {
-                try { logger(safeOutcome({ step: "internal", durationMs: 0, result: "indeterminate" })); } catch {}
+                try { logger(safeOutcome({ step: "internal", durationMs: 0, result: "indeterminate" })); } catch {};
             });
             return undefined;
         }
