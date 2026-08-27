@@ -6,513 +6,59 @@ import { petAudio } from './audioEngine';
 import './donation-modal.css';
 
 /**
- * DonationModal — cyberpunk "SUPPORT NV-GATEWAY" modal.
+ * DonationModal — cyberpunk "SUPPORT NV-GATEWAY" donation dialog.
  *
- * Visual design ported from nvgateway-donation-mockups/interactive-showcase.html:
- *   - Dark CRT theme (#0A0D0B / #141A16 border / #33FF00 green / #FFD028 VIP gold / #FF3366 panic red).
- *   - Tier selector (SUPPORTER $5 / ADVOCATE $15 / SYNDICATE $50 / SPONSOR custom)
- *     with auto-toggling currency (Crypto USDT/BTC/ETH vs Fiat card/PayPal mock).
- *   - Live QR code rendered to HTML canvas via `qrcode` package (SVG-free,
- *     works without external asset fetches, safe under tight CSP).
- *   - "Ascend to Syndicate Patron" instant VIP unlock button (persists to
- *     localStorage nv_pet_vip, emits petAudio ascension ritual sfx, fires
- *     onAscension callback to activate VIP state in PetWidget without reload).
+ * Ported from nvgateway-donation-mockups/interactive-showcase.html
+ * (donation modal + enlarged QR scan overlay). All payment values are
+ * PLACEHOLDERS until real addresses/links are wired in.
+ *
+ * Any successful support action (COPY, enlarged-QR scan confirmation,
+ * external platform link) triggers the Ascension ritual:
+ *   - petAudio.playAscensionRitual()
+ *   - localStorage nv_pet_vip = Date.now().toString() (expires in 7 days)
+ *   - onAscension() so the parent can flip the widget to Patron state
+ *   - speech bubble "THANK YOU, FRIEND!"
  */
 
 export interface DonationModalProps {
   open: boolean;
   onClose: () => void;
-  /**
-   * Fired when the user clicks "Ascend to Syndicate Patron" or confirms a
-   * donation. The host should notify PetWidget so it can update VIP state
-   * immediately.
-   */
-  onAscension?: () => void;
+  /** Fired after every successful support action (see Ascension above). */
+  onAscension: () => void;
 }
 
-type CurrencyMode = 'crypto' | 'fiat';
-type CryptoChain = 'usdt-trc20' | 'btc' | 'eth';
+type TabKey = 'crypto' | 'world';
 
-interface DonationTier {
+interface DonationRow {
   id: string;
-  nameKey: string;
-  usdAmount: number;
-  amountLabel: string;
-  taglineKey: string;
-  perksKey: string;
-  vip: boolean;
+  label: string;
+  /** FULL value copied to the clipboard (verbatim real address / link). */
+  value: string;
+  /** Optional short display string; when absent, `value` is shown as-is. */
+  display?: string;
+  /** Exact QR payload string (crypto URI scheme or plain address). */
+  qr?: string;
+  /** Present for external platform rows ("OPEN ↗"). '#' = placeholder link. */
+  url?: string;
 }
 
-const TIERS: readonly DonationTier[] = [
-  {
-    id: 'supporter',
-    nameKey: 'pet_tier_supporter',
-    usdAmount: 5,
-    amountLabel: '$5',
-    taglineKey: 'pet_tier_supporter_tag',
-    perksKey: 'pet_tier_supporter_perks',
-    vip: false,
-  },
-  {
-    id: 'advocate',
-    nameKey: 'pet_tier_advocate',
-    usdAmount: 15,
-    amountLabel: '$15',
-    taglineKey: 'pet_tier_advocate_tag',
-    perksKey: 'pet_tier_advocate_perks',
-    vip: false,
-  },
-  {
-    id: 'syndicate',
-    nameKey: 'pet_tier_syndicate',
-    usdAmount: 50,
-    amountLabel: '$50',
-    taglineKey: 'pet_tier_syndicate_tag',
-    perksKey: 'pet_tier_syndicate_perks',
-    vip: true,
-  },
-  {
-    id: 'custom',
-    nameKey: 'pet_tier_custom',
-    usdAmount: 0,
-    amountLabel: 'Custom',
-    taglineKey: 'pet_tier_custom_tag',
-    perksKey: 'pet_tier_custom_perks',
-    vip: false,
-  },
+const TABS: ReadonlyArray<{ key: TabKey }> = [
+  { key: 'crypto' },
+  { key: 'world' },
 ];
 
-/**
- * Public donation destination addresses (safe static donation targets).
- * TRON USDT (TRC-20) / BTC Native SegWit / EVM ETH.
- */
-const CRYPTO_ADDRESSES: Record<CryptoChain, { label: string; address: string; uriPrefix: string }> = {
-  'usdt-trc20': {
-    label: 'USDT (TRC-20 / TRON)',
-    address: 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t',
-    uriPrefix: '',
-  },
-  btc: {
-    label: 'Bitcoin (BTC)',
-    address: 'bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq',
-    uriPrefix: 'bitcoin:',
-  },
-  eth: {
-    label: 'Ethereum (ETH / ERC-20)',
-    address: '0x71C8A33190C6b62D71eb352136d8d9B7f8C733c7',
-    uriPrefix: 'ethereum:',
-  },
-};
+// NOTE: crypto rows carry REAL wallets (verbatim — do not alter);
+// `world` rows carry REAL support links (verbatim — do not alter).
+const BTC_ADDRESS = 'bc1qmle5479683zdggfd0d3qfzm08dcff3dd8zufw5';
+const EVM_ADDRESS = '0xEf3Ab19B35d770293107c1e54d8a6d5f1c6d00bA';
+const SOL_ADDRESS = '2r7bD3n3yoRPCPg1bjDaJ7nxcE7oMwJy5cRVu5XsrZgG';
+const TRON_ADDRESS = 'TPoeenevUvRwcTfXmCFweGVSbH37hiZpmr';
+const TON_ADDRESS = 'UQCirhEjqFkjA8CAQcypCkFOBSOUooNKBTVHgiBikDRUhBGZ';
 
-const VIP_STORAGE_KEY = 'nv_pet_vip';
-
-export function DonationModal({ open, onClose, onAscension }: DonationModalProps) {
-  const { t } = useTranslation();
-  const [selectedTier, setSelectedTier] = useState<string>('syndicate');
-  const [currency, setCurrency] = useState<CurrencyMode>('crypto');
-  const [cryptoChain, setCryptoChain] = useState<CryptoChain>('usdt-trc20');
-  const [customUsd, setCustomUsd] = useState<string>('25');
-  const [copied, setCopied] = useState<boolean>(false);
-  const [qrModalOpen, setQrModalOpen] = useState<boolean>(false);
-  const [isVip, setIsVip] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem(VIP_STORAGE_KEY) === 'true';
-    } catch {
-      return false;
-    }
-  });
-
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const qrCanvasRef = useRef<HTMLCanvasElement | null>(null);
-
-  // Close on Escape key
-  useEffect(() => {
-    if (!open) return;
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        if (qrModalOpen) {
-          setQrModalOpen(false);
-        } else {
-          onClose();
-        }
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [open, qrModalOpen, onClose]);
-
-  // Current crypto address
-  const activeCrypto = CRYPTO_ADDRESSES[cryptoChain];
-
-  // Render inline QR code when crypto tab is active
-  useEffect(() => {
-    if (!open || currency !== 'crypto') return;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const uri = activeCrypto.uriPrefix + activeCrypto.address;
-    QRCode.toCanvas(canvas, uri, {
-      width: 140,
-      margin: 1,
-      color: {
-        dark: '#33FF00',
-        light: '#0A0D0B',
-      },
-    }).catch(() => {
-      /* ignore canvas errors */
-    });
-  }, [open, currency, activeCrypto]);
-
-  // Render high-res zoomed QR code in sub-modal
-  useEffect(() => {
-    if (!qrModalOpen) return;
-    const canvas = qrCanvasRef.current;
-    if (!canvas) return;
-
-    const uri = activeCrypto.uriPrefix + activeCrypto.address;
-    QRCode.toCanvas(canvas, uri, {
-      width: 260,
-      margin: 2,
-      color: {
-        dark: '#33FF00',
-        light: '#0A0D0B',
-      },
-    }).catch(() => {
-      /* ignore canvas errors */
-    });
-  }, [qrModalOpen, activeCrypto]);
-
-  // Copy address to clipboard
-  const handleCopy = useCallback(async () => {
-    try {
-      await navigator.clipboard.writeText(activeCrypto.address);
-      setCopied(true);
-      petAudio.playEasterEggDisk(0);
-      window.setTimeout(() => setCopied(false), 2000);
-    } catch {
-      /* ignore */
-    }
-  }, [activeCrypto.address]);
-
-  // Ascend to VIP (persists VIP state, plays ascension ritual, fires callback)
-  const handleAscend = useCallback(() => {
-    try {
-      localStorage.setItem(VIP_STORAGE_KEY, 'true');
-    } catch {
-      /* ignore */
-    }
-    setIsVip(true);
-    petAudio.playAscensionRitual();
-    onAscension?.();
-  }, [onAscension]);
-
-  if (!open) return null;
-
-  const tier = TIERS.find((x) => x.id === selectedTier) ?? TIERS[2];
-
-  return (
-    <>
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label={t('pet_donation_title')}
-        className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/80 backdrop-blur-sm overflow-y-auto"
-        onClick={(e) => {
-          if (e.target === e.currentTarget) onClose();
-        }}
-      >
-        <div className="relative w-full max-w-xl my-auto rounded-xl border border-[#1A261C] bg-[#0A0D0B] p-5 sm:p-6 shadow-[0_0_40px_rgba(51,255,0,0.15)] text-textMain">
-          {/* Cyberpunk Top Accent Bar */}
-          <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-[#33FF00] via-[#00FFD1] to-[#FFD028] rounded-t-xl" />
-
-          {/* Header */}
-          <div className="flex items-start justify-between gap-3 mb-4">
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="font-mono text-xs font-bold text-accent-neon uppercase tracking-widest">
-                  [ {t('pet_donation_kicker')} ]
-                </span>
-                {isVip && (
-                  <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-[#FFD028]/20 text-[#FFD028] border border-[#FFD028]/60">
-                    👑 VIP PATRON
-                  </span>
-                )}
-              </div>
-              <h2 className="text-xl sm:text-2xl font-bold tracking-tight text-textMain mt-1">
-                {t('pet_donation_title')}
-              </h2>
-              <p className="text-xs text-textMuted mt-1 leading-relaxed">
-                {t('pet_donation_subtitle')}
-              </p>
-            </div>
-
-            <button
-              type="button"
-              onClick={onClose}
-              className="p-1.5 text-textMuted hover:text-accent-neon rounded-lg hover:bg-surface border border-transparent hover:border-border transition-colors cursor-pointer"
-              aria-label={t('close_menu')}
-            >
-              <X size={18} />
-            </button>
-          </div>
-
-          {/* Tier Selection Grid */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-4">
-            {TIERS.map((tItem) => {
-              const isSelected = selectedTier === tItem.id;
-              return (
-                <button
-                  key={tItem.id}
-                  type="button"
-                  onClick={() => {
-                    setSelectedTier(tItem.id);
-                    petAudio.playEasterEggDisk(1);
-                  }}
-                  className={`p-3 rounded-lg border text-left transition-all cursor-pointer relative overflow-hidden ${
-                    isSelected
-                      ? tItem.vip
-                        ? 'border-[#FFD028] bg-[#FFD028]/10 shadow-[0_0_15px_rgba(255,208,40,0.25)]'
-                        : 'border-accent-neon bg-accent-neon/10 shadow-[0_0_15px_rgba(51,255,0,0.2)]'
-                      : 'border-border/60 bg-surface/60 hover:border-border hover:bg-surface text-textMuted hover:text-textMain'
-                  }`}
-                >
-                  {tItem.vip && (
-                    <div className="text-[9px] font-mono font-bold text-[#FFD028] tracking-wider uppercase mb-1">
-                      👑 VIP
-                    </div>
-                  )}
-                  <div className="font-bold text-sm text-textMain">{t(tItem.nameKey)}</div>
-                  <div
-                    className={`font-mono text-xs font-semibold mt-0.5 ${
-                      tItem.vip ? 'text-[#FFD028]' : 'text-accent-neon'
-                    }`}
-                  >
-                    {tItem.id === 'custom' ? `$${customUsd}` : tItem.amountLabel}
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-
-          {/* Selected Tier Details Callout */}
-          <div className="p-3.5 rounded-lg border border-border/80 bg-surface/50 mb-4 text-xs space-y-1">
-            <div className="flex items-center justify-between">
-              <span className="font-bold text-textMain">{t(tier.nameKey)} Tier</span>
-              {tier.vip && (
-                <span className="font-mono text-[10px] text-[#FFD028] font-bold">
-                  ★ UNLOCKS VIP MASCOT BEHAVIORS
-                </span>
-              )}
-            </div>
-            <p className="text-textMuted">{t(tier.taglineKey)}</p>
-            <p className="text-textMuted/80 text-[11px] pt-1 border-t border-border/40 font-mono">
-              {t(tier.perksKey)}
-            </p>
-          </div>
-
-          {/* Currency Toggle (Crypto vs Fiat) */}
-          <div className="flex items-center gap-2 mb-3">
-            <button
-              type="button"
-              onClick={() => setCurrency('crypto')}
-              className={`px-3 py-1.5 rounded text-xs font-semibold transition-all cursor-pointer ${
-                currency === 'crypto'
-                  ? 'bg-accent-neon text-bg font-bold shadow-[0_0_10px_rgba(51,255,0,0.3)]'
-                  : 'bg-surface border border-border text-textMuted hover:text-textMain'
-              }`}
-            >
-              ⚡ Crypto (USDT / BTC / ETH)
-            </button>
-            <button
-              type="button"
-              onClick={() => setCurrency('fiat')}
-              className={`px-3 py-1.5 rounded text-xs font-semibold transition-all cursor-pointer ${
-                currency === 'fiat'
-                  ? 'bg-accent-neon text-bg font-bold shadow-[0_0_10px_rgba(51,255,0,0.3)]'
-                  : 'bg-surface border border-border text-textMuted hover:text-textMain'
-              }`}
-            >
-              💳 Card / PayPal (Direct)
-            </button>
-          </div>
-
-          {/* Crypto Content Block */}
-          {currency === 'crypto' ? (
-            <div className="space-y-3 p-4 rounded-xl border border-border bg-bg/80">
-              {/* Chain Selection Tabs */}
-              <div className="flex flex-wrap gap-2">
-                {(['usdt-trc20', 'btc', 'eth'] as const).map((chain) => (
-                  <button
-                    key={chain}
-                    type="button"
-                    onClick={() => setCryptoChain(chain)}
-                    className={`px-2.5 py-1 rounded text-xs font-mono transition-colors cursor-pointer ${
-                      cryptoChain === chain
-                        ? 'border border-accent-neon text-accent-neon bg-accent-neon/10 font-bold'
-                        : 'border border-border/80 text-textMuted hover:text-textMain bg-surface'
-                    }`}
-                  >
-                    {CRYPTO_ADDRESSES[chain].label}
-                  </button>
-                ))}
-              </div>
-
-              {/* QR & Address View */}
-              <div className="flex flex-col sm:flex-row items-center gap-4 pt-1">
-                {/* QR Canvas */}
-                <div
-                  onClick={() => setQrModalOpen(true)}
-                  className="p-2 rounded-lg border border-accent-neon/50 bg-[#0A0D0B] shrink-0 cursor-zoom-in group relative"
-                  title="Click to Zoom QR"
-                >
-                  <canvas ref={canvasRef} className="w-[140px] h-[140px] block" />
-                  <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 flex items-center justify-center text-[10px] font-mono text-accent-neon font-bold transition-opacity rounded-lg">
-                    🔍 ZOOM
-                  </div>
-                </div>
-
-                {/* Address and Actions */}
-                <div className="min-w-0 flex-1 space-y-2 w-full">
-                  <div>
-                    <label className="block text-[10px] font-mono uppercase tracking-wider text-textMuted mb-1">
-                      {activeCrypto.label} {t('pet_donation_address')}
-                    </label>
-                    <code className="block p-2 rounded bg-surface border border-border font-mono text-xs text-textMain break-all select-all">
-                      {activeCrypto.address}
-                    </code>
-                  </div>
-
-                  <div className="flex flex-wrap gap-2">
-                    <button
-                      type="button"
-                      onClick={() => void handleCopy()}
-                      className="px-3 py-1.5 rounded text-xs font-semibold bg-accent-neon/15 hover:bg-accent-neon/25 text-accent-neon border border-accent-neon/50 transition-colors cursor-pointer flex items-center gap-1.5"
-                    >
-                      <span>{copied ? '✓ COPIED' : '📋 COPY ADDRESS'}</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => setQrModalOpen(true)}
-                      className="px-3 py-1.5 rounded text-xs font-semibold bg-surface hover:bg-border text-textMain border border-border transition-colors cursor-pointer"
-                    >
-                      🔍 EXPAND QR
-                    </button>
-                  </div>
-
-                  <p className="text-[10px] text-textMuted leading-relaxed">
-                    {t('pet_donation_crypto_note')}
-                  </p>
-                </div>
-              </div>
-            </div>
-          ) : (
-            /* Fiat / Direct Links Content Block */
-            <div className="space-y-3 p-4 rounded-xl border border-border bg-bg/80">
-              <p className="text-xs text-textMuted leading-relaxed">
-                {t('pet_donation_fiat_desc')}
-              </p>
-
-              <div className="grid sm:grid-cols-2 gap-3 pt-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    void window.electronAPI.openExternal(
-                      'https://github.com/sponsors/HaYkMnE'
-                    );
-                  }}
-                  className="p-3 rounded-lg border border-border hover:border-accent-neon bg-surface hover:bg-accent-neon/10 text-left transition-all cursor-pointer"
-                >
-                  <div className="font-bold text-xs text-textMain">★ GitHub Sponsors</div>
-                  <div className="text-[11px] text-textMuted mt-0.5">Recurring or one-time via card</div>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    void window.electronAPI.openExternal(
-                      'https://github.com/HaYkMnE/NV-Gateway'
-                    );
-                  }}
-                  className="p-3 rounded-lg border border-border hover:border-[#FFD028] bg-surface hover:bg-[#FFD028]/10 text-left transition-all cursor-pointer"
-                >
-                  <div className="font-bold text-xs text-textMain">⚡ Project Repository</div>
-                  <div className="text-[11px] text-textMuted mt-0.5">Star & contribute on GitHub</div>
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* Syndicate Ascension Button */}
-          <div className="mt-5 pt-4 border-t border-border flex flex-col sm:flex-row items-center justify-between gap-3">
-            <div className="text-xs text-textMuted">
-              {isVip ? (
-                <span className="text-[#FFD028] font-bold">
-                  👑 VIP Syndicate Patron Status Active
-                </span>
-              ) : (
-                <span>Unlocked instant VIP perks on donation</span>
-              )}
-            </div>
-
-            <div className="flex items-center gap-2 w-full sm:w-auto">
-              {!isVip && (
-                <button
-                  type="button"
-                  onClick={handleAscend}
-                  className="w-full sm:w-auto px-4 py-2 rounded-lg text-xs font-bold bg-gradient-to-r from-[#FFD028] to-[#FF8C00] text-bg hover:brightness-110 shadow-[0_0_15px_rgba(255,208,40,0.4)] transition-all cursor-pointer flex items-center justify-center gap-1.5"
-                >
-                  <span>👑 ASCEND TO VIP PATRON</span>
-                </button>
-              )}
-
-              <button
-                type="button"
-                onClick={onClose}
-                className="w-full sm:w-auto px-4 py-2 rounded-lg text-xs font-medium border border-border hover:border-textMuted text-textMuted hover:text-textMain bg-surface transition-colors cursor-pointer"
-              >
-                {t('close_menu')}
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* High-res Zoomed QR Sub-modal */}
-      {qrModalOpen && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          aria-label="Zoomed QR Code"
-          className="fixed inset-0 z-60 flex items-center justify-center p-4 bg-black/90 backdrop-blur-md"
-          onClick={() => setQrModalOpen(false)}
-        >
-          <div
-            className="p-6 rounded-2xl border-2 border-accent-neon bg-[#0A0D0B] shadow-[0_0_50px_rgba(51,255,0,0.3)] text-center space-y-4 max-w-sm"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="text-xs font-mono font-bold text-accent-neon uppercase tracking-wider">
-              {activeCrypto.label}
-            </div>
-
-            <div className="p-3 bg-[#0A0D0B] rounded-xl border border-accent-neon/40 inline-block">
-              <canvas ref={qrCanvasRef} className="w-[260px] h-[260px] block" />
-            </div>
-
-            <code className="block p-2 rounded bg-surface border border-border font-mono text-[11px] text-textMain break-all select-all">
-              {activeCrypto.address}
-            </code>
-
-            <button
-              type="button"
-              onClick={() => setQrModalOpen(false)}
-              className="w-full py-2 rounded-lg bg-accent-neon text-bg font-bold text-xs hover:brightness-110 cursor-pointer"
-            >
-              {t('close_menu')}
-            </button>
-          </div>
-        </div>
-      )}
-    </>
-  );
+/** first8…last6 truncation for a long address. */
+function truncateAddress(value: string): string {
+  return value.length > 16 ? `${value.slice(0, 8)}…${value.slice(-6)}` : value;
 }
+
+const PANEL_ROWS: Record<TabKey, ReadonlyArray<DonationRow>> = {
+  crypto: [\n    {\n      id: 'btc',\n      label: 'Bitcoin — BTC',\n      value: BTC_ADDRESS,\n      display: truncateAddress(BTC_ADDRESS),\n      qr: `bitcoin:${BTC_ADDRESS}`,\n    },\n    {\n      id: 'eth',\n      label: 'Ethereum — ETH / USDT (ERC-20)',\n      value: EVM_ADDRESS,\n      display: truncateAddress(EVM_ADDRESS),\n      qr: `ethereum:${EVM_ADDRESS}@1`,\n    },\n    {\n      id: 'bsc',\n      label: 'BNB Smart Chain — BNB / USDT (BEP-20)',\n      value: EVM_ADDRESS,\n      display: truncateAddress(EVM_ADDRESS),\n      qr: `ethereum:${EVM_ADDRESS}@56`,\n    },\n    {\n      id: 'sol',\n      label: 'Solana — SOL / USDT',\n      value: SOL_ADDRESS,\n      display: truncateAddress(SOL_ADDRESS),\n      qr: `solana:${SOL_ADDRESS}`,\n    },\n    {\n      id: 'tron',\n      label: 'Tron — USDT (TRC-20)',\n      value: TRON_ADDRESS,\n      display: truncateAddress(TRON_ADDRESS),\n      qr: TRON_ADDRESS,\n    },\n    {\n      id: 'ton',\n      label: 'TON — TON',\n      value: TON_ADDRESS,\n      display: truncateAddress(TON_ADDRESS),\n      qr: `ton://transfer/${TON_ADDRESS}`,\n    },\n  ],\n  world: [\n    {\n      id: 'kofi',\n      label: 'Ko-fi',\n      value: 'https://ko-fi.com/haykmne',\n      display: 'ko-fi.com/haykmne',\n      url: 'https://ko-fi.com/haykmne',\n      qr: 'https://ko-fi.com/haykmne',\n    },\n    {\n      id: 'patreon',\n      label: 'Patreon',\n      value: 'https://www.patreon.com/c/HaYkMnE',\n      display: 'patreon.com/c/HaYkMnE',\n      url: 'https://www.patreon.com/c/HaYkMnE',\n      qr: 'https://www.patreon.com/c/HaYkMnE',\n    },\n    {\n      id: 'tribute',\n      label: 'Tribute (Telegram)',\n      value: 'https://t.me/tribute/app?startapp=ep_7qt3bDGDd36LHQg4oAifvcqXhzifEM9RF0TMtb54EZbJQOdZX0',\n      display: 't.me/tribute/app?startapp=…',\n      url: 'https://t.me/tribute/app?startapp=ep_7qt3bDGDd36LHQg4oAifvcqXhzifEM9RF0TMtb54EZbJQOdZX0',\n      qr: 'https://t.me/tribute/app?startapp=ep_7qt3bDGDd36LHQg4oAifvcqXhzifEM9RF0TMtb54EZbJQOdZX0',\n    },\n  ],\n};\n\n/** Clipboard write with execCommand fallback (Electron/permission safe). */\nfunction copyViaExecCommand(text: string): void {\n  const ta = document.createElement('textarea');\n  ta.value = text;\n  ta.setAttribute('readonly', '');\n  ta.style.position = 'fixed';\n  ta.style.opacity = '0';\n  document.body.appendChild(ta);\n  ta.select();\n  try {\n    document.execCommand('copy');\n  } catch {\n    /* clipboard unavailable — nothing else we can do */\n  }\n  ta.remove();\n}\n\nfunction copyText(text: string): void {\n  if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {\n    navigator.clipboard.writeText(text).catch(() => copyViaExecCommand(text));\n  } else {\n    copyViaExecCommand(text);\n  }\n}\n\n/** Dashed placeholder QR glyph (pure vector, no real payload). */\nfunction QrGlyph({ size }: { size: number }): React.JSX.Element {\n  return (\n    <svg\n      width=\"100%\"\n      height=\"100%\"\n      viewBox=\"0 0 44 44\"\n      aria-hidden=\"true\"\n      className=\"block h-full w-full\"\n      style={{ maxWidth: size, maxHeight: size }}\n    >\n      <rect x=\"2\" y=\"2\" width=\"40\" height=\"40\" rx=\"4\" fill=\"#ECEFF2\" />\n      <rect\n        x=\"2\"\n        y=\"2\"\n        width=\"40\"\n        height=\"40\"\n        rx=\"4\"\n        fill=\"none\"\n        stroke=\"#324458\"\n        strokeWidth=\"1.5\"\n        strokeDasharray=\"4 3\"\n      />\n      <g fill=\"#14181D\">\n        <rect x=\"7\" y=\"7\" width=\"9\" height=\"9\" />\n        <rect x=\"28\" y=\"7\" width=\"9\" height=\"9\" />\n        <rect x=\"7\" y=\"28\" width=\"9\" height=\"9\" />\n        <rect x=\"20\" y=\"20\" width=\"4\" height=\"4\" />\n        <rect x=\"29\" y=\"29\" width=\"5\" height=\"5\" />\n        <rect x=\"35\" y=\"21\" width=\"3\" height=\"3\" />\n        <rect x=\"21\" y=\"31\" width=\"3\" height=\"3\" />\n        <rect x=\"27\" y=\"20\" width=\"2\" height=\"2\" />\n        <rect x=\"31\" y=\"24\" width=\"2\" height=\"2\" />\n      </g>\n      <g fill=\"#ECEFF2\">\n        <rect x=\"10\" y=\"10\" width=\"3\" height=\"3\" />\n        <rect x=\"31\" y=\"10\" width=\"3\" height=\"3\" />\n        <rect x=\"10\" y=\"31\" width=\"3\" height=\"3\" />\n      </g>\n    </svg>\n  );\n}\n\n/**\n * REAL QR code rendered as inline SVG (CSP-safe: no data: URIs, no canvas).\n * Generated at mount from the exact payload string via the `qrcode` package.\n * Falls back to the dashed placeholder glyph while generating / on failure.\n */\ninterface ParsedQrSvg {\n  viewBox: string;\n  /** Every path in the generated QR (background + modules), as data. */\n  paths: ReadonlyArray<{ d: string; fill?: string; stroke?: string }>;\n}\n\n/**\n * Parse the SVG string produced by `qrcode.toString({ type: 'svg' })` into\n * plain data (viewBox + path d/fill pairs). Returns null if the markup does\n * not look like a qrcode SVG. No HTML is ever injected into the DOM — the\n * string is treated strictly as data, so the injection surface is zero.\n */\nfunction parseQrSvg(markup: string): ParsedQrSvg | null {\n  const viewBoxMatch = /<svg\\b[^>]*\\bviewBox=\"([^\"]+)\"/.exec(markup);\n  if (viewBoxMatch === null) return null;\n  const paths: Array<{ d: string; fill?: string; stroke?: string }> = [];\n  const pathRe = /<path\\b[^>]*>/g;\n  let pathTag: RegExpExecArray | null;\n  while ((pathTag = pathRe.exec(markup)) !== null) {\n    const dMatch = /\\bd=\"([^\"]+)\"/.exec(pathTag[0]);\n    const fillMatch = /\\bfill=\"(#[0-9A-Fa-f]{3,8})\"/.exec(pathTag[0]);\n    const strokeMatch = /\\bstroke=\"(#[0-9A-Fa-f]{3,8})\"/.exec(pathTag[0]);\n    if (dMatch === null) return null;\n    // qrcode draws modules as stroke lines (no fill); background as fill rect — keep both.\n    paths.push({ d: dMatch[1], fill: fillMatch?.[1], stroke: strokeMatch?.[1] });\n  }\n  if (paths.length === 0) return null;\n  return { viewBox: viewBoxMatch[1], paths };\n}\n\nfunction CryptoQr({ payload, size }: { payload: string; size: number }): React.JSX.Element {\n  const [qr, setQr] = useState<ParsedQrSvg | null>(null);\n\n  useEffect(() => {\n    let cancelled = false;\n    QRCode.toString(payload, {\n      type: 'svg',\n      errorCorrectionLevel: 'M',\n      margin: 1,\n      width: size,\n      color: { dark: '#14181D', light: '#ECEFF2' },\n    })\n      .then((markup) => {\n        if (!cancelled) setQr(parseQrSvg(markup));\n      })\n      .catch(() => {\n        if (!cancelled) setQr(null);\n      });\n    return () => {\n      cancelled = true;\n    };\n  }, [payload, size]);\n\n  if (qr === null) {\n    return <QrGlyph size={size} />;\n  }\n  return (\n    <span\n      className=\"block leading-none w-full h-full\"\n      style={{ maxWidth: size, maxHeight: size }}\n      data-qr-payload={payload}\n    >\n      <svg\n        xmlns=\"http://www.w3.org/2000/svg\"\n        viewBox={qr.viewBox}\n        width=\"100%\"\n        height=\"100%\"\n        aria-hidden=\"true\"\n        className=\"block h-full w-full\"\n      >\n        {qr.paths.map((p, i) => (\n          <path\n            key={i}\n            fill={p.fill ?? 'none'}\n            stroke={p.stroke}\n            strokeWidth={p.stroke !== undefined ? 1 : undefined}\n            d={p.d}\n          />\n        ))}\n      </svg>\n    </span>\n  );\n}\n\n/** Cyber corner bracket for the enlarged QR frame. */\nfunction QrCorner({ pos }: { pos: 'tl' | 'tr' | 'bl' | 'br' }): React.JSX.Element {\n  const cls: Record<typeof pos, string> = {\n    tl: 'top-0 left-0 border-t-2 border-l-2',\n    tr: 'top-0 right-0 border-t-2 border-r-2',\n    bl: 'bottom-0 left-0 border-b-2 border-l-2',\n    br: 'bottom-0 right-0 border-b-2 border-r-2',\n  };\n  return (\n    <div aria-hidden=\"true\" className={`absolute h-4 w-4 border-warning pointer-events-none ${cls[pos]}`} />\n  );\n}\n\nexport function DonationModal({ open, onClose, onAscension }: DonationModalProps) {\n  const { t } = useTranslation();\n  const [activeTab, setActiveTab] = useState<TabKey>('crypto');\n  const [copiedId, setCopiedId] = useState<string | null>(null);\n  const [qrRow, setQrRow] = useState<DonationRow | null>(null);\n  const [bubble, setBubble] = useState<string | null>(null);\n  const bubbleTimerRef = useRef<number | null>(null);\n\n  // Reset transient UI state each time the modal opens.\n  useEffect(() => {\n    if (open) {\n      setActiveTab('crypto');\n      setCopiedId(null);\n      setQrRow(null);\n      setBubble(null);\n    }\n  }, [open]);\n\n  useEffect(\n    () => () => {\n      if (bubbleTimerRef.current !== null) window.clearTimeout(bubbleTimerRef.current);\n    },\n    [],\n  );\n\n  // Escape: close the enlarged QR view first, then the modal itself.\n  useEffect(() => {\n    if (!open) return;\n    const handler = (event: KeyboardEvent) => {\n      if (event.key !== 'Escape') return;\n      if (qrRow) setQrRow(null);\n      else onClose();\n    };\n    document.addEventListener('keydown', handler);\n    return () => document.removeEventListener('keydown', handler);\n  }, [open, qrRow, onClose]);\n\n  /** Full Ascension sequence shared by COPY / QR confirm / external links. */\n  const triggerAscension = useCallback((): void => {\n    petAudio.playAscensionRitual();\n    try {\n      window.localStorage.setItem('nv_pet_vip', Date.now().toString());\n    } catch {\n      /* storage unavailable — VIP flag simply won't persist */\n    }\n    setBubble(t('pet_thanks'));\n    if (bubbleTimerRef.current !== null) window.clearTimeout(bubbleTimerRef.current);\n    bubbleTimerRef.current = window.setTimeout(() => setBubble(null), 4000);\n    onAscension();\n  }, [onAscension, t]);\n\n  const handleTabSwitch = useCallback((tab: TabKey): void => {\n    setActiveTab(tab);\n    petAudio.playActionCheer();\n  }, []);\n\n  const handleCopy = useCallback(\n    (row: DonationRow): void => {\n      copyText(row.value);\n      setCopiedId(row.id);\n      window.setTimeout(() => setCopiedId((current) => (current === row.id ? null : current)), 1000);\n      triggerAscension();\n    },\n    [triggerAscension],\n  );\n\n  /** Open a link row's URL externally via the safe IPC channel + Ascension. */\n  const openRowExternally = useCallback(\n    (row: DonationRow): void => {\n      void window.electronAPI?.openExternal(row.url ?? '');\n      triggerAscension();\n    },\n    [triggerAscension],\n  );\n\n  const handleExternalLink = useCallback(\n    (event_: React.MouseEvent<HTMLAnchorElement>, row: DonationRow): void => {\n      // Never navigate in-renderer (CSP/navigation guards deny it anyway) —\n      // ask the main process to open the URL externally via the safe\n      // allowlisted `shell:open-external` channel, then run Ascension.\n      event_.preventDefault();\n      event_.stopPropagation();\n      openRowExternally(row);\n    },\n    [openRowExternally],\n  );\n\n  if (!open) return null;\n\n  const rows = PANEL_ROWS[activeTab];\n  const activeTabLabel = t(`pet_tab_${activeTab}`);\n\n  return (\n    <>\n      \n      {/* ===================== Main modal ===================== */}\n      <div\n        role=\"dialog\"\n        aria-modal=\"true\"\n        aria-label={t('pet_donation_title')}\n        onMouseDown={onClose}\n        className=\"fixed inset-0 z-50 flex items-center justify-center bg-black/85 p-4 backdrop-blur-sm font-sans\"\n      >\n        <div\n          onMouseDown={(e) => e.stopPropagation()}\n          className=\"relative flex max-h-[90vh] w-full max-w-[560px] flex-col overflow-hidden rounded-xl border border-accent-neon bg-bg shadow-glow-neon-strong p-6\"\n        >\n          {/* Header */}\n          <div className=\"mb-3 flex items-start justify-between border-b border-border pb-3\">\n            <div>\n              <h2 className=\"text-lg font-bold tracking-[2.5px] text-accent-neon drop-shadow-[0_0_12px_rgba(89,255,0,0.45)]\">\n                {t('pet_donation_title')}\n              </h2>\n              <p className=\"mt-1 font-mono text-[10px] tracking-wider text-textMuted\">\n                {t('pet_donation_tagline')}\n              </p>\n            </div>\n            <button\n              type=\"button\"\n              onClick={onClose}\n              aria-label={t('pet_donation_close_aria')}\n              className=\"grid h-7 w-7 place-items-center rounded-md border border-border text-textMuted transition-colors hover:border-accent-neon hover:text-accent-neon\"\n            >\n              <X aria-hidden size={14} />\n            </button>\n          </div>\n\n          {/* Tabs */}\n          <div role=\"tablist\" aria-label={t('pet_donation_tabs_aria')} className=\"mb-4 flex gap-1 border-b border-border\">\n            {TABS.map((tab) => (\n              <button\n                key={tab.key}\n                type=\"button\"\n                role=\"tab\"\n                aria-selected={activeTab === tab.key}\n                onClick={() => handleTabSwitch(tab.key)}\n                className={`border-b-2 px-3 py-2 font-mono text-[11px] font-semibold uppercase tracking-wider transition-colors ${\n                  activeTab === tab.key\n                    ? 'border-accent-neon text-accent-neon'\n                    : 'border-transparent text-textMuted hover:text-textMain'\n                }`}\n              >\n                {t(`pet_tab_${tab.key}`)}\n              </button>\n            ))}\n          </div>\n\n          {/* Rows */}\n          <div role=\"tabpanel\" aria-label={activeTabLabel} className=\"flex max-h-[60vh] flex-col gap-2 overflow-y-auto pr-1\">\n            {rows.map((row) => (\n              <div\n                key={row.id}\n                onClick={\n                  row.url !== undefined\n                    ? () => openRowExternally(row)\n                    : row.qr !== undefined\n                      ? () => setQrRow(row)\n                      : undefined\n                }\n                title={row.url !== undefined ? row.url : row.qr !== undefined ? t('pet_qr_scan_hint') : undefined}\n                className={`grid grid-cols-[44px_1fr_auto] items-center gap-3 rounded-lg border border-border bg-surface px-3 py-2 transition-colors hover:border-accent-neon/40${\n                  row.qr !== undefined ? ' cursor-pointer hover:bg-surface/70' : ''\n                }`}\n              >\n                {/* QR placeholder box -> opens enlarged scan view */}\n                <button\n                  type=\"button\"\n                  onClick={(e) => {\n                    // The thumbnail always opens the enlarged QR view — never the\n                    // link-row external open (which the row body click triggers).\n                    e.stopPropagation();\n                    setQrRow(row);\n                  }}\n                  aria-label={t('pet_qr_enlarge_aria', { label: row.label })}\n                  title={t('pet_qr_scan_hint')}\n                  className=\"relative flex h-11 w-11 shrink-0 items-center justify-center overflow-visible rounded-md border border-border-hard bg-[#E8ECEF] transition-transform hover:scale-110 hover:border-warning focus-visible:outline focus-visible:outline-2 focus-visible:outline-warning\"\n                >\n                  {row.qr !== undefined ? <CryptoQr payload={row.qr} size={38} /> : <QrGlyph size={38} />}\n                  <span className=\"absolute -bottom-1 -right-1 rounded-sm border border-warning bg-bg px-0.5 font-mono text-[6.5px] font-bold leading-none tracking-wide text-warning\">\n                    {t('pet_qr_scan_badge')}\n                  </span>\n                </button>\n\n                {/* Label + placeholder value */}\n                <div className=\"flex min-w-0 flex-col gap-0.5\">\n                  <span className=\"text-sm font-semibold text-textMain\">{row.label}</span>\n                  <span className=\"truncate font-mono text-xs text-textMuted\" title={row.value}>\n                    {row.display ?? row.value}\n                  </span>\n                </div>\n\n                {/* Actions */}\n                <div className=\"flex shrink-0 items-center gap-2\">\n                  {row.url !== undefined && (\n                    <a\n                      href={row.url}\n                      onClick={(e) => {\n                        e.stopPropagation();\n                        handleExternalLink(e, row);\n                      }}\n                      className=\"rounded-md border border-border px-2 py-1 font-mono text-[11px] font-semibold text-textMain transition-colors hover:border-accent-neon hover:text-accent-neon\"\n                    >\n                      {t('pet_open_link')}\n                    </a>\n                  )}\n                  <button\n                    type=\"button\"\n                    onClick={(e) => {\n                      // Never bubble to the row — COPY must not open the QR overlay.\n                      e.stopPropagation();\n                      handleCopy(row);\n                    }}\n                    className={`min-w-[64px] rounded-md border px-2 py-1 font-mono text-[11px] font-semibold tracking-wide transition-colors ${\n                      copiedId === row.id\n                        ? 'border-success bg-success/10 text-success'\n                        : 'border-border text-textMuted hover:border-accent-neon hover:text-accent-neon'\n                    }`}\n                  >\n                    {copiedId === row.id ? t('pet_copied') : t('pet_copy')}\n                  </button>\n                </div>\n              </div>\n            ))}\n          </div>\n\n          {/* Speech bubble (post-ascension thanks) */}\n          {bubble && (\n            <div\n              role=\"status\"\n              className=\"nv-donation-bubble pointer-events-none absolute left-1/2 top-3 z-10 -translate-x-1/2 whitespace-nowrap rounded-full border border-accent-neon bg-bg px-4 py-1.5 font-mono text-xs font-bold tracking-widest text-accent-neon shadow-glow-neon\"\n            >\n              {bubble}\n            </div>\n          )}\n        </div>\n      </div>\n\n      {/* ============ Enlarged QR scan overlay ============ */}\n      {qrRow && (\n        <div\n          role=\"dialog\"\n          aria-modal=\"true\"\n          aria-label={t('pet_qr_overlay_aria', { label: qrRow.label })}\n          onMouseDown={() => setQrRow(null)}\n          className=\"fixed inset-0 z-[60] flex items-center justify-center bg-black/90 p-4 backdrop-blur-sm font-sans\"\n        >\n          <div\n            onMouseDown={(e) => e.stopPropagation()}\n            className=\"flex w-full max-w-[min(92vw,480px)] max-h-[95vh] flex-col overflow-y-auto rounded-xl border border-warning/70 bg-bg p-4 shadow-[0_0_45px_rgba(250,204,21,0.25)]\"\n          >\n            <div className=\"mb-2 flex items-start justify-between\">\n              <div className=\"flex items-center gap-2\">\n                <span aria-hidden=\"true\" className=\"h-2 w-2 animate-pulse rounded-full bg-error\" />\n                <span className=\"font-mono text-[10px] font-bold tracking-wider text-warning\">\n                  {t('pet_qr_ready')}\n                </span>\n              </div>\n              <button\n                type=\"button\"\n                onClick={() => setQrRow(null)}\n                aria-label={t('pet_qr_close_aria')}\n                className=\"grid h-7 w-7 place-items-center rounded-md border border-border text-textMuted transition-colors hover:border-warning hover:text-warning\"\n              >\n                <X aria-hidden size={14} />\n              </button>\n            </div>\n\n            <div className=\"mb-2 text-base font-bold tracking-wide text-textMain\">{qrRow.label}</div>\n\n            {/* Enlarged QR frame (vector SVG — lossless at any scale) */}\n            <div className=\"relative mx-auto mb-3 w-fit rounded-lg bg-[#ECEFF2] p-3\">\n              <QrCorner pos=\"tl\" />\n              <QrCorner pos=\"tr\" />\n              <QrCorner pos=\"bl\" />\n              <QrCorner pos=\"br\" />\n              <div\n                className=\"relative\"\n                style={{ width: 'min(45vh, 380px)', height: 'min(45vh, 380px)' }}\n                data-qr-big={qrRow.id}\n              >\n                {qrRow.qr !== undefined ? <CryptoQr payload={qrRow.qr} size={380} /> : <QrGlyph size={380} />}\n                <div aria-hidden=\"true\" className=\"pointer-events-none absolute inset-x-0 nv-donation-laser\">\n                  <div className=\"h-[3px] w-full bg-error shadow-[0_0_12px_rgba(255,51,51,0.9)]\" />\n                </div>\n              </div>\n              <div className=\"mt-1.5 text-center font-mono text-[9px] tracking-widest text-[#6C8194]\">\n                {t('pet_qr_confirm_hint')}\n              </div>\n            </div>\n\n            {/* Address row (below the QR) with COPY */}\n            <div className=\"mx-auto mb-3 flex w-full items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2\">\n              <span className=\"truncate font-mono text-xs text-textMuted\" title={qrRow.value}>\n                {qrRow.display ?? qrRow.value}\n              </span>\n              <button\n                type=\"button\"\n                onClick={() => handleCopy(qrRow)}\n                className={`ml-auto min-w-[64px] shrink-0 rounded-md border px-2 py-1 font-mono text-[11px] font-semibold tracking-wide transition-colors ${\n                  copiedId === qrRow.id\n                    ? 'border-success bg-success/10 text-success'\n                    : 'border-border text-textMuted hover:border-warning hover:text-warning'\n                }`}\n              >\n                {copiedId === qrRow.id ? t('pet_copied') : t('pet_copy')}\n              </button>\n            </div>\n\n            <button\n              type=\"button\"\n              onClick={() => {\n                triggerAscension();\n                setQrRow(null);\n              }}\n              className=\"flex w-full items-center justify-center gap-2 rounded-md bg-warning px-4 py-2.5 font-mono text-xs font-bold tracking-wider text-black transition-opacity hover:opacity-90\"\n            >\n              <span aria-hidden=\"true\">⚡</span>\n              <span>{t('pet_qr_confirm')}</span>\n            </button>\n\n            <div className=\"mt-2 text-center font-mono text-[9px] tracking-widest text-textMuted\">\n              {t('pet_vip_note')}\n            </div>\n          </div>\n        </div>\n      )}\n    </>\n  );\n}\n
