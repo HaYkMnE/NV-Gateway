@@ -1,0 +1,95 @@
+{
+    "$schema":  "https://nv-gateway/config.schema.json",
+    "version":  1,
+    "port":  null,
+    "language":  "en",
+    "upstreams":  [
+
+                  ],
+    "rotation":  {
+                     "retryOnStatus":  [
+                                           401,
+                                           403,
+                                           429,
+                                           500,
+                                           502,
+                                           503,
+                                           504
+                                       ],
+                     "analyzeBody":  true,
+                     "respectRetryAfter":  true,
+                     "backoffBaseMs":  1000,
+                     "backoffMaxMs":  300000,
+                     "cooldownMs":  60000
+                 },
+    "logging":  {
+                    "file":  "logs/gateway.jsonl",
+                    "intervalMs":  1000,
+                    "maxEntries":  100000,
+                    "rotateMB":  50
+                },
+    "limits":  {
+                   "firstByteTimeoutMs":  120000,
+                   "idleTimeoutMs":  90000,
+                   "hardTimeoutMs":  240000
+               },
+    "upstream":  {
+                     "baseUrl":  "https://integrate.api.nvidia.com/v1",
+                     "validatePath":  "/chat/completions",
+                     "validateBody":  {
+                                          "model":  "meta/llama-3.1-8b-instruct",
+                                          "messages":  [
+                                                           {
+                                                               "role":  "user",
+                                                               "content":  "ping"
+                                                           }
+                                                       ],
+                                          "max_tokens":  1,
+                                          "stream":  false
+                                      },
+                     "maskedKeyPrefix":  4,
+                     "maskedKeySuffix":  4
+                 },
+    "modelLimits":  {
+                        "deepseek-ai/deepseek-v4-pro":  {
+                                                            "output":  393216,
+                                                            "context":  1048576
+                                                        },
+                        "stepfun-ai/step-3.7-flash":  {
+                                                          "output":  16384,
+                                                          "context":  256000
+                                                      },
+                        "deepseek-ai/deepseek-v4-flash":  {
+                                                              "output":  393216,
+                                                              "context":  1048576
+                                                          },
+                        "deepseek/deepseek-v4-pro":  {
+                                                         "output":  393216,
+                                                         "context":  1048576
+                                                     },
+                        "*":  {
+                                  "output":  4096,
+                                  "context":  131072
+                              },
+                        "meta/llama-4-maverick-17b-128e-instruct":  {
+                                                                        "output":  4096,
+                                                                        "context":  128000
+                                                                    },
+                        "qwen/qwen3.5-397b-a17b":  {
+                                                       "output":  8192,
+                                                       "context":  262144
+                                                   },
+                        "z-ai/glm-5.2":  {
+                                              "output":  131072,
+                                              "context":  202752
+                                          },
+                        "minimaxai/minimax-m3":  {
+                                                     "output":  16384,
+                                                     "context":  1000000
+                                                 },
+                        "moonshotai/kimi-k3":  {
+                                                   "context":  1048576,
+                                                   "output":  131072
+                                               }
+                    }
+}
