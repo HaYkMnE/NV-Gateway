@@ -153,6 +153,16 @@ jobs:
             echo "Iteration $i: HTTP $HTTP_CODE"
             echo "Body: $BODY"
 
+            # --- Fail-fast: Jules source not connected (HTTP 404) ---
+            # A 404 means the Jules API cannot resolve sources/github/${REPO_FULL}:
+            # the Jules GitHub App is not installed or the repo is not connected.
+            # This is a CONFIG problem, not a transient error — looping would just
+            # burn API quota on guaranteed failures. Stop loudly.
+            if [ "$HTTP_CODE" = "404" ]; then
+              echo "JULES SETUP REQUIRED: the Jules GitHub App is not installed / the repository source is not connected for this Jules API key. Sign in at https://jules.google.com and connect HaYkMnE/NV-Gateway, then re-run. Response: $BODY"
+              exit 1
+            fi
+
             # --- Quota exhaustion detection (HTTP 429/403 or quota signals in body) ---
             if [ "$HTTP_CODE" = "429" ] || [ "$HTTP_CODE" = "403" ] || \
                echo "$BODY" | grep -qiE "RESOURCE_EXHAUSTED|quota|rateLimitExceeded|daily.*limit|RATE_LIMIT_EXCEEDED"; then

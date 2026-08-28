@@ -11,7 +11,7 @@
   "main": "build/src/main/index.js",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --project tsconfig.json --noEmit && vite build && tsc --project tsconfig.node.json",
+    "build": "tsc --project tsconfig.node.json && tsc --project tsconfig.json --noEmit && vite build",
     "build:portable": "npm run build && node scripts/run-electron-builder.mjs --win portable && npm run package:audit",
     "build:release": "npm run build && node scripts/run-electron-builder.mjs --win --publish never && npm run package:audit",
     "start": "electron .",
