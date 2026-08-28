@@ -531,7 +531,7 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
 
             <div className="mx-auto mb-3 flex w-full items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2">
               <span className="truncate font-mono text-xs text-textMuted" title={qrRow.value}>
-                {qrRow.display ?? row.value}
+                {qrRow.display ?? qrRow.value}
               </span>
               <button
                 type="button"
