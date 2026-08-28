@@ -72,7 +72,7 @@ export function deriveScannedRoots(root) {
 }
 
 function extractListSection(builder, section) {
-  const match = builder.match(new RegExp(`^${section}:\\r?\\n([\\s\\S]*?)(?=^[A-Za-z][^:\\r\\n]*:|$)`, 'm'));
+  const match = builder.match(new RegExp(`^${section}:\\r?\\n((?:[ \\t]+[^\\r\\n]*\\r?\\n?)*)`, 'm'));
   assert.notEqual(match, null, `PACKAGING_SECTION_MISSING:${section}`);
   return match[1].split(/\r?\n/)
     .map((line) => line.match(/^  -\s+"?(.+?)"?\s*$/)?.[1])
@@ -80,7 +80,7 @@ function extractListSection(builder, section) {
 }
 
 function extractExtraResources(builder) {
-  const match = builder.match(/^extraResources:\r?\n([\s\S]*?)(?=^[A-Za-z][^:\r\n]*:|$)/m);
+  const match = builder.match(/^extraResources:\r?\n((?:[ \t]+[^\r\n]*\r?\n?)*)/m);
   assert.notEqual(match, null, 'PACKAGING_SECTION_MISSING:extraResources');
   const resources = [];
   let from = null;
