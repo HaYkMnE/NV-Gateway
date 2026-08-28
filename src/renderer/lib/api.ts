@@ -1,18 +1,9 @@
-import type { GatewayApi } from '../../preload';
-
-export function getGatewayApi(): GatewayApi {
-  if (typeof window === 'undefined' || !window.gatewayApi) {
-    throw new Error('gatewayApi is not available in the current environment.');
-  }
-
-  return window.gatewayApi;
-}
-
-export function isGatewayApiAvailable(): boolean {
-  return typeof window !== 'undefined' && Boolean(window.gatewayApi);
-}
-
-export function openExternalUrl(url: string): Promise<boolean> {
-  const api = getGatewayApi();
-  return api.openExternal(url);
-}
+export const queryKeys = { runtime: ['runtime'] as const, keys: ['keys'] as const, logs: ['logs'] as const, updates: ['updates'] as const, models: ['models'] as const };
+export const api = {
+  runtime: () => window.electronAPI.getRuntimeState(),
+  keys: () => window.electronAPI.adminListKeys(),
+  logs: () => window.electronAPI.adminLogs(),
+  updateStatus: () => window.electronAPI.getUpdateStatus(),
+  models: () => window.electronAPI.getModels(),
+  refreshModels: () => window.electronAPI.refreshModels()
+};

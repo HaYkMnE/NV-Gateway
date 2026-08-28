@@ -1,90 +1,58 @@
-import { useState, useEffect, useTransition } from 'react';
-import type { GatewayState, KeyItem, AppSettings, LogEntry } from '../../preload';
-import { getGatewayApi, isGatewayApiAvailable } from './api';
+export type DataState = 'loading' | 'empty' | 'error' | 'stale' | 'success';
 
-export interface UseGatewayDataResult {
-  state: GatewayState | null;
-  keys: KeyItem[];
-  settings: AppSettings | null;
-  logs: LogEntry[];
-  isLoading: boolean;
-  error: Error | null;
-  isPending: boolean;
-  refresh: () => void;
+export function validateGatewayPort(value: string | number): null | 'required' | 'integer' | 'range' {
+  if (String(value).trim() === '') return 'required';
+  const port = Number(value);
+  if (!Number.isInteger(port)) return 'integer';
+  return port >= 1 && port <= 65534 ? null : 'range';
 }
 
-export function useGatewayData(): UseGatewayDataResult {
-  const [state, setState] = useState<GatewayState | null>(null);
-  const [keys, setKeys] = useState<KeyItem[]>([]);
-  const [settings, setSettings] = useState<AppSettings | null>(null);
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<Error | null>(null);
-  const [isPending, startTransition] = useTransition();
+export function classifyDataState(input: { pending: boolean; error: boolean; data?: unknown[]; stale?: boolean }): DataState {
+  if (input.pending && input.data === undefined) return 'loading';
+  if (input.error && input.data === undefined) return 'error';
+  if (input.stale) return 'stale';
+  if (!input.data?.length) return 'empty';
+  return 'success';
+}
 
-  const loadData = () => {
-    if (!isGatewayApiAvailable()) {
-      setIsLoading(false);
-      return;
-    }
+export function moveItem<T>(items: T[], from: number, to: number): T[] {
+  if (from < 0 || to < 0 || from >= items.length || to >= items.length || from === to) return items;
+  const copy = [...items];
+  const [item] = copy.splice(from, 1);
+  copy.splice(to, 0, item);
+  return copy;
+}
 
-    const api = getGatewayApi();
-    startTransition(async () => {
-      try {
-        const [nextState, nextKeys, nextSettings, nextLogs] = await Promise.all([
-          api.getState(),
-          api.getKeys(),
-          api.getSettings(),
-          api.getLogs(),
-        ]);
+export function isPlausibleNvidiaKey(value: string): boolean {
+  const key = value.trim();
+  return key.length >= 12 && key.length <= 8192 && /^[\x21-\x7e]+$/.test(key) && !key.includes('...');
+}
 
-        setState(nextState);
-        setKeys(nextKeys);
-        setSettings(nextSettings);
-        setLogs(nextLogs);
-        setError(null);
-      } catch (err) {
-        setError(err instanceof Error ? err : new Error(String(err)));
-      } finally {
-        setIsLoading(false);
-      }
-    });
-  };
+export function safeError(error: unknown, unknownLabel: string): string {
+  return error instanceof Error && error.message ? error.message : unknownLabel;
+}
 
-  useEffect(() => {
-    loadData();
+export function isGatewayUnavailable(error: unknown): boolean {
+  if (!error) return false;
+  if (error instanceof Error) {
+    if (error.name === "GATEWAY_NOT_RUNNING") return true;
+    if ((error as Error & { code?: string }).code === "ECONNRESET") return true;
+    if ((error as Error & { code?: string }).code === "ECONNREFUSED") return true;
+    if (error.message && error.message.includes("Gateway is not running.")) return true;
+  }
+  return false;
+}
 
-    if (!isGatewayApiAvailable()) return;
-    const api = getGatewayApi();
+export interface AddKeyMutationOptions {
+  mutationFn: (key: string) => Promise<unknown>;
+  onSettled?: () => void;
+  isUnavailable?: (error: unknown) => boolean;
+}
 
-    const unsubState = api.onStateChanged((nextState) => {
-      setState(nextState);
-    });
-
-    const unsubLogs = api.onLogEntry((entry) => {
-      setLogs((prev) => {
-        const next = [...prev, entry];
-        if (next.length > 1000) {
-          next.splice(0, next.length - 1000);
-        }
-        return next;
-      });
-    });
-
-    return () => {
-      unsubState();
-      unsubLogs();
-    };
-  }, []);
-
+export function createAddKeyMutationOptions(options: AddKeyMutationOptions) {
   return {
-    state,
-    keys,
-    settings,
-    logs,
-    isLoading,
-    error,
-    isPending,
-    refresh: loadData,
+    mutationFn: options.mutationFn,
+    retry: false,
+    onSettled: options.onSettled
   };
 }
