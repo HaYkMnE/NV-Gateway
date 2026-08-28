@@ -34,10 +34,6 @@ jobs:
       - name: Build and Package Release Artifacts
         env:
           NVGW_GH_OWNER: ${{ github.repository_owner }}
-          # Pinned to the source repository: packaging publishes Releases to the
-          # very repo this workflow runs in (github.com/HaYkMnE/NV-Gateway),
-          # matching the packaging-env-guard DEFAULT_RELEASE_REPOSITORY.
-          NVGW_GH_REPO: NV-Gateway
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           npm run build:release

@@ -47,7 +47,7 @@ jobs:
           #     prompt, title, sourceContext, requirePlanApproval, automationMode.
           #   Source: https://developers.google.com/jules/api/reference/rest/v1alpha/sessions
           #           https://jules.google/docs/api/reference/sessions/
-          #   The google-labs-code/jules-invoke@v1.0.0 action likewise has no
+          #   The google-labs-code/jules-action@v1.0.0 action likewise has no
           #   `model` input (see action.yaml inputs: prompt, jules_api_key,
           #   starting_branch, include_last_commit, include_commit_log).
           #   Pro account defaults to Gemini 3.1 Pro per Jules Pro subscription:
