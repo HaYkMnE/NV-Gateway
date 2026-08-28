@@ -134,13 +134,13 @@ jobs:
             jq -n --arg jules_prompt "$(cat prompt.txt)" \
                   --arg starting_branch "main" \
                   --arg repo_full_name "${REPO_FULL}" \
-                  '{\
-                    prompt: $jules_prompt,\
-                    sourceContext: {\
-                      source: ("sources/github/" + $repo_full_name),\
-                      githubRepoContext: { startingBranch: $starting_branch }\
-                    },\
-                    requirePlanApproval: true\
+                  '{
+                    prompt: $jules_prompt,
+                    sourceContext: {
+                      source: ("sources/github/" + $repo_full_name),
+                      githubRepoContext: { startingBranch: $starting_branch }
+                    },
+                    requirePlanApproval: true
                   }' > payload.json
 
             RESPONSE=$(curl -s --max-time 60 --retry 2 -w "\n%{http_code}" -X POST "https://jules.googleapis.com/v1alpha/sessions" \
