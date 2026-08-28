@@ -121,7 +121,7 @@ Whether you're running **Claude Code (`claude-code` CLI)**, autonomous coding sw
 - **Failover Engine**:
   - `401 / 403`: Immediately disables the invalid key.
   - `429 (Quota Exceeded)`: Identifies account-level quota exhaustion and places key in cooldown.
-  - `429 (Rate Limit)`: Applies backoff according to `Retry-After` header (capped to max 20s) and attempts the next available key immediately without blocking.
+  - `429 (Rate Limit)`: Applies backoff according to upstream `Retry-After` header (honored up to 300s, with a 20s default cooldown) and attempts the next available key immediately without blocking.
   - `5xx / Socket Timeouts`: Backs off transient server errors and retries the request seamlessly on another key.
 
 ### 2. Automatic Reasoning & Thinking Discovery
@@ -311,7 +311,7 @@ NV-Gateway binds two paired loopback ports (`P` and `P+1`, default `12004` and `
 | `POST /admin/keys` | `12005` | Admin Token | Add a new NVIDIA API key with fire-and-forget probe |
 | `DELETE /admin/keys/:id` | `12005` | Admin Token | Remove a managed key |
 | `POST /admin/models/refresh`| `12005` | Admin Token | Trigger NGC model re-discovery |
-| `GET /admin/logs/recent` | `12005` | Admin Token | Fetch sanitized recent JSONL request events |
+| `GET /admin/logs` | `12005` | Admin Token | Fetch sanitized recent JSONL request events |
 
 ---
 

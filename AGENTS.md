@@ -42,7 +42,7 @@ The NV-Gateway system is split across three distinct operational layers:
    - Never log, commit, or serialize raw API keys (e.g. `nvapi-...`), bearer tokens, or admin credentials.
    - All stdio, logging, and error pathways must pass through `redaction.mjs` (`setRuntimeSecrets`, `pathnameOnly`, query/fragment scrubbing).
 2. **Deterministic Windows ACLs**:
-   - Runtime directories and log files in `%APPDATA%\NV-Gateway\` receive best-effort DACL protection via `windows-acl-protector.ts`.
+   - Runtime directories and log files in `%APPDATA%\NV-Gateway\` receive best-effort DACL protection via `windows-acl.ts`.
 3. **Atomic File Transactions**:
    - State and config mutations (`keys.json`, `config.json`) must use atomic replace workflows (`write-file-atomic` style) and maintain `.bak` snapshots.
 4. **No Unbounded Memory Buffers**:
@@ -52,7 +52,7 @@ The NV-Gateway system is split across three distinct operational layers:
 
 ## 3. Level-1 Testing & Quality Standards
 
-Every modification must preserve 100% pass rate across the full test suite (**511/511 tests passing**).
+Every modification must preserve 100% pass rate across the full test suite (**515/515 tests passing**).
 
 ### Verification Commands:
 ```bash
@@ -113,7 +113,7 @@ This repository is equipped with a complete, closed-loop autonomous software eng
 +-----------------------------------------------------------------------------------+
 |                        4. DESIGN ART VIRTUOSO (UI Specialist)                     |
 |  - Invoked for renderer / visual changes (`.jules/roles/design-art-virtuoso.md`)  |
-|  - Enforces Cyberpunk HUD design system compliance (`docs/DESIGN_SYSTEM.md`)      |
+|  - Enforces Cyberpunk HUD design system compliance (`docs/jules/README.md`)       |
 |  - Validates layout balance, responsive density, CSS animations, and i18n         |
 +-----------------------------------------+-----------------------------------------+
                                           |
