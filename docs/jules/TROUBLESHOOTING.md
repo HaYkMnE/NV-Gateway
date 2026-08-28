@@ -110,7 +110,7 @@ env:
 ### Симптомы
 При запуске тестов на Linux CI-раннерах возникает ошибка создания директории:
 ```text
-Error: ENOENT: no such file or directory, mkdtemp 'C:OPENCODE-SANDBOX\test-xxxxxx'
+Error: ENOENT: no such file or directory, mkdtemp 'C:OPENCODE-SANDBOX	est-xxxxxx'
 ```
 
 ### Причина

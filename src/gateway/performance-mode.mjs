@@ -162,3 +162,100 @@ export function createPerformanceModeResolver(options = {}) {
 
     return { observe, resolve, getState };
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// Per-model failover-attempts overrides
+//
+// The config.json `perModelSettings.<modelId>.maxFailoverAttempts` field is the
+// operator's explicit per-model bound on failover attempts. It previously
+// never reached the gateway child (a dead config knob), so `server.mjs` reads
+// it here (case-insensitively keyed) and prefers it over the global profile.
+// `perModelSettings.<modelId>.rateLimitMaxAttempts` is the sibling bound for the
+// uniform-429 early stop; both live in one cached record per model.
+// Like the disabled-models cache, this is mtime+size keyed so config edits are
+// picked up on the next request without re-reading the file every call.
+// ───────────────────────────────────────────────────────────────────────────
+
+const perModelFailoverCache = { records: null, configPath: null, mtimeMs: null, size: null };
+
+function isPositiveInteger(value) {
+    return typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
+}
+
+function readPerModelFailoverOverrides(configPath) {
+    if (typeof configPath !== "string" || configPath.length === 0) return null;
+    let stat;
+    try {
+        stat = fs.statSync(configPath);
+    } catch {
+        // Transit FS error: keep last-known records (or null on cold start).
+        return perModelFailoverCache.records;
+    }
+    if (perModelFailoverCache.records
+        && perModelFailoverCache.configPath === configPath
+        && perModelFailoverCache.mtimeMs === stat.mtimeMs
+        && perModelFailoverCache.size === stat.size) {
+        return perModelFailoverCache.records;
+    }
+    let records = {};
+    try {
+        const raw = fs.readFileSync(configPath, "utf8");
+        const parsed = JSON.parse(raw.codePointAt(0) === 0xFEFF ? raw.slice(1) : raw);
+        const settings = parsed?.perModelSettings;
+        if (settings && typeof settings === "object" && !Array.isArray(settings)) {
+            for (const [modelId, value] of Object.entries(settings)) {
+                if (value && typeof value === "object" && !Array.isArray(value)) {
+                    // One record per model holding every failover-related bound, so a
+                    // second knob does not cost a second cached read of the same file.
+                    const record = {};
+                    if (isPositiveInteger(value.maxFailoverAttempts)) record.maxFailoverAttempts = value.maxFailoverAttempts;
+                    if (isPositiveInteger(value.rateLimitMaxAttempts)) record.rateLimitMaxAttempts = value.rateLimitMaxAttempts;
+                    if (Object.keys(record).length > 0) records[String(modelId).toLowerCase()] = record;
+                }
+            }
+        }
+    } catch {
+        records = {};
+    }
+    perModelFailoverCache.records = records;
+    perModelFailoverCache.configPath = configPath;
+    perModelFailoverCache.mtimeMs = stat.mtimeMs;
+    perModelFailoverCache.size = stat.size;
+    return records;
+}
+
+/**
+ * Read the operator's per-model `maxFailoverAttempts` override for a model id.
+ * Case-insensitive; returns null when the model has no explicit override (or the
+ * config is absent/malformed). Never throws.
+ *
+ * @param {string|null|undefined} modelId Requested model id.
+ * @param {string} [configPath] Config path (defaults to GATEWAY_CONFIG_PATH).
+ * @returns {number|null}
+ */
+export function readPerModelFailoverAttempts(modelId, configPath = process.env.GATEWAY_CONFIG_PATH) {
+    return readPerModelBound(modelId, "maxFailoverAttempts", configPath);
+}
+
+/**
+ * Read the operator's per-model `rateLimitMaxAttempts` override for a model id —
+ * how many confirming 429s are collected before the honest 429 is returned.
+ * Case-insensitive; returns null when the model has no explicit override (or the
+ * config is absent/malformed). The 1..3 clamp is applied by
+ * `resolveRateLimitMaxAttempts`, not here. Never throws.
+ *
+ * @param {string|null|undefined} modelId Requested model id.
+ * @param {string} [configPath] Config path (defaults to GATEWAY_CONFIG_PATH).
+ * @returns {number|null}
+ */
+export function readPerModelRateLimitAttempts(modelId, configPath = process.env.GATEWAY_CONFIG_PATH) {
+    return readPerModelBound(modelId, "rateLimitMaxAttempts", configPath);
+}
+
+function readPerModelBound(modelId, field, configPath) {
+    if (typeof modelId !== "string" || modelId.length === 0) return null;
+    const records = readPerModelFailoverOverrides(configPath);
+    if (!records) return null;
+    const value = records[modelId.toLowerCase()]?.[field];
+    return isPositiveInteger(value) ? value : null;
+}

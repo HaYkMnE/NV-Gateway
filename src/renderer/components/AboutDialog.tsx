@@ -44,7 +44,7 @@ export function AboutDialog({ isOpen, onClose }: AboutDialogProps) {
   if (!isOpen) return null;
 
   const openRepo = () => {
-    if (info?.repoUrl) void window.electronAPI.openExternal(info.repoUrl);
+    if (info?.repoUrl) window.open(info.repoUrl, '_blank');
   };
 
   return (

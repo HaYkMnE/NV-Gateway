@@ -21,6 +21,8 @@ test.after(() => {
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });
 
+// ── Harness helpers (cloned & trimmed from gateway-runtime.test.mjs) ─────────
+
 function listen(port) {
   return new Promise((resolve, reject) => {
     const server = net.createServer((conn) => conn.resume());
@@ -146,6 +148,9 @@ async function stopGateway(child) {
   });
 }
 
+// Generic request helper: POSTs/GETs against the gateway and resolves with
+// { statusCode, headers, body, terminal }. Collects all response bytes until
+// end/aborted/error/timeout — works for both buffered JSON and SSE streams.
 function rawRequest({ port, pathname, method = 'POST', body = '', headers = {}, timeoutMs = 5_000 }) {
   return new Promise((resolve, reject) => {
     const requestHeaders = { ...headers };
@@ -198,6 +203,8 @@ function parseSseEvents(text) {
   return events;
 }
 
+// ── Fake upstream canned responses ─────────────────────────────────────────
+
 function openaiCompletionJson({ model = 'z-ai/glm-5.2', content = 'Hello!', usage = { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 } } = {}) {
   return JSON.stringify({
     id: 'chatcmpl-test',
@@ -219,6 +226,8 @@ function openaiSseStream({ model = 'z-ai/glm-5.2', segments = ['Hello', '!'] } =
   out += 'data: [DONE]\n\n';
   return out;
 }
+
+// ── Tests 37–42 ─────────────────────────────────────────────────────────────
 
 test('37. POST /v1/messages simple text → 200 Anthropic response (non-streaming)', async () => {
   const upstream = await createLocalUpstream((_req, response) => {
@@ -289,6 +298,7 @@ test('38. POST /v1/messages stream:true → 200 SSE stream with Anthropic named 
 });
 
 test('39. POST /v1/messages invalid JSON body → 400 Anthropic error format', async () => {
+  // No upstream needed: the error is short-circuited in the route handler.
   const upstream = await createLocalUpstream((_req, response) => {
     response.writeHead(200, { 'content-type': 'application/json' });
     response.end(openaiCompletionJson());
@@ -372,6 +382,7 @@ test('42. POST /v1/messages without auth → 401', async () => {
   });
   const { child, gatewayPort } = await startGatewayWithLocalUpstream(upstream.address().port);
   try {
+    // Intentionally send NO authorization header (just content-type via rawRequest).
     const result = await rawRequest({ port: gatewayPort, pathname: '/v1/messages', body: JSON.stringify({ model: 'z-ai/glm-5.2', messages: [{ role: 'user', content: 'Hi' }], max_tokens: 10 }), headers: {} });
     assert.equal(result.statusCode, 401);
   } finally {
@@ -380,7 +391,7 @@ test('42. POST /v1/messages without auth → 401', async () => {
   }
 });
 
-test('43. POST /v1/messages exhausted failover returns 502 with Retry-After <= 20s', async () => {
+test('43. POST /v1/messages exhausted failover with a pool-wide 500 propagates the upstream 500', async () => {
   const upstream = await createLocalUpstream((_req, response) => {
     response.writeHead(500, { 'content-type': 'application/json' });
     response.end(JSON.stringify({ error: { message: 'internal error' } }));
@@ -393,13 +404,11 @@ test('43. POST /v1/messages exhausted failover returns 502 with Retry-After <= 2
       max_tokens: 10
     });
     const result = await rawRequest({ port: gatewayPort, pathname: '/v1/messages', body, headers: authHeaders() });
-    assert.equal(result.statusCode, 502);
-    const retryAfter = Number(result.headers['retry-after']);
-    assert.ok(Number.isInteger(retryAfter), 'Retry-After header must be an integer');
-    assert.ok(retryAfter >= 1 && retryAfter <= 20, `Retry-After must be <= 20s, got ${retryAfter}`);
+    assert.equal(result.statusCode, 500);
     const parsed = JSON.parse(result.body);
     assert.equal(parsed.type, 'error');
-    assert.equal(parsed.error.type, 'api_error');
+    assert.equal(parsed.error.type, 'overloaded_error');
+    assert.match(parsed.error.message, /every available key/);
   } finally {
     await stopGateway(child);
     await closeServer(upstream);

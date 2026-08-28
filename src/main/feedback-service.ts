@@ -3,7 +3,6 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { exportDiagnostic } from "./diagnostic-export";
 import { REPORTS_BASE_URL } from "./reports-endpoint";
-import { redactUserPaths } from "./redaction";
 
 export interface FeedbackData {
   type: "suggestion" | "bug";
@@ -19,7 +18,7 @@ export interface FeedbackResult {
   message: string;
 }
 
-const REPO_ISSUES_URL = "https://github.com/HaYkMnE/NV-Gateway/issues/new";
+const REPO_ISSUES_URL = "https://github.com/susmnavorasem/nv-gateway/issues/new";
 
 // Online delivery of saved feedback to the reporting worker (POST
 // /v1/feedback).  Best-effort: the local save below is the source of truth
@@ -37,10 +36,11 @@ function feedbackDir(): string {
 }
 
 function sanitizeText(value: string): string {
-  return redactUserPaths(value
+  return value
     .replace(/nvapi-[A-Za-z0-9_-]+/g, "nvapi-***")
     .replace(/sk-[A-Za-z0-9_-]+/g, "sk-***")
-    .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, "***@***.***"));
+    .replace(/C:\\Users\\[^\\]+\\/g, "C:\\Users\\***\\")
+    .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, "***@***.***");
 }
 
 // Reads the exported diagnostic bundle (entries were sanitized at collection

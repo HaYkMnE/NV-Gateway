@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // electron-builder launcher for every packaging entry point. It runs the
 // publish env guard FIRST (fail fast on a missing NVGW_GH_OWNER), then applies
-// the documented NVGW_GH_REPO default (NV-Gateway) in-process so that
+// the documented NVGW_GH_REPO default (NV-Gateway-releases) in-process so that
 // electron-builder's ${env.NVGW_GH_REPO} substitution in electron-builder.yml
 // — whose expansion is baked into resources/app-update.yml — always resolves.
 // All remaining CLI arguments are forwarded to electron-builder verbatim and

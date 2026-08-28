@@ -65,4 +65,11 @@ jobs:
             FAIL=$(echo "$CHECKS" | jq '[.[] | select(.conclusion != "success" and .conclusion != "neutral" and .conclusion != "skipped")] | length')
             if [ "$FAIL" -gt 0 ]; then echo "SKIP: $FAIL failing/missing check run(s)." ; continue; fi
 
-            echo "PASS all gates. Squash-merging #$PR...\"\n            if gh pr merge \"$PR\" --repo \"$GITHUB_REPOSITORY\" --squash --delete-branch; then\n              MERGED=$((MERGED + 1)); echo \"MERGED #$PR.\"\n            else\n              echo \"WARN: merge failed for #$PR (race/stale). Continue.\"\n            fi\n          done\n          echo \"Done. Merged $MERGED PR(s).\"\n
+            echo "PASS all gates. Squash-merging #$PR..."
+            if gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --squash --delete-branch; then
+              MERGED=$((MERGED + 1)); echo "MERGED #$PR."
+            else
+              echo "WARN: merge failed for #$PR (race/stale). Continue."
+            fi
+          done
+          echo "Done. Merged $MERGED PR(s)."

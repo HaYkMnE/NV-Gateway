@@ -49,3 +49,4 @@ jobs:
         with:
           prompt: 'Read .jules/roles/bug-hunter.md and act as the Bug Hunter. Review PR #${{ github.event.pull_request.number }}. Read the CI test results. Enforce the 2 CLEAN passes rule. If the code is flawed or tests failed, use the GitHub CLI to leave a review requesting changes. If everything is perfect, approve the PR. Output a JSON verdict matching bug-hunter-verdict.schema.json.'
           jules_api_key: ${{ secrets.JULES_BUG_HUNTER_API_KEY }}
+

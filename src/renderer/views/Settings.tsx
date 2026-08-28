@@ -167,181 +167,45 @@ function ModelsSection() {
 }
 
 export function Settings() {
-  const { t, i18n } = useTranslation();
-  const navigate = useNavigate();
-  const client = useQueryClient();
-  const { setConfig } = useConfigStore();
-  const { openFeedback } = useModal();
-
+  const { t, i18n } = useTranslation(); const navigate = useNavigate(); const client = useQueryClient(); const { setConfig } = useConfigStore(); const { openFeedback } = useModal();
   const query = useQuery({ queryKey: queryKeys.runtime, queryFn: api.runtime, refetchInterval: 3000 });
   const updatesQuery = useQuery({ queryKey: queryKeys.updates, queryFn: api.updateStatus, refetchInterval: 2000 });
-
-  const checkUpdates = useMutation({
-    mutationFn: window.electronAPI.checkForUpdates,
-    onSettled: () => client.invalidateQueries({ queryKey: queryKeys.updates }),
-  });
-
-  const autoLaunch = useMutation({
-    mutationFn: window.electronAPI.toggleAutoLaunch,
-    onSuccess: () => client.invalidateQueries({ queryKey: queryKeys.runtime }),
-  });
-
-  const performanceModeMutation = useMutation({
-    mutationFn: async (mode: 'day' | 'night' | 'auto') => {
-      const config = await window.electronAPI.setAppConfig({ performanceMode: mode });
-      setConfig(config);
-      client.setQueryData(queryKeys.runtime, (prev: unknown) =>
-        prev && typeof prev === 'object' ? { ...(prev as object), performanceMode: mode } : prev
-      );
-      return config;
-    },
-    onSuccess: () => client.invalidateQueries({ queryKey: queryKeys.runtime }),
-  });
-
-  const language = async (value: AppLanguage) => {
-    const config = await window.electronAPI.setAppConfig({ language: value });
-    setConfig(config);
-    await i18n.changeLanguage(value);
-    client.setQueryData(queryKeys.runtime, (prev: unknown) =>
-      prev && typeof prev === 'object' ? { ...(prev as object), language: value } : prev
-    );
-    client.invalidateQueries({ queryKey: queryKeys.runtime });
-  };
-
-  const setPerformanceMode = (mode: 'day' | 'night' | 'auto') => {
-    performanceModeMutation.mutate(mode);
-  };
-
+  const checkUpdates = useMutation({ mutationFn: window.electronAPI.checkForUpdates, onSettled: () => client.invalidateQueries({ queryKey: queryKeys.updates }) });
+  const autoLaunch = useMutation({ mutationFn: window.electronAPI.toggleAutoLaunch, onSuccess: () => client.invalidateQueries({ queryKey: queryKeys.runtime }) });
+  const performanceModeMutation = useMutation({ mutationFn: async (mode: 'day' | 'night' | 'auto') => { const config = await window.electronAPI.setAppConfig({ performanceMode: mode }); setConfig(config); client.setQueryData(queryKeys.runtime, (prev: unknown) => prev && typeof prev === 'object' ? { ...(prev as object), performanceMode: mode } : prev); return config; }, onSuccess: () => client.invalidateQueries({ queryKey: queryKeys.runtime }) });
+  const language = async (value: AppLanguage) => { const config = await window.electronAPI.setAppConfig({ language: value }); setConfig(config); await i18n.changeLanguage(value); client.setQueryData(queryKeys.runtime, (prev: unknown) => prev && typeof prev === 'object' ? { ...prev as object, language: value } : prev); client.invalidateQueries({ queryKey: queryKeys.runtime }); };
+  const setPerformanceMode = (mode: 'day' | 'night' | 'auto') => { performanceModeMutation.mutate(mode); };
   const performanceBusy = performanceModeMutation.isPending;
-
-  const rerun = async () => {
-    if (!window.confirm(t('confirm_reset'))) return;
-    const config = await window.electronAPI.setAppConfig({ setupComplete: false });
-    setConfig(config);
-    navigate('/wizard');
-  };
-
-  if (query.isPending) {
-    return <div role="status" className="p-8">{t('loading')}</div>;
-  }
-
-  if (query.isError || !query.data) {
-    return (
-      <div role="alert" className="p-8">
-        {t('settings_error')}{' '}
-        <button onClick={() => void query.refetch()} className="text-nvidia">
-          {t('retry')}
-        </button>
-      </div>
-    );
-  }
-
+  const rerun = async () => { if (!window.confirm(t('confirm_reset'))) return; const config = await window.electronAPI.setAppConfig({ setupComplete: false }); setConfig(config); navigate('/wizard'); };
+  if (query.isPending) return <div role="status" className="p-8">{t('loading')}</div>;
+  if (query.isError || !query.data) return <div role="alert" className="p-8">{t('settings_error')} <button onClick={() => void query.refetch()} className="text-nvidia">{t('retry')}</button></div>;
   const update = updatesQuery.isError ? { state: 'error' as const, version: null, percent: null } : updatesQuery.data ?? null;
   const updateBusy = update !== null && (update.state === 'checking' || update.state === 'downloading');
-  const updateStatusText = `${t(`update_state_${update?.state ?? 'none'}`)}${
-    update?.state === 'downloading' && update.percent !== null ? ` — ${t('update_progress', { percent: update.percent })}` : ''
-  }${update?.version ? ` — ${t('update_version', { version: update.version })}` : ''}`;
-
-  return (
-    <div className="flex flex-col h-full overflow-y-auto p-4 sm:p-8">
-      <h2 className="text-2xl font-bold mb-8">{t('settings')}</h2>
-      <div className="max-w-xl grid gap-6">
-        <label className="grid gap-2 text-sm text-textMuted">
-          {t('language')}
-          <select
-            value={query.data.language}
-            onChange={(event) => void language(event.target.value as AppLanguage)}
-            className="bg-surface border border-border p-3 text-textMain rounded focus:outline-none focus:border-nvidia"
-          >
-            <option value="en">{t('english')}</option>
-            <option value="zh">{t('chinese')}</option>
-            <option value="es">{t('spanish')}</option>
-            <option value="hi">{t('hindi')}</option>
-            <option value="fr">{t('french')}</option>
-            <option value="ar">{t('arabic')}</option>
-            <option value="ru">{t('russian')}</option>
-          </select>
-        </label>
-
-        <section aria-label={t('models_mode_label')} className="grid gap-2 text-sm text-textMuted border border-border bg-surface p-3">
-          <span>{t('models_mode_label')}</span>
-          <div role="radiogroup" aria-label={t('models_mode_label')} className="flex flex-wrap gap-2">
-            {(['day', 'night', 'auto'] as const).map((mode) => (
-              <button
-                key={mode}
-                type="button"
-                role="radio"
-                aria-checked={query.data.performanceMode === mode}
-                onClick={() => setPerformanceMode(mode)}
-                disabled={performanceBusy}
-                className={`border px-4 py-2 text-textMain ${
-                  query.data.performanceMode === mode
-                    ? 'border-nvidia bg-nvidia/10 text-nvidia'
-                    : 'border-border hover:text-accent-neon'
-                } disabled:opacity-50`}
-              >
-                {t(`mode_${mode}`)}
-              </button>
-            ))}
-          </div>
-        </section>
-
-        <label className="flex items-center justify-between gap-4 border border-border bg-surface p-4">
-          <span>{t('auto_launch')}</span>
-          <input
-            type="checkbox"
-            role="switch"
-            checked={query.data.autoLaunch}
-            disabled={autoLaunch.isPending}
-            onChange={(event) => autoLaunch.mutate(event.target.checked)}
-          />
-        </label>
-        {autoLaunch.isError && <p role="alert" className="text-error">{t('auto_launch_error')}</p>}
-
-        <section aria-label={t('updates')} className="grid gap-3 border border-border bg-surface p-4">
-          <div className="flex items-center justify-between gap-4">
-            <span>{t('updates')}</span>
-            <button
-              onClick={() => checkUpdates.mutate()}
-              disabled={checkUpdates.isPending || updateBusy}
-              className="border border-border px-4 py-2"
-            >
-              {t('update_check')}
-            </button>
-          </div>
-          <p role="status" className="text-sm text-textMuted">{updateStatusText}</p>
-        </section>
-
-        <dl className="grid grid-cols-2 gap-3 border border-border bg-surface p-4">
-          <dt>{t('current_status')}</dt>
-          <dd>{t(`gateway_${query.data.status.state}`)}</dd>
-          <dt>{t('port')}</dt>
-          <dd className="font-mono">{query.data.status.port ?? query.data.gatewayPort}</dd>
-          <dt>{t('version')}</dt>
-          <dd className="font-mono">{query.data.version}</dd>
-        </dl>
-
-        <ModelsSection />
-
-        <div className="flex flex-wrap gap-3">
-          <button onClick={() => navigate('/wizard?mode=change')} className="bg-nvidia text-bg px-4 py-2">
-            {t('change_port')}
-          </button>
-          <button onClick={() => void rerun()} className="border border-border px-4 py-2 text-textMuted">
-            {t('reset_wizard')}
-          </button>
-        </div>
-
-        <section aria-label={t('feedback_title')} className="grid gap-3 border border-border bg-surface p-4">
-          <div className="flex items-center justify-between gap-4">
-            <span className="text-textMain font-medium">{t('feedback_title')}</span>
-            <button onClick={openFeedback} className="flex items-center gap-2 border border-border px-4 py-2 text-textMain hover:text-accent-neon">
-              <Lightbulb aria-hidden size={16} />
-              {t('feedback_title')}
-            </button>
-          </div>
-        </section>
+  const updateStatusText = `${t(`update_state_${update?.state ?? 'none'}`)}${update?.state === 'downloading' && update.percent !== null ? ` — ${t('update_progress', { percent: update.percent })}` : ''}${update?.version ? ` — ${t('update_version', { version: update.version })}` : ''}`;
+  return <div className="flex flex-col h-full overflow-y-auto p-4 sm:p-8"><h2 className="text-2xl font-bold mb-8">{t('settings')}</h2><div className="max-w-xl grid gap-6">
+    <label className="grid gap-2 text-sm text-textMuted">{t('language')}<select value={query.data.language} onChange={(event) => void language(event.target.value as AppLanguage)} className="bg-surface border border-border p-3 text-textMain rounded focus:outline-none focus:border-nvidia"><option value="en">{t('english')}</option><option value="zh">{t('chinese')}</option><option value="es">{t('spanish')}</option><option value="hi">{t('hindi')}</option><option value="fr">{t('french')}</option><option value="ar">{t('arabic')}</option><option value="ru">{t('russian')}</option></select></label>
+    <section aria-label={t('models_mode_label')} className="grid gap-2 text-sm text-textMuted border border-border bg-surface p-3">
+      <span>{t('models_mode_label')}</span>
+      <div role="radiogroup" aria-label={t('models_mode_label')} className="flex flex-wrap gap-2">
+        {(['day', 'night', 'auto'] as const).map((mode) => <button key={mode} type="button" role="radio" aria-checked={query.data.performanceMode === mode} onClick={() => setPerformanceMode(mode)} disabled={performanceBusy} className={`border px-4 py-2 text-textMain ${query.data.performanceMode === mode ? 'border-nvidia bg-nvidia/10 text-nvidia' : 'border-border hover:text-accent-neon'} disabled:opacity-50`}>{t(`mode_${mode}`)}</button>)}
       </div>
-    </div>
-  );
+    </section>
+    <label className="flex items-center justify-between gap-4 border border-border bg-surface p-4"><span>{t('auto_launch')}</span><input type="checkbox" role="switch" checked={query.data.autoLaunch} disabled={autoLaunch.isPending} onChange={(event) => autoLaunch.mutate(event.target.checked)} /></label>{autoLaunch.isError && <p role="alert" className="text-error">{t('auto_launch_error')}</p>}
+    <section aria-label={t('updates')} className="grid gap-3 border border-border bg-surface p-4">
+      <div className="flex items-center justify-between gap-4"><span>{t('updates')}</span><button onClick={() => checkUpdates.mutate()} disabled={checkUpdates.isPending || updateBusy} className="border border-border px-4 py-2">{t('update_check')}</button></div>
+      <p role="status" className="text-sm text-textMuted">{updateStatusText}</p>
+    </section>
+    <dl className="grid grid-cols-2 gap-3 border border-border bg-surface p-4"><dt>{t('current_status')}</dt><dd>{t(`gateway_${query.data.status.state}`)}</dd><dt>{t('port')}</dt><dd className="font-mono">{query.data.status.port ?? query.data.gatewayPort}</dd><dt>{t('version')}</dt><dd className="font-mono">{query.data.version}</dd></dl>
+    <ModelsSection />
+    <div className="flex flex-wrap gap-3"><button onClick={() => navigate('/wizard?mode=change')} className="bg-nvidia text-bg px-4 py-2">{t('change_port')}</button><button onClick={() => void rerun()} className="border border-border px-4 py-2 text-textMuted">{t('reset_wizard')}</button></div>
+    <section aria-label={t('feedback_title')} className="grid gap-3 border border-border bg-surface p-4">
+      <div className="flex items-center justify-between gap-4">
+        <span className="text-textMain font-medium">{t('feedback_title')}</span>
+        <button onClick={openFeedback} className="flex items-center gap-2 border border-border px-4 py-2 text-textMain hover:text-accent-neon">
+          <Lightbulb aria-hidden size={16} />
+          {t('feedback_title')}
+        </button>
+      </div>
+    </section>
+  </div></div>;
 }

@@ -16,6 +16,12 @@ https.request = function requestLocalUpstream(options, callback) {
   return originalRequest.call(this, options, callback);
 };
 
+// Also redirect https.get so consumers that use it (model-discovery.mjs
+// fetchAvailableModels, which backs getCachedModels and /v1/models/cached +
+// /admin/models) reach the local fake upstream in tests. https.get internally
+// calls the module-local `request` binding via closure — it does NOT pick up the
+// `https.request` property patch above — so a dedicated `https.get` patch is
+// required for preload parity. Identical redirect logic to `request` above.
 const originalGet = https.get;
 
 https.get = function getLocalUpstream(options, callback) {

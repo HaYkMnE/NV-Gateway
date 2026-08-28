@@ -5,10 +5,26 @@ import QRCode from 'qrcode';
 import { petAudio } from './audioEngine';
 import './donation-modal.css';
 
+/**
+ * DonationModal — cyberpunk "SUPPORT NV-GATEWAY" donation dialog.
+ *
+ * Ported from nvgateway-donation-mockups/interactive-showcase.html
+ * (donation modal + enlarged QR scan overlay). All payment values are
+ * PLACEHOLDERS until real addresses/links are wired in.
+ *
+ * Any successful support action (COPY, enlarged-QR scan confirmation,
+ * external platform link) triggers the Ascension ritual:
+ *   - petAudio.playAscensionRitual()
+ *   - localStorage nv_pet_vip = Date.now().toString() (expires in 7 days)
+ *   - onAscension() so the parent can flip the widget to Patron state
+ *   - speech bubble "THANK YOU, FRIEND!"
+ */
+
 export interface DonationModalProps {
   open: boolean;
   onClose: () => void;
-  onAscension?: () => void;
+  /** Fired after every successful support action (see Ascension above). */
+  onAscension: () => void;
 }
 
 type TabKey = 'crypto' | 'world';
@@ -16,9 +32,13 @@ type TabKey = 'crypto' | 'world';
 interface DonationRow {
   id: string;
   label: string;
+  /** FULL value copied to the clipboard (verbatim real address / link). */
   value: string;
+  /** Optional short display string; when absent, `value` is shown as-is. */
   display?: string;
+  /** Exact QR payload string (crypto URI scheme or plain address). */
   qr?: string;
+  /** Present for external platform rows ("OPEN ↗"). '#' = placeholder link. */
   url?: string;
 }
 
@@ -27,12 +47,15 @@ const TABS: ReadonlyArray<{ key: TabKey }> = [
   { key: 'world' },
 ];
 
+// NOTE: crypto rows carry REAL wallets (verbatim — do not alter);
+// `world` rows carry REAL support links (verbatim — do not alter).
 const BTC_ADDRESS = 'bc1qmle5479683zdggfd0d3qfzm08dcff3dd8zufw5';
 const EVM_ADDRESS = '0xEf3Ab19B35d770293107c1e54d8a6d5f1c6d00bA';
 const SOL_ADDRESS = '2r7bD3n3yoRPCPg1bjDaJ7nxcE7oMwJy5cRVu5XsrZgG';
 const TRON_ADDRESS = 'TPoeenevUvRwcTfXmCFweGVSbH37hiZpmr';
 const TON_ADDRESS = 'UQCirhEjqFkjA8CAQcypCkFOBSOUooNKBTVHgiBikDRUhBGZ';
 
+/** first8…last6 truncation for a long address. */
 function truncateAddress(value: string): string {
   return value.length > 16 ? `${value.slice(0, 8)}…${value.slice(-6)}` : value;
 }
@@ -110,6 +133,7 @@ const PANEL_ROWS: Record<TabKey, ReadonlyArray<DonationRow>> = {
   ],
 };
 
+/** Clipboard write with execCommand fallback (Electron/permission safe). */
 function copyViaExecCommand(text: string): void {
   const ta = document.createElement('textarea');
   ta.value = text;
@@ -120,7 +144,9 @@ function copyViaExecCommand(text: string): void {
   ta.select();
   try {
     document.execCommand('copy');
-  } catch {}
+  } catch {
+    /* clipboard unavailable — nothing else we can do */
+  }
   ta.remove();
 }
 
@@ -132,6 +158,7 @@ function copyText(text: string): void {
   }
 }
 
+/** Dashed placeholder QR glyph (pure vector, no real payload). */
 function QrGlyph({ size }: { size: number }): React.JSX.Element {
   return (
     <svg
@@ -174,11 +201,23 @@ function QrGlyph({ size }: { size: number }): React.JSX.Element {
   );
 }
 
+/**
+ * REAL QR code rendered as inline SVG (CSP-safe: no data: URIs, no canvas).
+ * Generated at mount from the exact payload string via the `qrcode` package.
+ * Falls back to the dashed placeholder glyph while generating / on failure.
+ */
 interface ParsedQrSvg {
   viewBox: string;
+  /** Every path in the generated QR (background + modules), as data. */
   paths: ReadonlyArray<{ d: string; fill?: string; stroke?: string }>;
 }
 
+/**
+ * Parse the SVG string produced by `qrcode.toString({ type: 'svg' })` into
+ * plain data (viewBox + path d/fill pairs). Returns null if the markup does
+ * not look like a qrcode SVG. No HTML is ever injected into the DOM — the
+ * string is treated strictly as data, so the injection surface is zero.
+ */
 function parseQrSvg(markup: string): ParsedQrSvg | null {
   const viewBoxMatch = /<svg\b[^>]*\bviewBox="([^"]+)"/.exec(markup);
   if (viewBoxMatch === null) return null;
@@ -190,6 +229,7 @@ function parseQrSvg(markup: string): ParsedQrSvg | null {
     const fillMatch = /\bfill="(#[0-9A-Fa-f]{3,8})"/.exec(pathTag[0]);
     const strokeMatch = /\bstroke="(#[0-9A-Fa-f]{3,8})"/.exec(pathTag[0]);
     if (dMatch === null) return null;
+    // qrcode draws modules as stroke lines (no fill); background as fill rect — keep both.
     paths.push({ d: dMatch[1], fill: fillMatch?.[1], stroke: strokeMatch?.[1] });
   }
   if (paths.length === 0) return null;
@@ -250,6 +290,7 @@ function CryptoQr({ payload, size }: { payload: string; size: number }): React.J
   );
 }
 
+/** Cyber corner bracket for the enlarged QR frame. */
 function QrCorner({ pos }: { pos: 'tl' | 'tr' | 'bl' | 'br' }): React.JSX.Element {
   const cls: Record<typeof pos, string> = {
     tl: 'top-0 left-0 border-t-2 border-l-2',
@@ -270,6 +311,7 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
   const [bubble, setBubble] = useState<string | null>(null);
   const bubbleTimerRef = useRef<number | null>(null);
 
+  // Reset transient UI state each time the modal opens.
   useEffect(() => {
     if (open) {
       setActiveTab('crypto');
@@ -286,6 +328,7 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
     [],
   );
 
+  // Escape: close the enlarged QR view first, then the modal itself.
   useEffect(() => {
     if (!open) return;
     const handler = (event: KeyboardEvent) => {
@@ -297,15 +340,18 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
     return () => document.removeEventListener('keydown', handler);
   }, [open, qrRow, onClose]);
 
+  /** Full Ascension sequence shared by COPY / QR confirm / external links. */
   const triggerAscension = useCallback((): void => {
     petAudio.playAscensionRitual();
     try {
       window.localStorage.setItem('nv_pet_vip', Date.now().toString());
-    } catch {}
+    } catch {
+      /* storage unavailable — VIP flag simply won't persist */
+    }
     setBubble(t('pet_thanks'));
     if (bubbleTimerRef.current !== null) window.clearTimeout(bubbleTimerRef.current);
     bubbleTimerRef.current = window.setTimeout(() => setBubble(null), 4000);
-    onAscension?.();
+    onAscension();
   }, [onAscension, t]);
 
   const handleTabSwitch = useCallback((tab: TabKey): void => {
@@ -323,6 +369,7 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
     [triggerAscension],
   );
 
+  /** Open a link row's URL externally via the safe IPC channel + Ascension. */
   const openRowExternally = useCallback(
     (row: DonationRow): void => {
       void window.electronAPI?.openExternal(row.url ?? '');
@@ -333,6 +380,9 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
 
   const handleExternalLink = useCallback(
     (event_: React.MouseEvent<HTMLAnchorElement>, row: DonationRow): void => {
+      // Never navigate in-renderer (CSP/navigation guards deny it anyway) —
+      // ask the main process to open the URL externally via the safe
+      // allowlisted `shell:open-external` channel, then run Ascension.
       event_.preventDefault();
       event_.stopPropagation();
       openRowExternally(row);
@@ -347,6 +397,8 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
 
   return (
     <>
+      
+      {/* ===================== Main modal ===================== */}
       <div
         role="dialog"
         aria-modal="true"
@@ -358,6 +410,7 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
           onMouseDown={(e) => e.stopPropagation()}
           className="relative flex max-h-[90vh] w-full max-w-[560px] flex-col overflow-hidden rounded-xl border border-accent-neon bg-bg shadow-glow-neon-strong p-6"
         >
+          {/* Header */}
           <div className="mb-3 flex items-start justify-between border-b border-border pb-3">
             <div>
               <h2 className="text-lg font-bold tracking-[2.5px] text-accent-neon drop-shadow-[0_0_12px_rgba(89,255,0,0.45)]">
@@ -377,6 +430,7 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
             </button>
           </div>
 
+          {/* Tabs */}
           <div role="tablist" aria-label={t('pet_donation_tabs_aria')} className="mb-4 flex gap-1 border-b border-border">
             {TABS.map((tab) => (
               <button
@@ -396,6 +450,7 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
             ))}
           </div>
 
+          {/* Rows */}
           <div role="tabpanel" aria-label={activeTabLabel} className="flex max-h-[60vh] flex-col gap-2 overflow-y-auto pr-1">
             {rows.map((row) => (
               <div
@@ -412,9 +467,12 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
                   row.qr !== undefined ? ' cursor-pointer hover:bg-surface/70' : ''
                 }`}
               >
+                {/* QR placeholder box -> opens enlarged scan view */}
                 <button
                   type="button"
                   onClick={(e) => {
+                    // The thumbnail always opens the enlarged QR view — never the
+                    // link-row external open (which the row body click triggers).
                     e.stopPropagation();
                     setQrRow(row);
                   }}
@@ -428,6 +486,7 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
                   </span>
                 </button>
 
+                {/* Label + placeholder value */}
                 <div className="flex min-w-0 flex-col gap-0.5">
                   <span className="text-sm font-semibold text-textMain">{row.label}</span>
                   <span className="truncate font-mono text-xs text-textMuted" title={row.value}>
@@ -435,6 +494,7 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
                   </span>
                 </div>
 
+                {/* Actions */}
                 <div className="flex shrink-0 items-center gap-2">
                   {row.url !== undefined && (
                     <a
@@ -451,6 +511,7 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
                   <button
                     type="button"
                     onClick={(e) => {
+                      // Never bubble to the row — COPY must not open the QR overlay.
                       e.stopPropagation();
                       handleCopy(row);
                     }}
@@ -467,6 +528,7 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
             ))}
           </div>
 
+          {/* Speech bubble (post-ascension thanks) */}
           {bubble && (
             <div
               role="status"
@@ -478,6 +540,7 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
         </div>
       </div>
 
+      {/* ============ Enlarged QR scan overlay ============ */}
       {qrRow && (
         <div
           role="dialog"
@@ -509,6 +572,7 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
 
             <div className="mb-2 text-base font-bold tracking-wide text-textMain">{qrRow.label}</div>
 
+            {/* Enlarged QR frame (vector SVG — lossless at any scale) */}
             <div className="relative mx-auto mb-3 w-fit rounded-lg bg-[#ECEFF2] p-3">
               <QrCorner pos="tl" />
               <QrCorner pos="tr" />
@@ -529,6 +593,7 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
               </div>
             </div>
 
+            {/* Address row (below the QR) with COPY */}
             <div className="mx-auto mb-3 flex w-full items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2">
               <span className="truncate font-mono text-xs text-textMuted" title={qrRow.value}>
                 {qrRow.display ?? qrRow.value}

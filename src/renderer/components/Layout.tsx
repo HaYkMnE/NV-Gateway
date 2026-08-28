@@ -184,15 +184,15 @@ export function Layout() {
 
   return (
     <div className="flex h-full min-w-0 overflow-hidden">
-      <aside className="hidden md:flex w-[250px] shrink-0 bg-bg border-r border-border flex-col justify-between overflow-y-auto">
-        <div className="p-5 pb-0">
+      <aside className="hidden md:flex w-[250px] shrink-0 bg-bg border-r border-border flex-col overflow-y-auto">
+        <div className="p-5 pb-2">
           <div className="flex items-center gap-3 mb-4">
             <Logo className="w-9 h-9" />
             <h1 className="font-bold text-lg">{t('product_name')}</h1>
           </div>
           <Navigation onNavigate={handleNavigate} />
         </div>
-        <div className="px-5 my-2">
+        <div className="px-5 my-auto py-2">
           <PetWidget onOpenDonation={openDonation} />
         </div>
         <div className="mt-auto p-5 pt-3 border-t border-border">

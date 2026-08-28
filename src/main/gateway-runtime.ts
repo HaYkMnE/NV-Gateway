@@ -18,7 +18,7 @@ export interface GatewaySpawnOptions {
 export interface RuntimeProtector { protectDirectory(directoryPath: string): void; protectFile(filePath: string): void }
 const NO_PROTECTION: RuntimeProtector = { protectDirectory: () => {}, protectFile: () => {} };
 
-const DEFAULT_GATEWAY_PORT = 12004;
+const DEFAULT_GATEWAY_PORT = 12000;
 const WINDOWS_CHILD_ENVIRONMENT_NAMES = new Set([
   "SYSTEMROOT",
   "TEMP",

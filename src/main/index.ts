@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, safeStorage, session, Tray } from "electron";
+﻿import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, safeStorage, session, Tray } from "electron";
 import * as crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
@@ -65,7 +65,7 @@ function getAboutInfo(): {
   adminPort: number;
   repoUrl: string;
 } {
-  let proxyPort = 12004;
+  let proxyPort = 12000;
   if (gatewayRuntime) {
     try {
       proxyPort = readGatewayPort(gatewayRuntime.configPath);
@@ -80,7 +80,7 @@ function getAboutInfo(): {
     nodeVersion: process.versions.node,
     proxyPort,
     adminPort: proxyPort + 1,
-    repoUrl: "https://github.com/HaYkMnE/NV-Gateway"
+    repoUrl: "https://github.com/susmnavorasem/nv-gateway"
   };
 }
 function migrationPhaseAuditPath(): string {
@@ -291,7 +291,7 @@ function updateTray(status: GatewayStatus = gatewayLifecycle?.getStatus() ?? { s
   const stateKey = `gateway_${status.state}` as keyof typeof menuStr;
   const stateLabel = (menuStr[stateKey] as string) ?? (status.state[0].toUpperCase() + status.state.slice(1));
   const details = status.port ? ` (port ${status.port})` : "";
-  tray.setToolTip(`NV-Gateway — ${stateLabel}${details}`);
+  tray.setToolTip(`NVIDIA Gateway — ${stateLabel}${details}`);
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: `${menuStr.status_label}: ${stateLabel}${details}`, enabled: false },
     ...(status.state === "error" && status.message ? [{ label: status.message, enabled: false }] : []),

@@ -9,10 +9,7 @@
 //   nvapi-<...>      -> nvapi-***
 //   sk-<...>         -> sk-***   (word boundary + min 20 chars to avoid
 //                              matching "disk", "task", "risk", etc.)
-//   Windows user paths (drive/UNC/JSON-escaped/URL-encoded, any case of
-//   "Users")        -> C:\Users\***   via redactUserPaths (canonical
-//                              implementation: src/shared/redaction.mjs,
-//                              mirrored in ./redaction)
+//   C:\Users\<user>\ -> C:\Users\***\
 //   <addr>@<domain>  -> ***@***.***
 
 import { app } from "electron";
@@ -20,7 +17,6 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { REPORTS_BASE_URL } from "./reports-endpoint";
-import { redactUserPaths } from "./redaction";
 
 // Reporting endpoint of the deployed Cloudflare Worker (POST /v1/error).
 // No auth headers — the worker accepts unauthenticated writes.
@@ -37,6 +33,7 @@ const RE_NVAPI = /nvapi-[A-Za-z0-9_-]+/g;
 // Word boundary + minimum 20 chars so common words like "disk", "task",
 // "risk", "ask-" are not matched.
 const RE_SK = /\bsk-[A-Za-z0-9_-]{20,}/g;
+const RE_USERPATH = /C:\\Users\\[^\\]+\\/g;
 const RE_EMAIL = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
 
 export interface ErrorEntry {
@@ -71,10 +68,11 @@ function reportsDir(): string {
 }
 
 function sanitizeText(value: string): string {
-  return redactUserPaths(value
+  return value
     .replace(RE_NVAPI, "nvapi-***")
     .replace(RE_SK, "sk-***")
-    .replace(RE_EMAIL, "***@***.***"));
+    .replace(RE_USERPATH, "C:\\Users\\***\\")
+    .replace(RE_EMAIL, "***@***.***");
 }
 
 function sanitizeEntry(entry: Record<string, unknown>): Record<string, unknown> {

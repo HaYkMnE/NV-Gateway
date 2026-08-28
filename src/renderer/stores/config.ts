@@ -16,7 +16,7 @@ export const useConfigStore = create<ConfigState>()(
       hydrated: false,
       setupComplete: false,
       language: 'en',
-      gatewayPort: 12004,
+      gatewayPort: 12000,
       hydrate: (config) => set({ ...config, hydrated: true }),
       setConfig: (config) => set(config),
     })

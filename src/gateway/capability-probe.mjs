@@ -777,7 +777,7 @@ export async function probeAndCacheReasoningModes(modelId, options = {}) {
  * enabled, and hard-disabled via GATEWAY_CAPABILITY_PROBE_DISABLE=1.
  *
  * @param {unknown} modelIds Model ids from the freshly served catalog.
- * @param {{\
+ * @param {{
  *   logger?: (outcome: object) => void,
  *   keyProvider?: () => string | null,
  *   requestImpl?: Function,

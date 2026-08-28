@@ -8,7 +8,7 @@ import { sanitizeProxyHeaders, capResponseHeaders } from "./proxy-headers.mjs";
 import { createUpstreamSocketTimeouts, resolveGatewayTimeouts, resolveRetryFirstByteTimeoutMs } from "./upstream-timeouts.mjs";
 import { getModelLimits, getDisabledModels, setModelLimits } from "./model-limits.mjs";
 import { getCapabilityMetadata } from "./capability-registry.mjs";
-import { classifyUpstreamResponse, isSuccessfulStatus, parseRetryAfter, resolveMaxFailoverAttempts } from "./failover-policy.mjs";
+import { classifyUpstreamResponse, isPoolWideCapableStatus, isSuccessfulStatus, parseRetryAfter, RATE_LIMIT_STATUS, resolveMaxFailoverAttempts, resolvePoolWideFailureStatus, resolveRateLimitMaxAttempts, shouldEarlyStopOnRateLimit } from "./failover-policy.mjs";
 import { createBoundedBuffer, resolveMaxBufferedResponseBytes } from "./bounded-buffer.mjs";
 import { flushState } from "./rotation.mjs";
 import { classifyGatewayRoute, isAllowedOrigin, isBearerAuthorized, parseCorsAllowlist } from "./security.mjs";
@@ -18,6 +18,7 @@ import crypto from "node:crypto";
 import { getCachedModels, refreshModels } from "./model-discovery.mjs";
 import { createDirectGlmProbeScheduler, runDirectGlmProbe, shouldScheduleDirectGlmProbe } from "./direct-glm-probe.mjs";
 import { mergeProbedReasoning, scheduleCapabilityRefresh } from "./capability-probe.mjs";
+import { createPerformanceModeResolver, readPerModelFailoverAttempts, readPerModelRateLimitAttempts } from "./performance-mode.mjs";
 
 const NVIDIA_API = "integrate.api.nvidia.com";
 let LOCAL_TOKEN;
@@ -31,6 +32,42 @@ const { firstByteTimeoutMs, idleTimeoutMs, maxStreamDurationMs } = resolveGatewa
 // keeps the full fresh-request window so a legitimately slow NVIDIA response
 // is still tolerated on a fresh request.
 const retryFirstByteTimeoutMs = resolveRetryFirstByteTimeoutMs(firstByteTimeoutMs);
+
+// Performance-mode resolver (global day/night/auto profile + env overrides).
+// Supplies the configured maxFailoverAttempts bound the failover loops honor.
+const performanceMode = createPerformanceModeResolver();
+// In production the gateway child receives GATEWAY_CONFIG_PATH (config always
+// exists via ensureGatewayRuntime); in tests/dev it is unset, so no configured
+// bound is present and the failover loops fall back to covering the active pool.
+const hasGatewayConfig = typeof process.env.GATEWAY_CONFIG_PATH === "string" && process.env.GATEWAY_CONFIG_PATH.length > 0;
+
+// Resolve the configured failover-attempts bound for a model: per-model override
+// (config.perModelSettings[model].maxFailoverAttempts) wins over the global
+// performance profile. Returns undefined when no config is present (caller falls
+// back to pool-derived coverage).
+function resolveConfiguredMaxFailoverAttempts(modelId) {
+    if (!hasGatewayConfig) return undefined;
+    const perModel = readPerModelFailoverAttempts(modelId);
+    if (perModel !== null) return perModel;
+    return performanceMode.resolve().maxFailoverAttempts;
+}
+
+// Resolve the configured uniform-429 confirming-attempt bound for a model. Only a
+// PER-MODEL config entry participates: the global performance profile deliberately
+// has no rate-limit knob, because the ceiling on useful 429 retries is a property
+// of how NVIDIA scopes the limit (per model), not of a day/night speed trade-off.
+// Returns undefined when no config is present, leaving the default (2) in force.
+function resolveConfiguredRateLimitMaxAttempts(modelId) {
+    if (!hasGatewayConfig) return undefined;
+    return readPerModelRateLimitAttempts(modelId) ?? undefined;
+}
+
+// Per-request tracking of the current-attempt inbound "close"/"aborted" handlers.
+// Each failover attempt attaches a fresh pair to the SAME inbound request; without
+// cleanup they accumulate (2 × maxAttempts) and trip MaxListenersExceededWarning,
+// and each stale closure would also keep a dead upstream attempt alive. Only the
+// latest attempt's pair stays attached.
+const funnelAbortHandlers = new WeakMap();
 let isReady = false;
 const ipcChallenge = crypto.randomBytes(32).toString("base64url");
 const directGlmProbeScheduler = createDirectGlmProbeScheduler({
@@ -72,23 +109,107 @@ const modelsRefreshInterval = setInterval(() => {
 }, 24 * 60 * 60 * 1000);
 modelsRefreshInterval.unref();
 
+function poolWideFailureMessage(statusCode) {
+    if (statusCode === 429) return "Upstream rate limit: every available key is currently rate-limited.";
+    if (statusCode === 500) return "Upstream error: every available key returned an internal server error (500).";
+    if (statusCode === 502) return "Upstream error: every available key returned a bad gateway (502).";
+    if (statusCode === 503) return "Upstream error: every available key is unavailable (503).";
+    if (statusCode === 504) return "Upstream error: every available key timed out (504).";
+    return "Upstream returned HTTP " + statusCode + " for every available key.";
+}
+
+// Propagate a pool-wide upstream status (every attempted key returned the SAME
+// retryable status) instead of a generic 502. For 429 we supply our own
+// Retry-After (NVIDIA sends none) so clients can honor a sane backoff. Non-429
+// statuses (e.g. 500 with a non-NVCF signature) are passed through as-is.
+function writePoolWideFailure(res, statusCode, responseMode, retryAfterSeconds) {
+    const message = poolWideFailureMessage(statusCode);
+    const headers = { "Content-Type": "application/json" };
+    if (statusCode === 429) {
+        const retryAfter = Math.max(1, Math.min(60, Math.ceil(Number(retryAfterSeconds) || 0)));
+        headers["Retry-After"] = String(retryAfter);
+    }
+    if (responseMode === "anthropic") {
+        const errorType = statusCode === 429 ? "rate_limit_error" : (statusCode >= 500 ? "overloaded_error" : "api_error");
+        res.writeHead(statusCode, headers);
+        res.end(JSON.stringify({ type: "error", error: { type: errorType, message } }));
+        return;
+    }
+    res.writeHead(statusCode, capResponseHeaders(headers));
+    res.end(JSON.stringify({ error: message }));
+}
+
 function proxyRequestWithFailover(req, res, bodyBuffer, isStream, onKeyIdChange, opts = {}) {
     return new Promise((resolve) => {
         let attempt = 0;
         const activeCount = getKeys().filter((k) => k.status === "active").length;
-        const maxAttempts = resolveMaxFailoverAttempts(process.env, activeCount);
+        const requestedModelId = typeof opts.model === "string" ? opts.model : undefined;
+        const maxAttempts = resolveMaxFailoverAttempts(process.env, activeCount, resolveConfiguredMaxFailoverAttempts(requestedModelId));
+        // Status code seen on every retryable UPSTREAM HTTP failure, in order.
+        // Used to detect a pool-wide failure (all keys returning the same real
+        // upstream status) at the exhaustion point so the upstream status is
+        // propagated instead of a generic 502. Gateway-side synthetic failures
+        // (timeouts/socket errors/SSE errors) are excluded; individual/mixed
+        // failures keep the existing behavior.
+        const seenFailedStatuses = [];
+        // Distinct keys already attempted, so pool-wide coverage is judged on real
+        // key coverage rather than on the attempt counter (which may exceed or
+        // undershoot the pool size depending on the configured bound).
+        const attemptedKeyIds = new Set();
+
+        // A pool-wide verdict requires: every recorded upstream failure carried the
+        // SAME status, that status can describe the whole pool (not a per-key signal
+        // such as 401/403 or an NVCF dispatch 404), and enough DISTINCT keys were
+        // tried to cover the reachable portion of the pool (bounded by maxAttempts).
+        // Returns null otherwise. See resolvePoolWideFailureStatus in failover-policy.mjs.
+        const poolWideVerdict = () => resolvePoolWideFailureStatus(seenFailedStatuses, attemptedKeyIds.size, maxAttempts, activeCount);
+
+        // Confirming attempts required before a UNIFORM 429 is answered honestly.
+        // NVIDIA scopes a 429 to the MODEL, so every key answers the same way and
+        // covering the pool cannot succeed — see the note in failover-policy.mjs.
+        const rateLimitMaxAttempts = resolveRateLimitMaxAttempts(process.env, resolveConfiguredRateLimitMaxAttempts(requestedModelId));
 
         const tryNext = () => {
-            if (attempt >= maxAttempts) {
-                error("All failover attempts exhausted", { attempts: attempt });
+            // Two independent early-stop reasons, both requiring at least one attempt:
+            //  - rateLimitStop: every upstream answer so far was 429 and enough keys
+            //    have confirmed it. Fires REGARDLESS of pool coverage, which is the
+            //    point: with 15 keys the coverage test would otherwise walk all 15.
+            //  - coverageVerdict: the pre-existing rule — every attempted key returned
+            //    the SAME pool-wide-capable status and the reachable pool is covered.
+            //    Still the only early stop for 500/502/503/504/529.
+            const rateLimitStop = attempt > 0 && shouldEarlyStopOnRateLimit(seenFailedStatuses, rateLimitMaxAttempts);
+            const coverageVerdict = attempt > 0 ? poolWideVerdict() : null;
+            if (attempt >= maxAttempts || coverageVerdict !== null || rateLimitStop) {
+                // A uniform-429 stop IS a pool-wide verdict about this model, so the
+                // honest 429 is emitted through the same writePoolWideFailure path
+                // (consistent Retry-After and log shape) even though key coverage is
+                // deliberately incomplete.
+                const poolWideStatus = rateLimitStop ? RATE_LIMIT_STATUS : poolWideVerdict();
+                error("All failover attempts exhausted", {
+                    attempts: attempt,
+                    poolWide: poolWideStatus !== null,
+                    upstreamStatus: poolWideStatus,
+                    // Distinguishes "stopped because the pool's answer is already
+                    // established" from "ran out of the configured attempt budget".
+                    earlyStop: (rateLimitStop || coverageVerdict !== null) && attempt < maxAttempts,
+                    // Which rule ended the loop, so an honest 429 stays diagnosable.
+                    earlyStopReason: rateLimitStop ? "uniform_rate_limit" : (coverageVerdict !== null && attempt < maxAttempts ? "pool_coverage" : undefined),
+                    rateLimitMaxAttempts,
+                    keysTried: attemptedKeyIds.size,
+                    activeKeys: activeCount
+                });
                 if (!res.headersSent) {
-                    const retryAfter = String(getSoonestActiveCooldownRemainingSeconds());
-                    if (opts.responseMode === "anthropic") {
-                        res.writeHead(502, { "Content-Type": "application/json", "Retry-After": retryAfter });
-                        res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "All failover attempts exhausted" } }));
+                    if (poolWideStatus !== null) {
+                        writePoolWideFailure(res, poolWideStatus, opts.responseMode, getSoonestActiveCooldownRemainingSeconds());
                     } else {
-                        res.writeHead(502, capResponseHeaders({ "Content-Type": "application/json", "Retry-After": retryAfter }));
-                        res.end(JSON.stringify({ error: "All failover attempts exhausted" }));
+                        const retryAfter = String(getSoonestActiveCooldownRemainingSeconds());
+                        if (opts.responseMode === "anthropic") {
+                            res.writeHead(502, { "Content-Type": "application/json", "Retry-After": retryAfter });
+                            res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "All failover attempts exhausted" } }));
+                        } else {
+                            res.writeHead(502, capResponseHeaders({ "Content-Type": "application/json", "Retry-After": retryAfter }));
+                            res.end(JSON.stringify({ error: "All failover attempts exhausted" }));
+                        }
                     }
                 }
                 resolve({ success: false });
@@ -113,12 +234,21 @@ function proxyRequestWithFailover(req, res, bodyBuffer, isStream, onKeyIdChange,
             }
 
             attempt++;
+            attemptedKeyIds.add(key.id);
             if (onKeyIdChange) onKeyIdChange(key.id);
 
             proxyRequest(req, res, key, bodyBuffer, isStream, (result) => {
                 if (result.success || !result.retryable) {
                     resolve(result);
                 } else {
+                    // Only REAL upstream HTTP statuses (reason prefixed "http_")
+                    // participate in pool-wide detection. Gateway-side synthetic
+                    // failures — first-byte timeout (504), socket hang-up (502),
+                    // SSE error (500) — are NOT an upstream decision and must not
+                    // be mistaken for the pool having returned one status.
+                    if (typeof result.reason === "string" && result.reason.startsWith("http_") && Number.isInteger(result.statusCode)) {
+                        seenFailedStatuses.push(result.statusCode);
+                    }
                     warn("Retrying with different key", {
                         attempt,
                         maxAttempts,
@@ -310,10 +440,39 @@ function checkFirstChunkForSseError(chunk) {
     return false;
 }
 
+// Detach the inbound "close"/"aborted" pair registered for the CURRENT attempt on
+// this request, if any. Called when an attempt settles RETRYABLY (the failover loop
+// is about to re-enter proxyRequest on the same `req`), so listeners never
+// accumulate across attempts and no stale closure survives over a dead attempt.
+// NOT called on success: on the passthrough path onResult({success:true}) fires
+// BEFORE the body is piped, so the client-abort handler must stay attached for the
+// whole streaming window.
+function detachFunnelAbortHandlers(req) {
+    const handlers = funnelAbortHandlers.get(req);
+    if (!handlers) return false;
+    req.removeListener("close", handlers.close);
+    req.removeListener("aborted", handlers.aborted);
+    funnelAbortHandlers.delete(req);
+    return true;
+}
+
 function proxyRequest(req, res, targetKey, bodyBuffer, isStream, onResult, opts = {}) {
     const isAnthropic = opts.responseMode === "anthropic";
     const requestId = isAnthropic ? opts.requestId : undefined;
     const requestedModel = isAnthropic ? opts.model : undefined;
+    // Wrap the caller's callback so a RETRYABLE settle also releases this attempt's
+    // inbound abort listeners (see detachFunnelAbortHandlers). Shadowing keeps every
+    // existing `onResult(...)` / `if (onResult)` call site unchanged, and stays
+    // undefined when the caller passed nothing so those truthiness checks still work.
+    const rawOnResult = onResult;
+    onResult = typeof rawOnResult === "function"
+        ? (result) => {
+            if (result && result.success !== true && result.retryable === true) {
+                detachFunnelAbortHandlers(req);
+            }
+            rawOnResult(result);
+        }
+        : rawOnResult;
 
     const options = {
         hostname: NVIDIA_API,
@@ -943,7 +1102,14 @@ function proxyRequest(req, res, targetKey, bodyBuffer, isStream, onResult, opts 
     }
     upstreamReq.end();
 
-    req.on("close", () => {
+    // Attach the funnel "close"/"aborted" handlers for THIS attempt. A retryable
+    // settle already detached the previous attempt's pair; the defensive detach
+    // here also covers any path that re-entered without settling retryably. A
+    // failover loop re-enters proxyRequest for each retry on the SAME `req`, so
+    // without this every retry would add two more listeners (tripping
+    // MaxListenersExceededWarning) and leave stale closures over dead attempts.
+    detachFunnelAbortHandlers(req);
+    const onClientClose = () => {
         // Only abort upstream if we've already started receiving the response.
         // Destroying upstreamReq during TLS handshake causes socket hang up
         // on the upstream side instead of letting it complete naturally.
@@ -954,22 +1120,24 @@ function proxyRequest(req, res, targetKey, bodyBuffer, isStream, onResult, opts 
             activeUpstreamResponse?.destroy();
             upstreamReq.destroy();
         }
-    });
-
-    req.on("aborted", () => {
+    };
+    const onClientAborted = () => {
         if (!res.writableEnded) {
             intentionalUpstreamAbort = true;
             finishOutcome("client_aborted");
             upstreamReq.destroy();
         }
-    });
+    };
+    req.on("close", onClientClose);
+    req.on("aborted", onClientAborted);
+    funnelAbortHandlers.set(req, { close: onClientClose, aborted: onClientAborted });
 }
 
 function handleModelsWithFailover(req, res, onKeyIdChange) {
     return new Promise((resolve) => {
         let attempt = 0;
         const activeCount = getKeys().filter((k) => k.status === "active").length;
-        const maxAttempts = resolveMaxFailoverAttempts(process.env, activeCount);
+        const maxAttempts = resolveMaxFailoverAttempts(process.env, activeCount, resolveConfiguredMaxFailoverAttempts(undefined));
 
         const tryNext = () => {
             if (attempt >= maxAttempts) {
@@ -1281,20 +1449,30 @@ const server = http.createServer(async (req, res) => {
         });
         req.on("end", () => {
             if (bodyLength > MAX_PAYLOAD_SIZE) return;
-            let bodyBuffer = Buffer.concat(bodyChunks);
+            const bodyBuffer = Buffer.concat(bodyChunks);
             let isStream = false;
             let requestedModelId = undefined;
 
             if (req.headers["content-type"]?.includes("application/json") && bodyBuffer.length > 0) {
+                let parsed;
                 try {
-                    const parsed = JSON.parse(bodyBuffer.toString("utf8"));
-                    if (parsed.stream === true) {
-                        isStream = true;
-                    }
-                    // Capture requested model id for disabled-model check below.
-                    if (typeof parsed?.model === "string") requestedModelId = parsed.model;
-                } catch (e) {
+                    parsed = JSON.parse(bodyBuffer.toString("utf8"));
+                } catch {
+                    // Malformed JSON must fail fast HERE, before any key is touched.
+                    // Previously the unparseable body was swallowed and forwarded,
+                    // after which NVIDIA answered `500 text/plain` (treated as a
+                    // retryable failure) — burning every key in the pool into backoff.
+                    // The parser message is deliberately NOT echoed: it reflects
+                    // attacker-controlled bytes and adds no actionable detail.
+                    res.writeHead(400, { "Content-Type": "application/json" });
+                    res.end(JSON.stringify({ error: "invalid request body" }));
+                    return;
                 }
+                if (parsed.stream === true) {
+                    isStream = true;
+                }
+                // Capture requested model id for disabled-model check below.
+                if (typeof parsed?.model === "string") requestedModelId = parsed.model;
             }
 
             // SUB-TASK A#3: fail fast — block a request for a disabled model BEFORE any key
@@ -1309,7 +1487,7 @@ const server = http.createServer(async (req, res) => {
 
             proxyRequestWithFailover(req, res, bodyBuffer, isStream, (newKeyId) => {
                 loggedKeyId = newKeyId;
-            });
+            }, { model: requestedModelId });
         });
 
         req.on("error", (err) => {
@@ -1355,11 +1533,14 @@ const server = http.createServer(async (req, res) => {
             if (bodyLength > MAX_PAYLOAD_SIZE) return;
             const bodyBuffer = Buffer.concat(bodyChunks);
 
+            // Malformed JSON fails fast HERE, before any key is touched — same
+            // guarantee as the OpenAI chat path, expressed in Anthropic's error
+            // envelope. The parser message is never echoed back.
             let anthropicBody;
             try {
                 anthropicBody = JSON.parse(bodyBuffer.toString("utf8"));
-            } catch (e) {
-                sendAnthropicError(400, "invalid_request_error", "Invalid JSON body");
+            } catch {
+                sendAnthropicError(400, "invalid_request_error", "invalid request body");
                 return;
             }
 
@@ -1423,7 +1604,7 @@ const server = http.createServer(async (req, res) => {
     res.on("error", () => {}); res.end();
 });
 
-const PORT = Number.parseInt(process.env.PORT || "12004", 10);
+const PORT = Number.parseInt(process.env.PORT || "12000", 10);
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65534) {
     throw new Error("PORT must be an integer between 1 and 65534.");
 }

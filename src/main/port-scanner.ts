@@ -29,7 +29,7 @@ export async function checkPorts(ports: number[]): Promise<Record<number, boolea
   return results;
 }
 
-export async function findFreePort(startPort = 12004, maxPort = 12200): Promise<number | null> {
+export async function findFreePort(startPort = 12000, maxPort = 12200): Promise<number | null> {
   for (let p = startPort; p + 1 <= maxPort; p += 2) {
     const [pFree, p1Free] = await Promise.all([checkPort(p), checkPort(p + 1)]);
     if (!pFree && !p1Free) {

@@ -1,4 +1,4 @@
-appId: com.haykmne.nvgateway
+appId: com.susmnavorasem.nvgateway
 productName: NV-Gateway
 directories:
   output: dist
@@ -42,15 +42,13 @@ nsis:
   # Explicit, stable artifact naming (product + version). The portable target
   # naming is intentionally left at its default ("NV-Gateway <version>.exe").
   artifactName: ${productName}-Setup-${version}.${ext}
-# GitHub Releases auto-update source: the PUBLIC source repository itself
-# (github.com/HaYkMnE/NV-Gateway) — Releases ship from the repo that holds the
-# code; there is no separate releases-showcase repository.
+# GitHub Releases auto-update source: the PUBLIC "releases showcase" repo.
 # Both values are build-time env substitutions — electron-builder expands
 # ${env.NAME} when it resolves the publish config and the EXPANDED values are
 # baked into resources/app-update.yml, the file electron-updater reads at
 # runtime; this substitution is therefore NOT runtime-configurable.
 # NVGW_GH_OWNER is required at package time (scripts/run-electron-builder.mjs
-# fails fast when it is missing); NVGW_GH_REPO defaults to NV-Gateway
+# fails fast when it is missing); NVGW_GH_REPO defaults to NV-Gateway-releases
 # in the same wrapper. releaseType: release means only full stable releases are
 # served, never drafts/prereleases.
 publish:

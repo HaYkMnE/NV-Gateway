@@ -1,8 +1,5 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-// Canonical Windows user-path redaction (single source of truth), mirrored
-// from scripts/telemetry/collect-minimized-logs.ts.
-import { redactUserPaths } from '../../src/shared/redaction.mjs';
 
 const ALLOWED_FIELDS = new Set([
   'timestamp', 'level', 'message', 'statusCode', 'status', 
@@ -20,10 +17,11 @@ export function sanitizeEntry(raw: Record<string, unknown>): Record<string, unkn
   for (const [key, value] of Object.entries(raw)) {
     if (ALLOWED_FIELDS.has(key)) {
       if (typeof value === 'string') {
-        // Redact secrets, then local Windows user paths via the canonical helper.
-        const cleanVal = redactUserPaths(value
+        // Redact secrets and local Windows user paths
+        const cleanVal = value
           .replace(/nvapi-[a-zA-Z0-9_-]+/g, '[REDACTED_KEY]')
-          .replace(/sk-[a-zA-Z0-9_-]+/g, '[REDACTED_KEY]'));
+          .replace(/sk-[a-zA-Z0-9_-]+/g, '[REDACTED_KEY]')
+          .replace(/C:\\Users\\[^\\]+/gi, 'C:\\Users\\[REDACTED]');
         sanitized[key] = cleanVal;
       } else {
         sanitized[key] = value;

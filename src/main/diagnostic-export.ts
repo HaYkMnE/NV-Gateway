@@ -1,7 +1,6 @@
 import { app } from "electron";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { redactUserPaths } from "./redaction";
 
 export interface DiagnosticExportResult {
   success: boolean;
@@ -12,17 +11,18 @@ export interface DiagnosticExportResult {
 // Reuses the minimization approach from scripts/telemetry/collect-minimized-logs.ts:
 // read the last ~50 lines of each JSONL log in %APPDATA%\NV-Gateway\logs\,
 // parse, sanitize and write a telemetry-bundle.json.  Sanitization rules
-// match src/main/error-reporter.ts (nvapi-*** / sk-*** / Windows user paths
-// -> C:\Users\*** via redactUserPaths / ***@***.***).
+// match src/main/error-reporter.ts (nvapi-*** / sk-*** / C:\Users\***\ /
+// ***@***.***).
 
 const LOG_FILES = ["gateway.jsonl", "app.jsonl", "gateway-stdio.jsonl"];
 const MAX_ENTRIES = 50;
 
 function sanitizeText(value: string): string {
-  return redactUserPaths(value
+  return value
     .replace(/nvapi-[A-Za-z0-9_-]+/g, "nvapi-***")
     .replace(/sk-[A-Za-z0-9_-]+/g, "sk-***")
-    .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, "***@***.***"));
+    .replace(/C:\\Users\\[^\\]+\\/g, "C:\\Users\\***\\")
+    .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, "***@***.***");
 }
 
 function sanitizeEntry(entry: Record<string, unknown>): Record<string, unknown> {

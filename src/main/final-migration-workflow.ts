@@ -283,7 +283,7 @@ function readAppConfigBytes(configPath: string): Buffer { try { return fs.readFi
 function createAppConfigCandidate(original: Buffer): Buffer {
   let existing: Record<string, unknown> = {};
   try { const parsed = JSON.parse(original.toString("utf8").replace(/^\uFEFF/, "")); if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) existing = parsed as Record<string, unknown>; } catch {}
-  const gatewayPort = typeof existing.gatewayPort === "number" && Number.isInteger(existing.gatewayPort) && existing.gatewayPort >= 1 && existing.gatewayPort <= 65534 ? existing.gatewayPort : 12004;
+  const gatewayPort = typeof existing.gatewayPort === "number" && Number.isInteger(existing.gatewayPort) && existing.gatewayPort >= 1 && existing.gatewayPort <= 65534 ? existing.gatewayPort : 12000;
   const language = typeof existing.language === "string" && ["en", "ru", "zh", "hi", "es", "fr", "ar"].includes(existing.language) ? existing.language : "en";
   return Buffer.from(JSON.stringify({ ...existing, version: 1, gatewayPort: FINAL_MIGRATION_PORT, language, setupComplete: true }, null, 2), "utf8");
 }

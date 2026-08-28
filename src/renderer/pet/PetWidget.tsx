@@ -202,7 +202,7 @@ function hackerModeOf(activity: AnyActivity): string {
 
 export interface PetWidgetProps {
   /** Fired when the widget body (not the sound toggle) is clicked. */
-  onOpenDonation?: () => void;
+  onOpenDonation: () => void;
 }
 
 export function PetWidget({ onOpenDonation }: PetWidgetProps): React.JSX.Element {
@@ -217,6 +217,7 @@ export function PetWidget({ onOpenDonation }: PetWidgetProps): React.JSX.Element
 
   const vipRef = useRef<boolean>(isVip);
   const soundRef = useRef<boolean>(soundOn);
+  const activityRef = useRef<AnyActivity>(activity);
   const engineRef = useRef<PetEngine | null>(null);
   const hackerRendererRef = useRef<PixelHackerRenderer | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -240,6 +241,21 @@ export function PetWidget({ onOpenDonation }: PetWidgetProps): React.JSX.Element
     setIsVip(vip);
   }, []);
 
+  const showThought = useCallback((act: AnyActivity, durationMs = 6000): void => {
+    if (thoughtTimerRef.current !== null) {
+      window.clearTimeout(thoughtTimerRef.current);
+      thoughtTimerRef.current = null;
+    }
+    const picked = pickThought(act, tRef.current);
+    setThought(picked);
+    if (picked !== null) {
+      thoughtTimerRef.current = window.setTimeout(() => {
+        setThought(null);
+        thoughtTimerRef.current = null;
+      }, durationMs);
+    }
+  }, []);
+
   // Activity switch: re-render character animation, play matching SFX once,
   // show themed thought cloud, re-sync VIP flag (it may have flipped while
   // the donation modal was open).
@@ -248,6 +264,7 @@ export function PetWidget({ onOpenDonation }: PetWidgetProps): React.JSX.Element
   // never changes identity when the translator instance does.
   const handleActivityChange = useCallback(
     (next: AnyActivity): void => {
+      activityRef.current = next;
       setActivity(next);
       syncVipFromStorage();
       // Audio must never take the widget down: the FIRST seeded activity
@@ -259,31 +276,47 @@ export function PetWidget({ onOpenDonation }: PetWidgetProps): React.JSX.Element
       } catch {
         /* procedural SFX is best-effort — ignore engine failures */
       }
-      setThought(pickThought(next, tRef.current));
-      if (thoughtTimerRef.current !== null) window.clearTimeout(thoughtTimerRef.current);
-      thoughtTimerRef.current = window.setTimeout(() => {
-        setThought(null);
-        thoughtTimerRef.current = null;
-      }, 2600);
+      // If a cue is currently active, cue handler will trigger thought cloud sequentially.
+      if (cueTimerRef.current === null) {
+        showThought(next, 6000);
+      }
     },
-    [syncVipFromStorage],
+    [showThought, syncVipFromStorage],
   );
 
   // CAUGHT IN THE ACT! — fired by the engine when focus returns after away.
+  // Sequential display: cue shows for 3500ms first, followed by thought cloud for 6000ms.
   const handleCue = useCallback((): void => {
+    if (cueTimerRef.current !== null) {
+      window.clearTimeout(cueTimerRef.current);
+      cueTimerRef.current = null;
+    }
+    if (thoughtTimerRef.current !== null) {
+      window.clearTimeout(thoughtTimerRef.current);
+      thoughtTimerRef.current = null;
+    }
+    if (fadeTimerRef.current !== null) {
+      window.clearTimeout(fadeTimerRef.current);
+      fadeTimerRef.current = null;
+    }
+
+    // Never show thought simultaneously with cue
+    setThought(null);
     setCueShown(true);
     setCrossfading(true);
-    if (cueTimerRef.current !== null) window.clearTimeout(cueTimerRef.current);
-    if (fadeTimerRef.current !== null) window.clearTimeout(fadeTimerRef.current);
-    cueTimerRef.current = window.setTimeout(() => {
-      setCueShown(false);
-      cueTimerRef.current = null;
-    }, 2800);
+
     fadeTimerRef.current = window.setTimeout(() => {
       setCrossfading(false);
       fadeTimerRef.current = null;
     }, 600);
-  }, []);
+
+    cueTimerRef.current = window.setTimeout(() => {
+      setCueShown(false);
+      cueTimerRef.current = null;
+      // Cue finished: sequentially trigger thought cloud for 6000ms
+      showThought(activityRef.current, 6000);
+    }, 3500);
+  }, [showThought]);
 
   // Engine + audio wiring (mount once).
   useEffect(() => {

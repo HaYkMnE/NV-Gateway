@@ -326,7 +326,7 @@ export function registerFamilyPatterns(overrides) {
 /**
  * List all currently known families (built-in + registered overrides).
  * Sorted for deterministic output.
- * @returns {string[] }
+ * @returns {string[]}
  */
 export function listKnownFamilies() {
     return Object.keys(FAMILY_PATTERNS).sort();

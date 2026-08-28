@@ -1,10 +1,5 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-// Canonical Windows user-path redaction (single source of truth). This script
-// is executed via tsx (see .github/workflows/autonomous-analysis.yml), which
-// resolves the ESM .mjs import directly — unlike src/main (compiled to
-// CommonJS), which uses the mirrored helper in src/main/redaction.ts.
-import { redactUserPaths } from '../../src/shared/redaction.mjs';
 
 const ALLOWED_FIELDS = new Set([
   'timestamp', 'level', 'message', 'statusCode', 'status', 
@@ -22,11 +17,11 @@ export function sanitizeEntry(raw: Record<string, unknown>): Record<string, unkn
   for (const [key, value] of Object.entries(raw)) {
     if (ALLOWED_FIELDS.has(key)) {
       if (typeof value === 'string') {
-        // Redact secrets, then local Windows user paths via the canonical
-        // helper (drive/UNC/JSON-escaped/URL-encoded, any case of "Users").
-        const cleanVal = redactUserPaths(value
+        // Redact secrets and local Windows user paths
+        const cleanVal = value
           .replace(/nvapi-[a-zA-Z0-9_-]+/g, '[REDACTED_KEY]')
-          .replace(/sk-[a-zA-Z0-9_-]+/g, '[REDACTED_KEY]'));
+          .replace(/sk-[a-zA-Z0-9_-]+/g, '[REDACTED_KEY]')
+          .replace(/C:\\Users\\[^\\]+/gi, 'C:\\Users\\[REDACTED]');
         sanitized[key] = cleanVal;
       } else {
         sanitized[key] = value;

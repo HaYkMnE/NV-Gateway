@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { translateAnthropicRequest, translateAnthropicResponse, translateAnthropicSseStream } from '../src/gateway/anthropic-adapter.mjs';
 
+// Helpers for consuming the SSE async generator into parseable events.
 async function collectSseEvents(asyncGen) {
   const events = [];
   for await (const ev of asyncGen) {
@@ -25,6 +26,7 @@ function parseEvents(events) {
   });
 }
 
+// Helper to make an async iterable of raw SSE strings
 function asyncFrom(arr) {
   return {
     async *[Symbol.asyncIterator]() {
@@ -204,6 +206,7 @@ test('12. tool parameters do not alias caller input_schema (defensive clone)', (
   };
   const r = translateAnthropicRequest(body);
   assert.equal(r.errors.length, 0);
+  // Mutate the output — the input must not change
   r.openaiBody.tools[0].function.parameters.properties = 'CORRUPTED';
   assert.notEqual(body.tools[0].input_schema.properties, 'CORRUPTED');
 });
@@ -226,7 +229,7 @@ test('14. malformed tool_result without tool_use_id → error', () => {
     messages: [
       { role: 'user', content: 'Use tool' },
       { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'x', input: {} }] },
-      { role: 'user', content: [{ type: 'tool_result', content: 'result' }] },
+      { role: 'user', content: [{ type: 'tool_result', content: 'result' }] }, // no tool_use_id
     ],
     max_tokens: 100,
   });
@@ -245,6 +248,9 @@ test('15. unsupported message role → skipped with warning', () => {
   });
   assert.ok(r.warnings.some(w => w.includes('system')));
   assert.ok(r.warnings.some(w => w.includes('weird')));
+  // Only the user message should survive
+  const nonUser = r.openaiBody.messages.filter(m => m.role !== 'user' && m.role !== 'system');
+  // "system" role is skipped, "weird" role is skipped; only user remains (plus the gateway's own system if any)
   assert.equal(r.openaiBody.messages.filter(m => m.role === 'weird').length, 0);
   assert.equal(r.openaiBody.messages.filter(m => m.role === 'system' && m.content === 'Extra system').length, 0);
 });
@@ -304,7 +310,7 @@ test('20. thinking enabled budget 4000 on z-ai/glm-5.2 -> reasoning_effort=low',
   assert.equal(r.openaiBody.reasoning_effort, 'low');
 });
 
-test('21. thinking enabled budget 50000 on z-ai/glm-5.2 -> reasoning_effort=max', () => {
+test('21. thinking enabled budget 50000 on z-ai/glm-5.2 -> reasoning_effort=max (no longer clamped to high; direct NVIDIA accepts Max)', () => {
   const r = translateAnthropicRequest({
     model: 'z-ai/glm-5.2',
     messages: [{ role: 'user', content: 'Hi' }],
@@ -312,7 +318,7 @@ test('21. thinking enabled budget 50000 on z-ai/glm-5.2 -> reasoning_effort=max'
     thinking: { type: 'enabled', budget_tokens: 50000 },
   });
   assert.equal(r.errors.length, 0);
-  assert.equal(r.openaiBody.reasoning_effort, 'max');
+  assert.equal(r.openaiBody.reasoning_effort, 'max', 'budget 50000 -> max (z-ai/glm-5.2 modes include "max", adapter modes-clamp-down keeps it)');
 });
 
 test('22. thinking enabled on stepfun-ai model -> chat_template_kwargs.thinking=true', () => {
@@ -419,8 +425,10 @@ test('29. reasoning→text transition: text_delta is in a TEXT block, not the th
     'data: [DONE]\n\n',
   ]);
   const events = parseEvents(await collectSseEvents(translateAnthropicSseStream(chunks, 'msg_1', 'z-ai/glm-5.2')));
+  // Find the text_delta event
   const textDelta = events.find(e => e.eventType === 'content_block_delta' && e.data?.delta?.type === 'text_delta');
   assert.ok(textDelta, 'text_delta must be emitted');
+  // Find the content_block_start preceding it — must be type:text, not thinking
   const textIdx = textDelta.data.index;
   const blockStarts = events.filter(e => e.eventType === 'content_block_start');
   const blockForText = blockStarts.find(e => e.data.index === textIdx);
@@ -446,7 +454,7 @@ test('31. text then tool_calls → tool_use gets its own block', async () => {
   const chunks = asyncFrom([
     'data: {"choices":[{"delta":{"content":"Let me check."},"finish_reason":null}]}\n\n',
     'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"weather","arguments":"{\\"city\\":"}}]},"finish_reason":null}]}\n\n',
-    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"London\\"}"}}]},"finish_reason":null}]}\n\n',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"London\"}"}}]},"finish_reason":null}]}\n\n',
     'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
     'data: [DONE]\n\n',
   ]);
@@ -507,6 +515,8 @@ test('36. simple text stream: message_start → block_start → text_delta → b
   ]);
   const events = parseEvents(await collectSseEvents(translateAnthropicSseStream(chunks, 'msg_8', 'z-ai/glm-5.2')));
   const types = events.map(e => e.eventType);
+  const expected = ['message_start', 'content_block_start', 'content_block_delta', 'content_block_stop', 'message_delta', 'message_stop'];
+  // The exact sequence may include more events but should start with message_start and end with message_stop
   assert.equal(types[0], 'message_start');
   assert.equal(types[types.length - 1], 'message_stop');
   assert.ok(types.includes('content_block_start'));

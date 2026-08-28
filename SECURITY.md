@@ -8,8 +8,8 @@ The **NV-Gateway** team takes security, privacy, and credential safety seriously
 
 | Version | Supported |
 | :--- | :--- |
-| `0.0.0` (Latest / Active) | :white_check_mark: |
-| `< 0.0.0` (Legacy / Deprecated) | :x: |
+| `0.1.0` (Latest / Active) | :white_check_mark: |
+| `< 0.1.0` (Legacy / Deprecated) | :x: |
 
 ---
 

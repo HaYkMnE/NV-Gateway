@@ -14,7 +14,7 @@
 **Next-Gen Local AI Gateway & Desktop Control Deck for NVIDIA NGC / NIM Models**
 *OpenAI and Anthropic Dual Gateway // Local Anthropic Messages Proxy // Claude Code with NVIDIA NIM*
 
-[![Release](https://img.shields.io/badge/Release-v0.0.0-00FF66?style=for-the-badge&logo=github&logoColor=black)](https://github.com/HaYkMnE/NV-Gateway/releases)
+[![Release](https://img.shields.io/badge/Release-v0.1.0-00FF66?style=for-the-badge&logo=github&logoColor=black)](https://github.com/HaYkMnE/NV-Gateway/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-00E5FF?style=for-the-badge)](LICENSE)
 [![Node](https://img.shields.io/badge/Node-20%2B-339933?style=for-the-badge&logo=nodedotjs&logoColor=white)](https://nodejs.org/)
 [![Electron](https://img.shields.io/badge/Electron-31-47848F?style=for-the-badge&logo=electron&logoColor=white)](https://electronjs.org/)
@@ -121,7 +121,7 @@ Whether you're running **Claude Code (`claude-code` CLI)**, autonomous coding sw
 - **Failover Engine**:
   - `401 / 403`: Immediately disables the invalid key.
   - `429 (Quota Exceeded)`: Identifies account-level quota exhaustion and places key in cooldown.
-  - `429 (Rate Limit)`: Applies backoff according to upstream `Retry-After` header (honored up to 300s, with a 20s default cooldown) and attempts the next available key immediately without blocking.
+  - `429 (Rate Limit)`: Applies backoff according to `Retry-After` header (capped to max 20s) and attempts the next available key immediately without blocking.
   - `5xx / Socket Timeouts`: Backs off transient server errors and retries the request seamlessly on another key.
 
 ### 2. Automatic Reasoning & Thinking Discovery
@@ -155,7 +155,7 @@ Whether you're running **Claude Code (`claude-code` CLI)**, autonomous coding sw
 ## Quick Start
 
 ### Option A: 1-Click Installer (Windows)
-1. Download `NV-Gateway-Setup-0.0.0.exe` from [GitHub Releases](https://github.com/HaYkMnE/NV-Gateway/releases).
+ 1. Download `NV-Gateway-Setup-0.1.0.exe` from [GitHub Releases](https://github.com/HaYkMnE/NV-Gateway/releases).
 2. Launch the installer (installs per-user to `%LOCALAPPDATA%\Programs\NV-Gateway`).
 3. Follow the first-run wizard to add your NVIDIA API keys and select your local port (default: `12004`).
 4. Close the window to minimize to the System Tray.
@@ -177,7 +177,7 @@ npm run dev
 npm run build:portable
 ```
 
-The portable binary is created in `dist/NV-Gateway 0.0.0.exe`.
+The portable binary is created in `dist/NV-Gateway 0.1.0.exe`.
 
 ---
 
@@ -311,7 +311,7 @@ NV-Gateway binds two paired loopback ports (`P` and `P+1`, default `12004` and `
 | `POST /admin/keys` | `12005` | Admin Token | Add a new NVIDIA API key with fire-and-forget probe |
 | `DELETE /admin/keys/:id` | `12005` | Admin Token | Remove a managed key |
 | `POST /admin/models/refresh`| `12005` | Admin Token | Trigger NGC model re-discovery |
-| `GET /admin/logs` | `12005` | Admin Token | Fetch sanitized recent JSONL request events |
+| `GET /admin/logs/recent` | `12005` | Admin Token | Fetch sanitized recent JSONL request events |
 
 ---
 

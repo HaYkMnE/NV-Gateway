@@ -9,7 +9,7 @@ import { shell } from "electron";
  * against a strict allowlist BEFORE handing it to `shell.openExternal`.
  */
 
-/** Hostnames that may ever be opened externally (support / donation platforms, project repository). */
+/** Hostnames that may ever be opened externally (support / donation platforms). */
 const ALLOWED_EXTERNAL_HOSTS: ReadonlySet<string> = new Set([
   "patreon.com",
   "www.patreon.com",
@@ -19,8 +19,6 @@ const ALLOWED_EXTERNAL_HOSTS: ReadonlySet<string> = new Set([
   "www.t.me",
   "telegram.org",
   "www.telegram.org",
-  "github.com",
-  "www.github.com",
 ]);
 
 export function isAllowedExternalUrl(value: unknown): value is string {

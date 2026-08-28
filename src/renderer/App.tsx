@@ -107,26 +107,8 @@ export default function App() {
     };
   }, []);
 
-  if (!hydrated && hydration.state === 'error') {
-    return (
-      <div className="h-full grid place-items-center p-6">
-        <div role="alert" className="max-w-md border border-error p-5 break-words">
-          <p>{t('hydration_error')}</p>
-          <p className="mt-2 text-sm text-textMuted break-all">{hydration.message}</p>
-          <button onClick={() => void retryHydration()} className="mt-4 text-accent-neon">
-            {t('retry')}
-          </button>
-        </div>
-      </div>
-    );
-  }
-  if (!hydrated) {
-    return (
-      <div className="h-full grid place-items-center" role="status">
-        {t('loading')}
-      </div>
-    );
-  }
+  if (!hydrated && hydration.state === 'error') return <div className="h-full grid place-items-center p-6"><div role="alert" className="max-w-md border border-error p-5 break-words"><p>{t('hydration_error')}</p><p className="mt-2 text-sm text-textMuted break-all">{hydration.message}</p><button onClick={() => void retryHydration()} className="mt-4 text-accent-neon">{t('retry')}</button></div></div>;
+  if (!hydrated) return <div className="h-full grid place-items-center" role="status">{t('loading')}</div>;
 
   return (
     <ModalContext.Provider value={modalValue}>

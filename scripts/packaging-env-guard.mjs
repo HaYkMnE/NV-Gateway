@@ -10,7 +10,7 @@
 // Direct run (`node scripts/packaging-env-guard.mjs`):
 //   - exit 1 with a clear message when NVGW_GH_OWNER is missing/blank;
 //   - exit 0 and print the effective publish target otherwise
-//     (NVGW_GH_REPO falls back to NV-Gateway when unset);
+//     (NVGW_GH_REPO falls back to NV-Gateway-releases when unset);
 //   - also verifies electron-builder.yml still carries the env-macro publish
 //     block so config drift breaks packaging loudly, not silently.
 // The pure resolvePublishEnvironment is exported for run-electron-builder.mjs
@@ -20,7 +20,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-export const DEFAULT_RELEASE_REPOSITORY = 'NV-Gateway';
+export const DEFAULT_RELEASE_REPOSITORY = 'NV-Gateway-releases';
 
 export function resolvePublishEnvironment(env = process.env) {
   const owner = typeof env.NVGW_GH_OWNER === 'string' ? env.NVGW_GH_OWNER.trim() : '';

@@ -1,4 +1,4 @@
-{
+﻿{
     "$schema":  "https://nv-gateway/config.schema.json",
     "version":  1,
     "port":  null,

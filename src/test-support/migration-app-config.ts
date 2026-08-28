@@ -24,7 +24,7 @@ function candidate(original: Buffer, update: Partial<AppConfigState>): Buffer {
   let existing: Record<string, unknown> = {};
   try { const parsed = JSON.parse(original.toString("utf8").replace(/^\uFEFF/, "")); if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) existing = parsed as Record<string, unknown>; } catch {}
   const current: AppConfigState = {
-    gatewayPort: typeof existing.gatewayPort === "number" && Number.isInteger(existing.gatewayPort) && existing.gatewayPort >= 1 && existing.gatewayPort <= 65534 ? existing.gatewayPort : 12004,
+    gatewayPort: typeof existing.gatewayPort === "number" && Number.isInteger(existing.gatewayPort) && existing.gatewayPort >= 1 && existing.gatewayPort <= 65534 ? existing.gatewayPort : 12000,
     language: typeof existing.language === "string" && ["en", "ru", "zh", "hi", "es", "fr", "ar"].includes(existing.language) ? existing.language as any : "en",
     setupComplete: existing.setupComplete === true,
     performanceMode: existing.performanceMode === "night" || existing.performanceMode === "auto" || existing.performanceMode === "day" ? existing.performanceMode : "day",

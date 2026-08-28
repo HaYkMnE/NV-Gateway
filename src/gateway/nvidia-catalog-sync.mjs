@@ -111,7 +111,7 @@ let fetcher = defaultFetchJson;
  * @returns {string}
  */
 function userAgent() {
-    return `NV-Gateway/${process.env.npm_package_version || "0.0.0"}`;
+    return `NV-Gateway/${process.env.npm_package_version || "1.0.0"}`;
 }
 
 /**

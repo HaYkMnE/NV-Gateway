@@ -1,6 +1,6 @@
 {
   "name": "nv-gateway",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Free Windows desktop gateway for NVIDIA NGC/NIM: 100+ models, OpenAI+Anthropic compatible local API, multi-key rotation & failover",
   "author": "HaYkMnE",
   "license": "MIT",
