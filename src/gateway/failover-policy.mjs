@@ -163,13 +163,27 @@ export function resolveRateLimitMaxAttempts(env = process.env, configuredMax = u
  * Gateway-side synthetic failures (timeouts, socket hang-ups, SSE errors) are
  * never recorded by the caller, so they neither satisfy nor poison this verdict.
  *
+ * With PER-MODEL key routing the confirming count is additionally bounded by
+ * `eligibleKeyCount` — the keys this MODEL is allowed to use (globally available
+ * and not cooling down for it). Two reasons:
+ *   - the verdict must not be declared before the keys that could actually serve
+ *     this model — including its known-good sticky key — have been tried; and
+ *   - when fewer keys are eligible than the configured confirming count, asking
+ *     for more confirmations than there are distinct keys would re-probe the
+ *     same key, spending wall-clock on a limit already established.
+ * Omitting the argument leaves the historical behaviour untouched.
+ *
  * @param {number[]} seenFailedStatuses Retryable upstream HTTP statuses, in order.
  * @param {number} maxAttempts Confirming attempts required (see {@link resolveRateLimitMaxAttempts}).
+ * @param {number} [eligibleKeyCount] Keys allowed for the requested model.
  * @returns {boolean}
  */
-export function shouldEarlyStopOnRateLimit(seenFailedStatuses, maxAttempts) {
+export function shouldEarlyStopOnRateLimit(seenFailedStatuses, maxAttempts, eligibleKeyCount) {
     if (!Array.isArray(seenFailedStatuses) || seenFailedStatuses.length === 0) return false;
-    const required = clampRateLimitAttempts(maxAttempts) ?? DEFAULT_RATE_LIMIT_MAX_ATTEMPTS;
+    let required = clampRateLimitAttempts(maxAttempts) ?? DEFAULT_RATE_LIMIT_MAX_ATTEMPTS;
+    if (Number.isSafeInteger(eligibleKeyCount) && eligibleKeyCount > 0) {
+        required = Math.max(1, Math.min(required, eligibleKeyCount));
+    }
     if (seenFailedStatuses.length < required) return false;
     return seenFailedStatuses.every((status) => status === RATE_LIMIT_STATUS);
 }

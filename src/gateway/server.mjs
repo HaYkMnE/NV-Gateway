@@ -2,7 +2,7 @@ import http from "node:http";
 import https from "node:https";
 import { StringDecoder } from "node:string_decoder";
 import { handleAdminRequest } from "./admin-api.mjs";
-import { getNextKey, getKeys, handleKeyError, markKeyUsedAndDebounceSave, initializeState, getSoonestActiveCooldownRemainingSeconds } from "./rotation.mjs";
+import { getNextKey, getKeys, handleKeyError, markKeyUsedAndDebounceSave, initializeState, getSoonestActiveCooldownRemainingSeconds, getModelEligibleKeyCount, getRetryAfterSecondsForModel } from "./rotation.mjs";
 import { info, warn, error, flushLogs } from "./logger.mjs";
 import { sanitizeProxyHeaders, capResponseHeaders } from "./proxy-headers.mjs";
 import { createUpstreamSocketTimeouts, resolveGatewayTimeouts, resolveRetryFirstByteTimeoutMs } from "./upstream-timeouts.mjs";
@@ -169,6 +169,12 @@ function proxyRequestWithFailover(req, res, bodyBuffer, isStream, onKeyIdChange,
         // covering the pool cannot succeed — see the note in failover-policy.mjs.
         const rateLimitMaxAttempts = resolveRateLimitMaxAttempts(process.env, resolveConfiguredRateLimitMaxAttempts(requestedModelId));
 
+        // Keys allowed for THIS model at the start of the request (globally
+        // available and not cooling down for it). Captured once so the bound
+        // reflects the pool the model started with, not the keys this very
+        // request has since parked. undefined for model-less callers.
+        const modelEligibleKeyCount = getModelEligibleKeyCount(requestedModelId);
+
         const tryNext = () => {
             // Two independent early-stop reasons, both requiring at least one attempt:
             //  - rateLimitStop: every upstream answer so far was 429 and enough keys
@@ -177,7 +183,11 @@ function proxyRequestWithFailover(req, res, bodyBuffer, isStream, onKeyIdChange,
             //  - coverageVerdict: the pre-existing rule — every attempted key returned
             //    the SAME pool-wide-capable status and the reachable pool is covered.
             //    Still the only early stop for 500/502/503/504/529.
-            const rateLimitStop = attempt > 0 && shouldEarlyStopOnRateLimit(seenFailedStatuses, rateLimitMaxAttempts);
+            // Confirming attempts are bounded by the keys this MODEL may use, so
+            // the verdict is never declared before its own eligible keys (sticky
+            // key first) have answered. Model-less callers pass undefined and
+            // keep the historical pool-wide rule.
+            const rateLimitStop = attempt > 0 && shouldEarlyStopOnRateLimit(seenFailedStatuses, rateLimitMaxAttempts, modelEligibleKeyCount);
             const coverageVerdict = attempt > 0 ? poolWideVerdict() : null;
             if (attempt >= maxAttempts || coverageVerdict !== null || rateLimitStop) {
                 // A uniform-429 stop IS a pool-wide verdict about this model, so the
@@ -200,9 +210,11 @@ function proxyRequestWithFailover(req, res, bodyBuffer, isStream, onKeyIdChange,
                 });
                 if (!res.headersSent) {
                     if (poolWideStatus !== null) {
-                        writePoolWideFailure(res, poolWideStatus, opts.responseMode, getSoonestActiveCooldownRemainingSeconds());
+                        // Model-scoped Retry-After: for a model-wide 429 wave the honest
+                        // wait is when THIS model's keys come back, not the pool's.
+                        writePoolWideFailure(res, poolWideStatus, opts.responseMode, getRetryAfterSecondsForModel(requestedModelId));
                     } else {
-                        const retryAfter = String(getSoonestActiveCooldownRemainingSeconds());
+                        const retryAfter = String(getRetryAfterSecondsForModel(requestedModelId));
                         if (opts.responseMode === "anthropic") {
                             res.writeHead(502, { "Content-Type": "application/json", "Retry-After": retryAfter });
                             res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "All failover attempts exhausted" } }));
@@ -216,11 +228,13 @@ function proxyRequestWithFailover(req, res, bodyBuffer, isStream, onKeyIdChange,
                 return;
             }
 
-            const key = getNextKey();
+            // PER-MODEL selection: the model reuses its own sticky key, skips keys
+            // cooling down for it, and prefers a key no other active model holds.
+            const key = getNextKey(requestedModelId);
             if (!key) {
                 warn("No available keys to service request");
                 if (!res.headersSent) {
-                    const retryAfter = String(getSoonestActiveCooldownRemainingSeconds());
+                    const retryAfter = String(getRetryAfterSecondsForModel(requestedModelId));
                     if (opts.responseMode === "anthropic") {
                         res.writeHead(503, { "Content-Type": "application/json", "Retry-After": retryAfter });
                         res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "All API keys exhausted" } }));
@@ -460,6 +474,10 @@ function proxyRequest(req, res, targetKey, bodyBuffer, isStream, onResult, opts 
     const isAnthropic = opts.responseMode === "anthropic";
     const requestId = isAnthropic ? opts.requestId : undefined;
     const requestedModel = isAnthropic ? opts.model : undefined;
+    // Model id for PER-MODEL key accounting on every failure path below: a 429
+    // must park only this (model, key) pair, never the key pool-wide. Set for
+    // both response modes (unlike requestedModel, which is Anthropic-only).
+    const affinityModelId = typeof opts.model === "string" && opts.model.length > 0 ? opts.model : undefined;
     // Wrap the caller's callback so a RETRYABLE settle also releases this attempt's
     // inbound abort listeners (see detachFunnelAbortHandlers). Shadowing keeps every
     // existing `onResult(...)` / `if (onResult)` call site unchanged, and stays
@@ -544,7 +562,7 @@ function proxyRequest(req, res, targetKey, bodyBuffer, isStream, onResult, opts 
                 intentionalUpstreamAbort = true;
                 upstreamReq.destroy();
                 warn("Upstream first-byte timeout", { id: targetKey.id });
-                handleKeyError(targetKey.id, 504, "First byte timeout", null);
+                handleKeyError(targetKey.id, 504, "First byte timeout", null, affinityModelId);
                 keyOutcomeAccounted = true;
                 finishOutcome("first_byte_timeout");
                 if (onResult) {
@@ -662,7 +680,7 @@ function proxyRequest(req, res, targetKey, bodyBuffer, isStream, onResult, opts 
                 }
 
                 warn("Upstream non-2xx response", { statusCode, model, upstreamCode, upstreamType, upstreamStatusCode });
-                handleKeyError(targetKey.id, statusCode, errorBody, retryAfter);
+                handleKeyError(targetKey.id, statusCode, errorBody, retryAfter, affinityModelId);
                 keyOutcomeAccounted = true;
                 finishOutcome("upstream_http_error");
 
@@ -772,7 +790,7 @@ function proxyRequest(req, res, targetKey, bodyBuffer, isStream, onResult, opts 
                             intentionalUpstreamAbort = true;
                             upstreamReq.destroy();
                             activeUpstreamResponse?.destroy();
-                            handleKeyError(targetKey.id, 500, "Upstream SSE Error", null);
+                            handleKeyError(targetKey.id, 500, "Upstream SSE Error", null, affinityModelId);
                             keyOutcomeAccounted = true;
                             finishOutcome("upstream_sse_error");
                             if (onResult) {
@@ -796,7 +814,7 @@ function proxyRequest(req, res, targetKey, bodyBuffer, isStream, onResult, opts 
                     error("Upstream response stream error", { id: targetKey.id, upstreamStatus: statusCode });
                     finishOutcome("upstream_stream_error");
                     if (!res.headersSent && !firstChunkHandled) {
-                        handleKeyError(targetKey.id, 502, err.message, null);
+                        handleKeyError(targetKey.id, 502, err.message, null, affinityModelId);
                         keyOutcomeAccounted = true;
                         if (onResult) {
                             onResult({ success: false, retryable: true, statusCode: 502, reason: "upstream_stream_error" });
@@ -812,7 +830,7 @@ function proxyRequest(req, res, targetKey, bodyBuffer, isStream, onResult, opts 
                     intentionalUpstreamAbort = true;
                     finishOutcome("upstream_stream_error");
                     if (!res.headersSent && !firstChunkHandled) {
-                        handleKeyError(targetKey.id, 502, "Upstream response aborted", null);
+                        handleKeyError(targetKey.id, 502, "Upstream response aborted", null, affinityModelId);
                         keyOutcomeAccounted = true;
                         if (onResult) {
                             onResult({ success: false, retryable: true, statusCode: 502, reason: "upstream_stream_error" });
@@ -879,7 +897,7 @@ function proxyRequest(req, res, targetKey, bodyBuffer, isStream, onResult, opts 
                         intentionalUpstreamAbort = true;
                         upstreamReq.destroy();
                         activeUpstreamResponse?.destroy();
-                        handleKeyError(targetKey.id, 500, "Upstream SSE Error", null);
+                        handleKeyError(targetKey.id, 500, "Upstream SSE Error", null, affinityModelId);
                         keyOutcomeAccounted = true;
                         finishOutcome("upstream_sse_error");
                         if (onResult) {
@@ -900,7 +918,7 @@ function proxyRequest(req, res, targetKey, bodyBuffer, isStream, onResult, opts 
                 error("Upstream response stream error", { id: targetKey.id, upstreamStatus: statusCode });
                 finishOutcome("upstream_stream_error");
                 if (!res.headersSent && !firstChunkHandled) {
-                    handleKeyError(targetKey.id, 502, err.message, null);
+                    handleKeyError(targetKey.id, 502, err.message, null, affinityModelId);
                     keyOutcomeAccounted = true;
                     if (onResult) {
                         onResult({ success: false, retryable: true, statusCode: 502, reason: "upstream_stream_error" });
@@ -915,7 +933,7 @@ function proxyRequest(req, res, targetKey, bodyBuffer, isStream, onResult, opts 
                 clearTimeout(maxStreamTimer);
                 finishOutcome("upstream_stream_error");
                 if (!res.headersSent && !firstChunkHandled) {
-                    handleKeyError(targetKey.id, 502, "Upstream response aborted", null);
+                    handleKeyError(targetKey.id, 502, "Upstream response aborted", null, affinityModelId);
                     keyOutcomeAccounted = true;
                     if (onResult) {
                         onResult({ success: false, retryable: true, statusCode: 502, reason: "upstream_stream_error" });
@@ -1077,7 +1095,7 @@ function proxyRequest(req, res, targetKey, bodyBuffer, isStream, onResult, opts 
         if (intentionalUpstreamAbort) return;
         error("Upstream request error", { id: targetKey.id, error: err.message, stack: err.stack });
         if (!firstByteReceived) {
-            handleKeyError(targetKey.id, 502, err.message, null);
+            handleKeyError(targetKey.id, 502, err.message, null, affinityModelId);
             keyOutcomeAccounted = true;
         }
         finishOutcome("upstream_stream_error");

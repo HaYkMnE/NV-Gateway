@@ -1,5 +1,14 @@
 import crypto from "node:crypto";
 import { info, warn } from "./logger.mjs";
+import {
+  countEligibleKeys,
+  getModelCooldownRemainingSeconds,
+  markRateLimited,
+  persistAffinity,
+  pruneExpired,
+  recordAssignment,
+  selectKeyForModel
+} from "./model-key-affinity.mjs";
 
 export const MAX_KEY_LENGTH = 8192;
 export const MAX_KEYS = 1000;
@@ -44,7 +53,13 @@ function normalize(state) {
   return result;
 }
 
-export function initializeState(state) { keys = normalize(state); info("State initialized", { count: keys.length }); }
+export function initializeState(state) {
+  keys = normalize(state);
+  // Drop routing memory that decayed while the gateway child was down, so a
+  // restart never starts out reserving keys for models nobody is using.
+  pruneModelAffinity();
+  info("State initialized", { count: keys.length });
+}
 export function setPersistenceAdapter(adapter) { persistAdapter = adapter; }
 export function saveState() {
   // Project the per-key contract the main process validates (state-ownership.ts
@@ -79,10 +94,35 @@ export function getSoonestActiveCooldownRemainingSeconds() {
 }
 
 let locked = false;
-export function getNextKey() {
+/**
+ * Select the key that should serve this request.
+ *
+ * With a `modelId` the choice is PER-MODEL (see model-key-affinity.mjs): the
+ * model reuses its own sticky key, avoids keys cooling down for it specifically,
+ * and prefers a key no other active model holds. Without a `modelId` — the
+ * /v1/models path, admin flows and every existing caller — the behaviour is the
+ * unchanged pool-wide LRU, so the model-less contract is preserved exactly.
+ *
+ * When no key is eligible for the model, selection falls through to the
+ * pool-wide algorithm rather than reporting an empty pool: a model-scoped
+ * cooldown must never turn into a 503 when the pool itself is healthy. The
+ * failover loop's uniform-429 early stop is what ends a genuine model-wide wave.
+ *
+ * @param {string} [modelId] Requested model id, when the caller knows it.
+ * @returns {object | null}
+ */
+export function getNextKey(modelId) {
   if (locked) return null; locked = true;
   try {
     const now = Date.now();
+    if (typeof modelId === "string" && modelId.length > 0) {
+      const affine = selectKeyForModel(modelId, keys, { now });
+      if (affine) {
+        affine.usage.lastUsed = now;
+        recordAssignment(modelId, affine.id, { now });
+        return affine;
+      }
+    }
     const available = keys.filter((key) => key.status === "active" && key.backoffUntil <= now).sort((a, b) => a.usage.lastUsed - b.usage.lastUsed);
     if (available.length > 0) {
       available[0].usage.lastUsed = now;
@@ -122,11 +162,42 @@ export function markKeyUsedAndDebounceSave(id, { success, tokens = 0 }) {
   if (!saveTimer) saveTimer = setTimeout(() => { saveTimer = null; saveState(); }, 5000);
 }
 
-export function handleKeyError(id, statusCode, responseBody, retryAfterSeconds) {
+/**
+ * Record an upstream failure against a key.
+ *
+ * Scope of each verdict — this split is the point of the per-model routing:
+ *
+ *  - 401/403          GLOBAL. A credential verdict: the key is disabled for
+ *                     every model.
+ *  - 429 with "quota" GLOBAL. Exhausted credits answer 429 everywhere, so the
+ *                     key becomes quota-exceeded pool-wide.
+ *  - 429 rate limit   PER (model, key) when `modelId` is known. NVIDIA scopes a
+ *                     rate limit to the model, so parking the key globally would
+ *                     evict a key that is healthy for every other model — the
+ *                     defect this replaces. Without a `modelId` the historical
+ *                     global cooldown is kept, preserving the old contract.
+ *  - 5xx              GLOBAL. An upstream fault is not model-specific; keeps the
+ *                     existing short global backoff unchanged.
+ *
+ * @param {string} id Key id.
+ * @param {number} statusCode Upstream HTTP status.
+ * @param {string} responseBody Upstream body (quota detection only).
+ * @param {number | null} retryAfterSeconds Parsed Retry-After, when present.
+ * @param {string} [modelId] Requested model id, when the caller knows it.
+ * @returns {void}
+ */
+export function handleKeyError(id, statusCode, responseBody, retryAfterSeconds, modelId) {
   const key = keys.find((item) => item.id === id); if (!key) return;
+  const hasModel = typeof modelId === "string" && modelId.length > 0;
   let backoffMs = retryAfterSeconds ? retryAfterSeconds * 1000 : 0;
   if (statusCode === 401 || statusCode === 403) { key.status = "disabled"; warn("Key disabled due to auth error", { id, statusCode }); }
   else if (statusCode === 429 && typeof responseBody === "string" && responseBody.toLowerCase().includes("quota")) { key.status = "quota-exceeded"; }
+  else if (statusCode === 429 && hasModel) {
+    // MODEL-SCOPED: this key stays immediately usable by every other model.
+    backoffMs = Math.min(MAX_BACKOFF_MS, Math.max(0, backoffMs || MAX_KEY_COOLDOWN_429_MS));
+    markRateLimited(modelId, id, { cooldownMs: backoffMs });
+    persistAffinity();
+  }
   else if (statusCode === 429 || statusCode >= 500) {
     backoffMs ||= statusCode === 429 ? MAX_KEY_COOLDOWN_429_MS : 10000;
     backoffMs = Math.min(MAX_BACKOFF_MS, Math.max(0, backoffMs));
@@ -135,6 +206,39 @@ export function handleKeyError(id, statusCode, responseBody, retryAfterSeconds) 
   markKeyUsedAndDebounceSave(id, { success: false });
   if (statusCode >= 500) warn("Upstream error, backing off", { id, statusCode, backoffMs });
 }
+
+/**
+ * Keys currently allowed to serve this model (globally available and not
+ * cooling down for it). The failover loop bounds its uniform-429 confirming
+ * attempts by this count, so the early stop never fires before the keys this
+ * model may actually use have been tried.
+ *
+ * @param {string} [modelId]
+ * @returns {number | undefined} undefined when there is no model to scope by.
+ */
+export function getModelEligibleKeyCount(modelId) {
+  if (typeof modelId !== "string" || modelId.length === 0) return undefined;
+  return countEligibleKeys(modelId, keys);
+}
+
+/**
+ * Honest Retry-After for a model-scoped rate limit: the soonest moment THIS
+ * model may retry. Falls back to the pool-wide cooldown view when the model has
+ * no live model-scoped cooldown.
+ *
+ * @param {string} [modelId]
+ * @returns {number} Seconds, 1..20.
+ */
+export function getRetryAfterSecondsForModel(modelId) {
+  if (typeof modelId === "string" && modelId.length > 0) {
+    const remaining = getModelCooldownRemainingSeconds(modelId, keys);
+    if (remaining !== null) return Math.max(1, Math.min(20, remaining));
+  }
+  return getSoonestActiveCooldownRemainingSeconds();
+}
+
+/** Drop decayed per-model routing memory. Called on state init. */
+export function pruneModelAffinity() { return pruneExpired(); }
 
 export function addKey(value) {
   const key = typeof value === "string" ? value.trim() : "";
