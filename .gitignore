@@ -30,3 +30,7 @@ build/vite.config.js
 build/vite.config.d.ts
 build/src/
 build/renderer/
+# Generated gateway engine bundle (scripts/build-gateway-bundle.mjs). Produced by
+# `npm run build`; never committed, so the repo keeps exactly one copy of the
+# engine — the readable sources in src/gateway.
+build/gateway/

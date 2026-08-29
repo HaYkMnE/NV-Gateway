@@ -20,9 +20,11 @@ test('shipping credential scanner captures buffers, derives every builder payloa
   const scanner = await import('../scripts/shipping-credential-scan.mjs');
   const result = scanner.runShippingCredentialScan({ root });
   assert.equal(result.scannedFileCount > 0, true);
+  // The engine ships as a prebuilt bundle (build/gateway), and src/shared is no
+  // longer part of the payload — redaction.mjs is inlined into that bundle.
   assert.deepEqual(result.scannedRoots, [
     'build/src/main', 'build/src/preload', 'build/renderer', 'package.json',
-    'src/gateway', 'src/shared', 'build/assets'
+    'build/gateway', 'build/assets'
   ]);
   assert.equal(result.testSupportExcluded, true);
 

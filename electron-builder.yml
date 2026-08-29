@@ -10,10 +10,16 @@ files:
   - build/renderer/**/*
   - package.json
 extraResources:
-  - from: src/gateway
+  # The gateway engine ships as ONE minified bundle (scripts/build-gateway-bundle.mjs),
+  # never as readable sources: an installed copy must not carry the engine's
+  # annotated source, whose comments document hard-won upstream behaviour.
+  # The packaged path stays resources/gateway/server.mjs, which is exactly what
+  # getGatewayServerPath() in src/main/index.ts resolves — so the spawn contract
+  # is unchanged. src/shared is deliberately NOT shipped: its only runtime
+  # consumer was the engine, and redaction.mjs is now inlined into the bundle
+  # (src/main has its own compiled ./redaction).
+  - from: build/gateway
     to: gateway
-  - from: src/shared
-    to: shared
   - from: build/assets
     to: assets
     filter:

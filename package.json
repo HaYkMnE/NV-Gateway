@@ -11,7 +11,8 @@
   "main": "build/src/main/index.js",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --project tsconfig.node.json && tsc --project tsconfig.json --noEmit && vite build",
+    "build": "tsc --project tsconfig.node.json && tsc --project tsconfig.json --noEmit && vite build && npm run build:gateway",
+    "build:gateway": "node scripts/build-gateway-bundle.mjs",
     "build:portable": "npm run build && node scripts/run-electron-builder.mjs --win portable && npm run package:audit",
     "build:release": "npm run build && node scripts/run-electron-builder.mjs --win --publish never && npm run package:audit",
     "start": "electron .",
@@ -47,6 +48,7 @@
     "autoprefixer": "^10.4.19",
     "electron": "^31.3.1",
     "electron-builder": "^24.13.3",
+    "esbuild": "0.28.2",
     "jsqr": "^1.4.0",
     "postcss": "^8.4.40",
     "tailwindcss": "3.4.19",

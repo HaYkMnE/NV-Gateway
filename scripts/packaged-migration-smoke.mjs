@@ -23,11 +23,20 @@ export async function runPackagedMigrationSmoke({ root = path.resolve(import.met
   for (const forbidden of [...FORBIDDEN_ASAR_IDENTIFIERS, 'NVGW_PACKAGED_SMOKE_', 'NVGW_PACKAGED_TEST_', 'remote-debugging-port', 'remote-allow-origins']) assert.equal(asarSource.includes(forbidden), false, `FORBIDDEN_ASAR_IDENTIFIER:${forbidden}`);
   assert.equal(asarSource.includes('OPENCODE-PROVIDER') && asarSource.includes('nvidia.json'), true, 'FIXED_LEGACY_SOURCE_MISSING');
   assert.equal(asarSource.includes('opencode.json') && asarSource.includes('opencode.jsonc'), true, 'FIXED_OPENCODE_TARGET_MISSING');
-  const gatewaySource = fs.readFileSync(path.join(packageOutputDirectory, 'win-unpacked', 'resources', 'gateway', 'server.mjs'), 'utf8');
-  const sourceGateway = fs.readFileSync(path.join(root, 'src', 'gateway', 'server.mjs'), 'utf8');
-  assert.equal(gatewaySource, sourceGateway, 'PACKAGED_GATEWAY_SOURCE_STALE');
-  assert.equal(gatewaySource.includes('type: "ports:bound"'), true, 'BOUND_ATTESTATION_PROTOCOL_MISSING');
-  assert.equal(gatewaySource.includes('gatewayPort: PORT, adminPort: ADMIN_PORT'), true, 'BOUND_ATTESTATION_PORT_PAIR_MISSING');
+  // The engine ships as ONE minified bundle, so the old byte-equality against
+  // src/gateway/server.mjs is gone by design. The staleness property it guarded
+  // is preserved by comparing the packaged artifact to the CURRENT build output
+  // instead: a packaged bundle that lags a rebuild still fails here.
+  const gatewayDirectory = path.join(packageOutputDirectory, 'win-unpacked', 'resources', 'gateway');
+  const gatewaySource = fs.readFileSync(path.join(gatewayDirectory, 'server.mjs'), 'utf8');
+  const builtBundle = fs.readFileSync(path.join(root, 'build', 'gateway', 'server.mjs'), 'utf8');
+  assert.equal(gatewaySource, builtBundle, 'PACKAGED_GATEWAY_BUNDLE_STALE');
+  // Exactly one engine file is shipped: no sibling module may leak in.
+  assert.deepEqual(fs.readdirSync(gatewayDirectory), ['server.mjs'], 'PACKAGED_GATEWAY_NOT_A_SINGLE_BUNDLE');
+  // The bound-attestation protocol must survive minification. Identifier names
+  // are mangled, so the shape is matched instead of the pre-minified spelling.
+  assert.match(gatewaySource, /["']ports:bound["']/, 'BOUND_ATTESTATION_PROTOCOL_MISSING');
+  assert.match(gatewaySource, /gatewayPort:\s*\w+\s*,\s*adminPort:\s*\w+/, 'BOUND_ATTESTATION_PORT_PAIR_MISSING');
   return { executableExists: true, normalCodeHasNoEnvironmentMigrationOverride: true, normalCodeHasNoRemoteDebuggingBranch: true, fixedProductionPathsPresent: true, testSupportExcludedByPackagerRule: true, forbiddenIdentifiersAbsentFromAsar: true, testSupportAbsentFromAsar: true, packagedGatewayMatchesSource: true, boundAttestationProtocolPresent: true };
 }
 

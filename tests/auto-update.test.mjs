@@ -429,14 +429,17 @@ test('electron-builder wiring declares nsis+portable, env-macro publish, per-use
   assert.match(builder, /forceCodeSigning: false/, 'code signing stays disabled (accepted)');
   assert.match(builder, /signAndEditExecutable: true/, 'Phase 5 icon fix: executable signing+edit enabled');
 
-  // The extraResources payload (src/gateway + src/shared 13 files and the asset
-  // filter verified by tray-icons.test.mjs) must survive the edit byte-identically.
-  const extraResources = [
-    'extraResources:',
-    '  - from: src/gateway',
-    '    to: gateway',
-    '  - from: src/shared',
-    '    to: shared',
+  // The extraResources payload must survive the edit. The engine now ships as a
+  // prebuilt minified bundle (build/gateway -> gateway) rather than as readable
+  // sources, and src/shared is no longer shipped at all: its only runtime
+  // consumer was the engine and redaction.mjs is inlined into that bundle. Each
+  // mapping is asserted as a contiguous from/to pair (explanatory comments are
+  // allowed between entries), plus the asset filter verified by tray-icons.
+  const normalized = builder.replace(/\r\n/g, '\n');
+  assert.match(normalized, /^extraResources:$/m, 'extraResources section must remain');
+  assert.ok(normalized.includes('  - from: build/gateway\n    to: gateway\n'),
+    'the gateway bundle must be mapped to resources/gateway');
+  assert.ok(normalized.includes([
     '  - from: build/assets',
     '    to: assets',
     '    filter:',
@@ -444,8 +447,10 @@ test('electron-builder wiring declares nsis+portable, env-macro publish, per-use
     '      - tray-*.svg',
     '      - tray-*-16.png',
     '      - tray-*-32.png'
-  ].join('\n');
-  assert.ok(builder.replace(/\r\n/g, '\n').includes(extraResources), 'extraResources block must stay intact after adding targets/publish');
+  ].join('\n')), 'the asset mapping and its filter must stay intact');
+  // Readable engine sources must NOT be shipped, in any mapping.
+  assert.equal(/^\s+- from: src\/gateway$/m.test(normalized), false, 'src/gateway must never be shipped as sources');
+  assert.equal(/^\s+- from: src\/shared$/m.test(normalized), false, 'src/shared must no longer be shipped');
 });
 
 test('packaging entry points are guarded by the env-aware electron-builder wrapper', () => {

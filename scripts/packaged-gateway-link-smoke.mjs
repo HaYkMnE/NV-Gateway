@@ -31,6 +31,11 @@ export function runPackagedGatewayLinkSmoke({
   assert.equal(proof.linked, true, 'PACKAGED_GATEWAY_LINK_INCOMPLETE');
   assert.equal(proof.evaluated, false, 'PACKAGED_GATEWAY_LINK_EVALUATED');
   assert.equal(proof.listenerCreated, false, 'PACKAGED_GATEWAY_LISTENER_CREATED');
+  // The engine ships as ONE self-contained bundle: every former sibling module
+  // is inlined, so exactly one on-disk file may take part in the link. This
+  // replaces the old "the whole 21-file graph resolves" invariant with the
+  // stronger property that there is no graph left to ship.
+  assert.equal(proof.fileModuleCount, 1, `PACKAGED_GATEWAY_NOT_A_SINGLE_BUNDLE:${proof.fileModuleCount}`);
   return proof;
 }
 
@@ -141,7 +146,12 @@ export async function linkPackagedGatewayModules(entryPath, { fileSystem = fs, s
     return getModule(new URL(specifier, referencingModule.identifier).href);
   });
 
-  return { entry: entry.identifier, linked: entry.status === 'linked', evaluated: false, listenerCreated: false, moduleCount: modules.size };
+  // `moduleCount` counts EVERY linked module, node: builtins included.
+  // `fileModuleCount` counts only on-disk engine files, which is what the
+  // single-bundle invariant is about (builtins are irreducible and vary with
+  // the engine's imports, so they must not be part of that assertion).
+  const fileModuleCount = [...modules.keys()].filter((identifier) => !identifier.startsWith('node:')).length;
+  return { entry: entry.identifier, linked: entry.status === 'linked', evaluated: false, listenerCreated: false, moduleCount: modules.size, fileModuleCount };
 }
 
 if (process.argv[2] === childMode) {

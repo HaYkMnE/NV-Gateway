@@ -20,9 +20,11 @@ const EXPECTED_FILES_RULES = [
   'build/renderer/**/*',
   'package.json'
 ];
+// The gateway engine ships as a prebuilt minified bundle (build/gateway), not as
+// readable sources. src/shared is no longer shipped at all: its only runtime
+// consumer was the engine, and redaction.mjs is now inlined into that bundle.
 const EXPECTED_EXTRA_RESOURCE_RULES = [
-  'src/gateway -> gateway',
-  'src/shared -> shared',
+  'build/gateway -> gateway',
   'build/assets -> assets'
 ];
 
@@ -65,7 +67,7 @@ export function deriveScannedRoots(root) {
   assert.deepEqual(extractExtraResources(builder), EXPECTED_EXTRA_RESOURCE_RULES, 'PACKAGING_EXTRA_RESOURCES_RULES_CHANGED');
   const roots = [
     'build/src/main', 'build/src/preload', 'build/renderer', 'package.json',
-    'src/gateway', 'src/shared', 'build/assets'
+    'build/gateway', 'build/assets'
   ];
   for (const relative of roots) assert.equal(fs.existsSync(path.join(root, relative)), true, `PACKAGING_PAYLOAD_MISSING:${relative}`);
   return roots;
