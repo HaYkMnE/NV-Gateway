@@ -31,6 +31,8 @@ export interface GatewayLifecycleOptions {
   shutdownTimeoutMs?: number;
   /** Forced termination wait after graceful shutdown; production default is 3 seconds. */
   forcedShutdownTimeoutMs?: number;
+  /** Co-operative ipc shutdown wait, tried before signals; production default is 1 second. */
+  ipcShutdownGraceMs?: number;
   stdioLogPath?: string;
   workingDirectory?: string;
   afterOwnerRecordWrite?: (child: ChildProcess) => void | Promise<void>;
@@ -51,6 +53,15 @@ const MAX_STDIO_FILE_SIZE = 5 * 1024 * 1024; // 5MB
 const MAX_STDIO_ROTATED_FILES = 3;
 const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 3_000;
 const FORCED_SHUTDOWN_TIMEOUT_MS = 3_000;
+/**
+ * Grace granted to a co-operative ipc shutdown request before falling back to
+ * signals. Deliberately SHORT: it is added in front of the existing
+ * SIGTERM/SIGKILL escalation, so it must not stretch a managed stop. A child
+ * that honours the request flushes and exits well inside this window (it closes
+ * both listeners and disconnects); anything slower is treated as unresponsive
+ * and handled by the unchanged escalation below.
+ */
+const IPC_SHUTDOWN_GRACE_MS = 1_000;
 const STATE_INVALID_MESSAGE = "Gateway lifecycle state is invalid.";
 const MAX_GATEWAY_CREDENTIAL_LENGTH = 8_192;
 
@@ -67,6 +78,7 @@ export class GatewayLifecycle {
   private readonly startupTimeoutMs: number;
   private readonly shutdownTimeoutMs: number;
   private readonly forcedShutdownTimeoutMs: number;
+  private readonly ipcShutdownGraceMs: number;
   private readonly stdioLogPath: string;
   private readonly workingDirectory: string;
   private status: GatewayStatus = { state: "stopped" };
@@ -92,6 +104,7 @@ export class GatewayLifecycle {
     this.startupTimeoutMs = options.startupTimeoutMs ?? 10_000;
     this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? GRACEFUL_SHUTDOWN_TIMEOUT_MS;
     this.forcedShutdownTimeoutMs = options.forcedShutdownTimeoutMs ?? FORCED_SHUTDOWN_TIMEOUT_MS;
+    this.ipcShutdownGraceMs = options.ipcShutdownGraceMs ?? IPC_SHUTDOWN_GRACE_MS;
     this.stdioLogPath = options.stdioLogPath ?? "";
     this.workingDirectory = options.workingDirectory ?? process.cwd();
     this.afterOwnerRecordWrite = options.afterOwnerRecordWrite;
@@ -557,12 +570,39 @@ private async preflight(port: number): Promise<GatewayStatus | null> {
    */
   private async stopChild(child: ChildProcess): Promise<boolean> {
     if (child.exitCode !== null) return true;
+    // ASK before killing. On Windows child.kill("SIGTERM") is TerminateProcess:
+    // Node never runs the child's signal handlers, so its shutdown() — and the
+    // state flush inside it — never happened on a managed stop. A co-operative
+    // request over the already-bound ipc channel is the only way the child gets
+    // to flush. Everything below is the UNCHANGED escalation, so an
+    // unresponsive child is still guaranteed to die.
+    if (this.requestIpcShutdown(child)) {
+      if (await this.waitForChildExit(child, this.ipcShutdownGraceMs)) return true;
+    }
     if (!child.killed) {
       try { child.kill("SIGTERM"); } catch {}
     }
     if (await this.waitForChildExit(child, this.shutdownTimeoutMs)) return true;
     try { child.kill("SIGKILL"); } catch {}
     return this.waitForChildExit(child, this.forcedShutdownTimeoutMs);
+  }
+
+  /**
+   * Ask the child to shut down over ipc.
+   *
+   * @returns true only when the request is confirmed ON the channel, which is
+   * what earns the extra grace window. A missing/closed channel, a mocked
+   * `send` that confirms nothing, or a throw all return false so the caller
+   * proceeds straight to signals instead of waiting on a request that may never
+   * have been delivered.
+   */
+  private requestIpcShutdown(child: ChildProcess): boolean {
+    if (child.connected !== true || typeof child.send !== "function") return false;
+    try {
+      return child.send({ type: "shutdown" }) === true;
+    } catch {
+      return false;
+    }
   }
 
   private async waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {

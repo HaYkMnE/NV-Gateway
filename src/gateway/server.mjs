@@ -1678,15 +1678,41 @@ server.listen(PORT, "127.0.0.1", () => {
 
 process.on("message", (message) => {
     if (message?.type === "state:init") isReady = Boolean(LOCAL_TOKEN && ADMIN_TOKEN && server.listening && adminServer.listening);
+    // GRACEFUL STOP REQUEST from the parent. On Windows child.kill("SIGTERM")
+    // is TerminateProcess: Node never runs our signal handlers, so shutdown()
+    // — and with it the state flush — was silently skipped on every managed
+    // stop. The parent therefore ASKS over this already-bound ipc channel
+    // before falling back to signals. Carries no state and grants nothing, so
+    // it needs no challenge (only the parent can write to this pipe); the
+    // credential-bearing state:init path above keeps its challenge check.
+    else if (message?.type === "shutdown") shutdown();
 });
 
+// Parent vanished (crash, or the channel was closed): flush anyway rather than
+// waiting to be killed with unsaved state.
+process.on("disconnect", shutdown);
+
+let shuttingDown = false;
 function shutdown() {
+    // Idempotent: an ipc shutdown request, a disconnect and a delivered signal
+    // can all arrive for the SAME stop (disconnecting below re-enters here).
+    if (shuttingDown) return;
+    shuttingDown = true;
     info("Gateway shutting down", { graceful: true });
     // Flush remaining log buffer before exit
     flushState();
     flushLogs();
     server.close();
     adminServer.close();
+    // Nothing above releases the event loop: both listeners may still hold
+    // keep-alive sockets and the ipc channel is itself a ref'd handle, so the
+    // child would linger until the parent's SIGKILL. Release both so the exit
+    // is prompt and the parent's short grace is enough — the flush is already
+    // durable by this point, and anything destroyed here would have died at
+    // SIGKILL moments later anyway.
+    server.closeAllConnections?.();
+    adminServer.closeAllConnections?.();
+    try { if (process.connected) process.disconnect(); } catch {}
 }
 
 process.once("SIGTERM", shutdown);

@@ -30,7 +30,20 @@ let keys = [];
 let saveTimer = null;
 let persistAdapter = (state) => {
   if (typeof process.send !== "function") throw new Error("Private persistence channel is unavailable.");
-  process.send({ type: "state:persist", state });
+  // The parent may already be gone: a deliberate disconnect on a graceful stop,
+  // or a parent crash. `process.send` stays a function after the channel closes,
+  // so writing anyway emits an unhandled 'error' (EPIPE) ON THE PROCESS and
+  // kills the child mid-shutdown — costing it the remaining flushes. With no
+  // channel there is no way to persist the projection, so skipping is the only
+  // honest option; the file-based affinity cache still flushes independently.
+  if (process.connected !== true) return;
+  // The CALLBACK is load-bearing, not decoration: process.send is ASYNCHRONOUS,
+  // so a failed write (EPIPE, when the parent disconnects a tick later) is NOT
+  // thrown — with no callback Node emits it as an 'error' event ON THE PROCESS,
+  // which is unhandled and kills the child mid-shutdown, costing the remaining
+  // flushes. Supplying a callback routes that error here instead. try/catch is
+  // kept for the synchronous failure modes only.
+  try { process.send({ type: "state:persist", state }, () => { /* delivery failure is terminal-only */ }); } catch { /* channel closed mid-write */ }
 };
 
 function normalize(state) {
@@ -86,7 +99,10 @@ export function saveState() {
 // call sites and neither leaves a timer holding the process alive:
 //   flushState        -> land queued affinity changes on disk (durability)
 //   closeStateWatcher -> only stop holding a timer, matching its saveTimer role
-export function flushState() { if (saveTimer) clearTimeout(saveTimer); saveTimer = null; saveState(); flushAffinity(); }
+// flushAffinity() sits in a `finally`: the two persistence paths are
+// INDEPENDENT (ipc projection vs local JSON cache), so a failing projection
+// must not cost the affinity flush. The throw still propagates unchanged.
+export function flushState() { if (saveTimer) clearTimeout(saveTimer); saveTimer = null; try { saveState(); } finally { flushAffinity(); } }
 export function closeStateWatcher() { if (saveTimer) clearTimeout(saveTimer); saveTimer = null; closeAffinityPersistence(); }
 export function getKeys() { return keys; }
 

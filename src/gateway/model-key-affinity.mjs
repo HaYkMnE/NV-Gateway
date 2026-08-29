@@ -536,7 +536,8 @@ export function snapshotAffinity() {
 }
 
 /**
- * Reset all routing state. Used by tests and at gateway-child startup; the next
+ * Reset all routing state. Used by TESTS only — the gateway child does not call
+ * this at startup; it lazily loads the cache on first access instead. The next
  * access re-loads from disk, which is exactly what a process restart does.
  * Pass `cachePath: null` for memory-only routing.
  *
