@@ -13,7 +13,10 @@ const root = path.resolve(import.meta.dirname, '..');
 const built = (name) => pathToFileURL(path.join(root, 'build', 'src', 'main', name)).href;
 const testSupport = (name) => pathToFileURL(path.join(root, 'build', 'src', 'test-support', name)).href;
 const sandboxRoot = os.tmpdir();
-const tempRoot = fs.mkdtempSync(path.join(sandboxRoot, `nvgw-final-migration-${process.pid}-`));
+// realpathSync.native expands Windows 8.3 short names (CI runner TEMP is
+// C:\Users\RUNNER~1\...) while plain realpathSync does not. Normalize the
+// fixture root up front so both resolvers agree on the same long-form path.
+const tempRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(sandboxRoot, `nvgw-final-migration-${process.pid}-`)));
 test.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
 
 const fakeCredentials = Object.freeze({ gatewayToken: 'fake-gateway-token-not-real', adminToken: 'fake-admin-token-not-real' });
