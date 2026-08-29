@@ -67,6 +67,13 @@ export const MAX_MODEL_COOLDOWN_MS = 300 * 1000;
 /** Persistent-cache payload format. */
 export const AFFINITY_CACHE_FORMAT_VERSION = 1;
 
+/**
+ * Debounce window for deferred cache writes. 5s matches the `saveTimer`
+ * precedent in rotation.mjs (markKeyUsedAndDebounceSave) so both of the
+ * gateway's persistence paths coalesce on the same cadence.
+ */
+export const AFFINITY_PERSIST_DEBOUNCE_MS = 5_000;
+
 /** Cache file name used when derived from the gateway's APPDATA state dir. */
 const CACHE_FILENAME = "model-key-affinity.json";
 
@@ -94,6 +101,20 @@ let state = {
 };
 
 let ttlMs = AFFINITY_TTL_MS;
+
+/**
+ * Single coalescing timer for deferred writes, mirroring the `saveTimer`
+ * precedent in rotation.mjs (markKeyUsedAndDebounceSave): while one is armed,
+ * further requests ride on it instead of arming another.
+ * @type {NodeJS.Timeout | null}
+ */
+let persistTimer = null;
+
+/** True when memory holds changes not yet on disk. */
+let persistPending = false;
+
+/** Mutable so tests can shorten the window via resetAffinityState() (same pattern as ttlMs). */
+let persistDebounceMs = AFFINITY_PERSIST_DEBOUNCE_MS;
 
 // ---------------------------------------------------------------------------
 // Path resolution + persistence (mirrors capability-probe.mjs)
@@ -171,14 +192,22 @@ function ensureLoaded() {
 }
 
 /**
- * Write the current map to disk. Best-effort: a failure leaves the in-memory
- * routing fully functional. Only model ids, key UUIDs and timestamps are
- * written — never key material.
+ * Write the current map to disk IMMEDIATELY. Best-effort: a failure leaves the
+ * in-memory routing fully functional. Only model ids, key UUIDs and timestamps
+ * are written — never key material.
+ *
+ * Prefer {@link schedulePersistAffinity} on hot paths: this call is a synchronous
+ * writeFileSync + rename and must not run once per upstream failure.
+ *
  * @returns {void}
  */
 export function persistAffinity() {
     ensureLoaded();
     if (!state.cachePath) return;
+    // Disk is about to match memory, so any queued write is satisfied. Cleared
+    // up front: even if the write below fails, re-queueing is the scheduler's
+    // job, not a retry loop hidden in here.
+    persistPending = false;
     const payload = {
         version: AFFINITY_CACHE_FORMAT_VERSION,
         savedAt: new Date().toISOString(),
@@ -193,6 +222,82 @@ export function persistAffinity() {
     } catch {
         // Persistence is best-effort by design.
     }
+}
+
+/**
+ * Queue a deferred write, coalescing a burst into ONE disk write.
+ *
+ * Why this exists: {@link persistAffinity} is a synchronous writeFileSync +
+ * rename of a payload that can reach ~163 KB. Calling it once per rate-limit 429
+ * put that write on the FAILURE hot path — during a 429 wave (many models ×
+ * many keys) the gateway would issue a burst of synchronous file writes at
+ * precisely the moment it is already degrading, blocking the event loop.
+ *
+ * Mirrors the `saveTimer` precedent in rotation.mjs
+ * (markKeyUsedAndDebounceSave): one timer, {@link AFFINITY_PERSIST_DEBOUNCE_MS}
+ * apart, and while it is armed every further request simply rides on it.
+ *
+ * The timer is `unref`'d so a queued cache write can never hold the gateway
+ * child — or a test runner — alive. Durability comes from
+ * {@link flushAffinity} on the shutdown path instead, so a graceful stop always
+ * lands the data; an ungraceful kill forfeits at most one debounce window of
+ * cooldown marks, which are short-lived rate-limit hints (20s cooldowns under a
+ * 15-minute TTL), never authoritative state.
+ *
+ * @returns {void}
+ */
+export function schedulePersistAffinity() {
+    ensureLoaded();
+    if (!state.cachePath) return; // memory-only: nothing to write, nothing to arm
+    persistPending = true;
+    if (persistTimer) return; // coalesce onto the already-armed timer
+    persistTimer = setTimeout(() => {
+        persistTimer = null;
+        if (persistPending) persistAffinity();
+    }, persistDebounceMs);
+    persistTimer.unref?.();
+}
+
+/**
+ * Write any queued changes NOW and drop the timer. Shutdown counterpart of
+ * {@link schedulePersistAffinity}, mirroring flushState() in rotation.mjs.
+ *
+ * Unlike flushState — which always writes — this writes only when something is
+ * actually queued, so a shutdown that changed nothing does not create or rewrite
+ * the cache file.
+ *
+ * @returns {void}
+ */
+export function flushAffinity() {
+    if (persistTimer) clearTimeout(persistTimer);
+    persistTimer = null;
+    if (persistPending) persistAffinity();
+}
+
+/**
+ * Drop the timer WITHOUT writing, mirroring closeStateWatcher() in rotation.mjs.
+ * Used where the goal is only to stop holding a timer.
+ * @returns {void}
+ */
+export function closeAffinityPersistence() {
+    if (persistTimer) clearTimeout(persistTimer);
+    persistTimer = null;
+}
+
+/**
+ * Persistence bookkeeping, for tests and diagnostics.
+ *
+ * `timerHasRef` is false for an armed timer because it is unref'd: a queued
+ * cache write must never be the reason a process stays alive.
+ *
+ * @returns {{ pending: boolean, timerArmed: boolean, timerHasRef: boolean }}
+ */
+export function affinityPersistState() {
+    return {
+        pending: persistPending,
+        timerArmed: persistTimer !== null,
+        timerHasRef: persistTimer !== null && persistTimer.hasRef?.() === true
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -435,13 +540,21 @@ export function snapshotAffinity() {
  * access re-loads from disk, which is exactly what a process restart does.
  * Pass `cachePath: null` for memory-only routing.
  *
- * @param {{ cachePath?: string | null, ttlMs?: number }} [overrides]
+ * @param {{ cachePath?: string | null, ttlMs?: number, persistDebounceMs?: number }} [overrides]
  * @returns {void}
  */
 export function resetAffinityState(overrides = {}) {
+    // Drop any armed timer WITHOUT writing: the state it would have persisted is
+    // being discarded on the next line, so writing it would be meaningless — and
+    // a surviving timer would fire against freshly reset state.
+    closeAffinityPersistence();
+    persistPending = false;
     assignments.clear();
     cooldowns.clear();
     ttlMs = Number.isSafeInteger(overrides.ttlMs) && overrides.ttlMs > 0 ? overrides.ttlMs : AFFINITY_TTL_MS;
+    persistDebounceMs = Number.isSafeInteger(overrides.persistDebounceMs) && overrides.persistDebounceMs > 0
+        ? overrides.persistDebounceMs
+        : AFFINITY_PERSIST_DEBOUNCE_MS;
     state = {
         // Explicit null ⇒ memory-only; undefined ⇒ derive from env once.
         cachePath: overrides.cachePath !== undefined ? overrides.cachePath : resolveAffinityCachePath(),

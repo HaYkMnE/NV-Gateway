@@ -1,12 +1,14 @@
 import crypto from "node:crypto";
 import { info, warn } from "./logger.mjs";
 import {
+  closeAffinityPersistence,
   countEligibleKeys,
+  flushAffinity,
   getModelCooldownRemainingSeconds,
   markRateLimited,
-  persistAffinity,
   pruneExpired,
   recordAssignment,
+  schedulePersistAffinity,
   selectKeyForModel
 } from "./model-key-affinity.mjs";
 
@@ -79,8 +81,13 @@ export function saveState() {
   }));
   persistAdapter({ keys: projection });
 }
-export function flushState() { if (saveTimer) clearTimeout(saveTimer); saveTimer = null; saveState(); }
-export function closeStateWatcher() { if (saveTimer) clearTimeout(saveTimer); saveTimer = null; }
+// Shutdown counterparts. Each also settles the DEBOUNCED affinity-cache write
+// (schedulePersistAffinity), so both persistence paths are handled at the same
+// call sites and neither leaves a timer holding the process alive:
+//   flushState        -> land queued affinity changes on disk (durability)
+//   closeStateWatcher -> only stop holding a timer, matching its saveTimer role
+export function flushState() { if (saveTimer) clearTimeout(saveTimer); saveTimer = null; saveState(); flushAffinity(); }
+export function closeStateWatcher() { if (saveTimer) clearTimeout(saveTimer); saveTimer = null; closeAffinityPersistence(); }
 export function getKeys() { return keys; }
 
 export function getSoonestActiveCooldownRemainingSeconds() {
@@ -196,7 +203,11 @@ export function handleKeyError(id, statusCode, responseBody, retryAfterSeconds, 
     // MODEL-SCOPED: this key stays immediately usable by every other model.
     backoffMs = Math.min(MAX_BACKOFF_MS, Math.max(0, backoffMs || MAX_KEY_COOLDOWN_429_MS));
     markRateLimited(modelId, id, { cooldownMs: backoffMs });
-    persistAffinity();
+    // DEBOUNCED, never a synchronous write here: this is the failure hot path,
+    // and a 429 wave (many models × many keys) would otherwise issue a burst of
+    // writeFileSync calls exactly while the gateway is already degrading.
+    // flushAffinity() on shutdown is what makes the deferred write durable.
+    schedulePersistAffinity();
   }
   else if (statusCode === 429 || statusCode >= 500) {
     backoffMs ||= statusCode === 429 ? MAX_KEY_COOLDOWN_429_MS : 10000;
