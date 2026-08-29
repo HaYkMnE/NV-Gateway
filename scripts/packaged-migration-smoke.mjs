@@ -23,16 +23,30 @@ export async function runPackagedMigrationSmoke({ root = path.resolve(import.met
   for (const forbidden of [...FORBIDDEN_ASAR_IDENTIFIERS, 'NVGW_PACKAGED_SMOKE_', 'NVGW_PACKAGED_TEST_', 'remote-debugging-port', 'remote-allow-origins']) assert.equal(asarSource.includes(forbidden), false, `FORBIDDEN_ASAR_IDENTIFIER:${forbidden}`);
   assert.equal(asarSource.includes('OPENCODE-PROVIDER') && asarSource.includes('nvidia.json'), true, 'FIXED_LEGACY_SOURCE_MISSING');
   assert.equal(asarSource.includes('opencode.json') && asarSource.includes('opencode.jsonc'), true, 'FIXED_OPENCODE_TARGET_MISSING');
-  // The engine ships as ONE minified bundle, so the old byte-equality against
-  // src/gateway/server.mjs is gone by design. The staleness property it guarded
-  // is preserved by comparing the packaged artifact to the CURRENT build output
-  // instead: a packaged bundle that lags a rebuild still fails here.
-  const gatewayDirectory = path.join(packageOutputDirectory, 'win-unpacked', 'resources', 'gateway');
-  const gatewaySource = fs.readFileSync(path.join(gatewayDirectory, 'server.mjs'), 'utf8');
+  // The engine now ships INSIDE app.asar, so it is read out of the ARCHIVE
+  // rather than from resources/. That location change is the security fix: while
+  // the engine sat in resources/gateway it was OUTSIDE the ASAR integrity
+  // envelope, so a substituted — still functional — engine ran unnoticed, and the
+  // engine receives the user's NVIDIA keys in the clear over IPC.
+  // The staleness property is unchanged: the shipped bytes are compared to the
+  // CURRENT build output, so a packaged bundle that lags a rebuild still fails.
+  const stripLeadingSeparators = (entry) => entry.replace(/^[\\/]+/, '');
+  const toPosix = (entry) => entry.replace(/\\/g, '/');
+  const engineEntries = archiveContents
+    .map(stripLeadingSeparators)
+    .filter((entry) => toPosix(entry).startsWith('build/gateway/'));
+  // Exactly one engine file inside the archive: no sibling module may leak in.
+  assert.deepEqual(engineEntries.map(toPosix), ['build/gateway/server.mjs'], 'PACKAGED_GATEWAY_NOT_A_SINGLE_BUNDLE');
+  const gatewaySource = extractFile(archive, engineEntries[0]).toString('utf8');
   const builtBundle = fs.readFileSync(path.join(root, 'build', 'gateway', 'server.mjs'), 'utf8');
   assert.equal(gatewaySource, builtBundle, 'PACKAGED_GATEWAY_BUNDLE_STALE');
-  // Exactly one engine file is shipped: no sibling module may leak in.
-  assert.deepEqual(fs.readdirSync(gatewayDirectory), ['server.mjs'], 'PACKAGED_GATEWAY_NOT_A_SINGLE_BUNDLE');
+  // The old integrity-UNCOVERED location must be gone for good: anything
+  // executable left in resources/ could be swapped without detection.
+  assert.equal(
+    fs.existsSync(path.join(packageOutputDirectory, 'win-unpacked', 'resources', 'gateway')),
+    false,
+    'PACKAGED_GATEWAY_STILL_OUTSIDE_ASAR'
+  );
   // The bound-attestation protocol must survive minification. Identifier names
   // are mangled, so the shape is matched instead of the pre-minified spelling.
   assert.match(gatewaySource, /["']ports:bound["']/, 'BOUND_ATTESTATION_PROTOCOL_MISSING');

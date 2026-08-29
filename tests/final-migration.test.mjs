@@ -1252,15 +1252,30 @@ test('main and shared redactors remove explicit gateway/admin/local credential n
   }
 });
 
-test('package layout resolves every relative gateway import after --dir packaging', () => {
+test('packaged gateway layout is self-contained inside app.asar after --dir packaging', async () => {
+  // BEFORE: the engine shipped to resources/gateway, so this walked those .mjs
+  // files and checked each relative import resolved on disk.
+  // NOW: the engine ships INSIDE app.asar (ASAR integrity only covers the
+  // archive), so the bytes are read from the archive and the invariant is
+  // STRONGER — a bundled engine must have NO relative imports left to resolve.
+  // Written as an assertion rather than an early return so the move cannot make
+  // this test silently vacuous.
   const resources = path.join(root, 'dist', 'win-unpacked', 'resources');
-  const gateway = path.join(resources, 'gateway');
-  if (!fs.existsSync(path.join(gateway, 'server.mjs'))) return;
-  for (const name of fs.readdirSync(gateway).filter((entry) => entry.endsWith('.mjs'))) {
-    const file = path.join(gateway, name);
-    const source = fs.readFileSync(file, 'utf8');
-    for (const match of source.matchAll(/from\s+["'](\.{1,2}\/[^"']+)["']/g)) {
-      assert.equal(fs.existsSync(path.resolve(path.dirname(file), match[1])), true, `${name} -> ${match[1]}`);
-    }
-  }
+  const archive = path.join(resources, 'app.asar');
+  if (!fs.existsSync(archive)) return;
+  const { extractFile, listPackage } = await import('@electron/asar');
+
+  // @electron/asar addresses entries by the NATIVE separator on Windows, so the
+  // raw form is kept for extractFile and only the ASSERTION is normalised to
+  // posix. A posix path makes extractFile throw "was not found in this archive".
+  const toPosix = (entry) => entry.replace(/\\/g, '/');
+  const engine = listPackage(archive, {})
+    .map((entry) => entry.replace(/^[\\/]+/, ''))
+    .filter((entry) => toPosix(entry).startsWith('build/gateway/'));
+  assert.deepEqual(engine.map(toPosix), ['build/gateway/server.mjs'], 'the engine must be a single archive entry');
+  assert.equal(fs.existsSync(path.join(resources, 'gateway')), false, 'resources/gateway must be gone');
+
+  const source = extractFile(archive, engine[0]).toString('utf8');
+  const relativeImports = [...source.matchAll(/from\s*["'](\.{1,2}\/[^"']+)["']/g)].map((match) => match[1]);
+  assert.deepEqual(relativeImports, [], 'a bundled engine must carry no relative imports');
 });

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
+import { createPackage } from '@electron/asar';
 import { linkPackagedGatewayModules, runPackagedGatewayLinkSmoke } from '../scripts/packaged-gateway-link-smoke.mjs';
 
 const fixturePrefix = `nvgw-packaged-gateway-link-${process.pid}-`;
@@ -287,24 +288,47 @@ test('canonical aliases share exactly one module identity in a static ESM cycle 
   }
 });
 
-test('regression: a mixed packaged gateway module set fails ESM linking before server evaluation', () => {
+/**
+ * Build a fake packaged output whose engine lives INSIDE app.asar, which is where
+ * it now ships: ASAR integrity validation only covers the archive, so the former
+ * resources/gateway location was outside the integrity envelope. The fixtures
+ * therefore package their engine files rather than writing them to resources/.
+ *
+ * @param {Record<string, string>} engineFiles relative name -> source
+ * @returns {Promise<{ fixture: string, packageOutputDirectory: string }>}
+ */
+async function createPackagedEngineFixture(engineFiles) {
   const fixture = createFixture();
-  const gateway = path.join(fixture, 'dist', 'win-unpacked', 'resources', 'gateway');
-  const server = path.join(gateway, 'server.mjs');
-  try {
-    fs.mkdirSync(gateway, { recursive: true });
-    fs.writeFileSync(server, [
+  const source = path.join(fixture, 'source');
+  const gateway = path.join(source, 'build', 'gateway');
+  fs.mkdirSync(gateway, { recursive: true });
+  for (const [name, contents] of Object.entries(engineFiles)) {
+    fs.writeFileSync(path.join(gateway, name), contents, 'utf8');
+  }
+  const archive = path.join(fixture, 'dist', 'win-unpacked', 'resources', 'app.asar');
+  fs.mkdirSync(path.dirname(archive), { recursive: true });
+  await createPackage(source, archive);
+  return { fixture, packageOutputDirectory: path.join(fixture, 'dist') };
+}
+
+test('regression: a mixed packaged gateway module set fails ESM linking before server evaluation', async () => {
+  // Unchanged property: a server whose sibling does not provide the imported
+  // binding must fail at LINK time, before any evaluation. Only the location
+  // changed — the modules are now archive entries instead of files in resources/.
+  const { fixture, packageOutputDirectory } = await createPackagedEngineFixture({
+    'server.mjs': [
       'import http from "node:http";',
       'import { capResponseHeaders } from "./proxy-headers.mjs";',
       'process.stdout.write("UNEXPECTED_SERVER_EVALUATION\\n");',
       'http.createServer().listen(18765);',
       'export { capResponseHeaders };'
-    ].join('\n'), 'utf8');
-    fs.writeFileSync(path.join(gateway, 'proxy-headers.mjs'), 'export function sanitizeProxyHeaders() {}\n', 'utf8');
-
+    ].join('\n'),
+    'proxy-headers.mjs': 'export function sanitizeProxyHeaders() {}\n'
+  });
+  try {
     let thrown;
     try {
-      runPackagedGatewayLinkSmoke({ packageOutputDirectory: path.join(fixture, 'dist') });
+      runPackagedGatewayLinkSmoke({ packageOutputDirectory });
     } catch (error) {
       thrown = error;
     }
@@ -316,22 +340,42 @@ test('regression: a mixed packaged gateway module set fails ESM linking before s
   }
 });
 
-test('package graph audit links a server without evaluating its listener startup code', () => {
-  const fixture = createFixture();
-  const gateway = path.join(fixture, 'dist', 'win-unpacked', 'resources', 'gateway');
-  try {
-    fs.mkdirSync(gateway, { recursive: true });
-    fs.writeFileSync(path.join(gateway, 'server.mjs'), [
+test('package graph audit links a server without evaluating its listener startup code', async () => {
+  const { fixture, packageOutputDirectory } = await createPackagedEngineFixture({
+    'server.mjs': [
       'import http from "node:http";',
       'process.stdout.write("UNEXPECTED_SERVER_EVALUATION\\n");',
       'http.createServer().listen(18765);',
       'export const linked = true;'
-    ].join('\n'), 'utf8');
-
-    const proof = runPackagedGatewayLinkSmoke({ packageOutputDirectory: path.join(fixture, 'dist') });
+    ].join('\n')
+  });
+  try {
+    const proof = runPackagedGatewayLinkSmoke({ packageOutputDirectory });
     assert.equal(proof.linked, true);
     assert.equal(proof.evaluated, false);
     assert.equal(proof.listenerCreated, false);
+    // New: the engine was audited FROM the archive, which is what integrity covers.
+    assert.equal(proof.asarEntry, 'build/gateway/server.mjs');
+    assert.equal(proof.integrityCovered, true);
+  } finally {
+    removeFixture(fixture);
+  }
+});
+
+test('the link audit refuses a packaged output whose engine sits OUTSIDE app.asar', async () => {
+  // Direct regression guard for the closed hole: an engine in resources/gateway is
+  // not covered by ASAR integrity, so the audit must reject that layout outright.
+  const { fixture, packageOutputDirectory } = await createPackagedEngineFixture({
+    'server.mjs': 'export const linked = true;\n'
+  });
+  try {
+    const stray = path.join(packageOutputDirectory, 'win-unpacked', 'resources', 'gateway');
+    fs.mkdirSync(stray, { recursive: true });
+    fs.writeFileSync(path.join(stray, 'server.mjs'), 'export const substituted = true;\n', 'utf8');
+    assert.throws(
+      () => runPackagedGatewayLinkSmoke({ packageOutputDirectory }),
+      /PACKAGED_GATEWAY_STILL_OUTSIDE_ASAR/
+    );
   } finally {
     removeFixture(fixture);
   }

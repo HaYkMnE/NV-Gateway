@@ -437,8 +437,15 @@ test('electron-builder wiring declares nsis+portable, env-macro publish, per-use
   // allowed between entries), plus the asset filter verified by tray-icons.
   const normalized = builder.replace(/\r\n/g, '\n');
   assert.match(normalized, /^extraResources:$/m, 'extraResources section must remain');
-  assert.ok(normalized.includes('  - from: build/gateway\n    to: gateway\n'),
-    'the gateway bundle must be mapped to resources/gateway');
+  // The engine bundle ships INSIDE app.asar (a `files` entry), because ASAR
+  // integrity validation only covers the archive. It used to be mapped as an
+  // extraResource, i.e. outside that envelope, where a substituted engine ran
+  // undetected. Both halves are asserted: present in `files`, absent from
+  // `extraResources`.
+  assert.ok(normalized.includes('  - build/gateway/**/*\n'),
+    'the gateway bundle must be packed into app.asar via the files section');
+  assert.equal(/^\s+- from: build\/gateway$/m.test(normalized), false,
+    'the engine must NOT be mapped as an extraResource: that is outside ASAR integrity');
   assert.ok(normalized.includes([
     '  - from: build/assets',
     '    to: assets',

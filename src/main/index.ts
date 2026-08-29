@@ -87,8 +87,17 @@ function migrationPhaseAuditPath(): string {
   return path.join(app.getPath("appData"), "NV-Gateway", "logs", "migration-phase.jsonl");
 }
 function getGatewayServerPath(): string {
+  // PACKAGED: inside app.asar (app.getAppPath() IS the archive), so the engine
+  // is covered by ASAR integrity validation. It used to live in
+  // process.resourcesPath/gateway, which is OUTSIDE the archive and therefore
+  // outside the integrity envelope — a substituted engine ran unnoticed, and the
+  // engine is handed the user's NVIDIA keys in the clear over IPC.
+  // Electron patches fs and the module loaders with asar support in both the main
+  // process and ELECTRON_RUN_AS_NODE children, so the existsSync check below and
+  // spawning this path as the child's entry script both work unchanged.
+  // DEV: unchanged — the readable sources, so `npm run dev` is unaffected.
   return app.isPackaged
-    ? path.join(process.resourcesPath, "gateway", "server.mjs")
+    ? path.join(app.getAppPath(), "build", "gateway", "server.mjs")
     : path.join(app.getAppPath(), "src", "gateway", "server.mjs");
 }
 

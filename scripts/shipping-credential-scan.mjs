@@ -18,13 +18,16 @@ const EXPECTED_FILES_RULES = [
   '!build/src/test-support/**/*',
   'build/src/preload/**/*',
   'build/renderer/**/*',
+  // The engine bundle moved INTO app.asar so ASAR integrity validation covers
+  // it; it used to be an extraResource, i.e. outside the integrity envelope.
+  'build/gateway/**/*',
   'package.json'
 ];
-// The gateway engine ships as a prebuilt minified bundle (build/gateway), not as
-// readable sources. src/shared is no longer shipped at all: its only runtime
-// consumer was the engine, and redaction.mjs is now inlined into that bundle.
+// Only inert image assets ship OUTSIDE app.asar now. The engine bundle moved into
+// the archive (see EXPECTED_FILES_RULES) so ASAR integrity validation covers it,
+// and src/shared is not shipped at all — redaction.mjs is inlined into the bundle.
+// Nothing executable is left in resources/.
 const EXPECTED_EXTRA_RESOURCE_RULES = [
-  'build/gateway -> gateway',
   'build/assets -> assets'
 ];
 

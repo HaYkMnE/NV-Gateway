@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { extractFile, listPackage } from '@electron/asar';
 
 const childMode = '--link-only';
 
@@ -11,32 +13,71 @@ export function runPackagedGatewayLinkSmoke({
   packageOutputDirectory = process.env.NVGW_PACKAGE_OUTPUT_DIRECTORY || path.join(root, 'dist'),
   nodePath = process.execPath
 } = {}) {
-  const gatewayDirectory = path.join(packageOutputDirectory, 'win-unpacked', 'resources', 'gateway');
-  const server = path.join(gatewayDirectory, 'server.mjs');
-  assert.equal(fs.existsSync(server), true, `PACKAGED_GATEWAY_SERVER_MISSING:${server}`);
+  const unpacked = path.join(packageOutputDirectory, 'win-unpacked');
+  const archive = path.join(unpacked, 'resources', 'app.asar');
+  assert.equal(fs.existsSync(archive), true, `PACKAGED_ASAR_MISSING:${archive}`);
 
-  const result = spawnSync(nodePath, ['--experimental-vm-modules', fileURLToPath(import.meta.url), childMode, server], {
-    encoding: 'utf8',
-    windowsHide: true,
-    env: {}
-  });
-  if (result.error) throw result.error;
-  if (result.status !== 0) {
-    const detail = (result.stderr || result.stdout || `exit=${result.status}`).trim();
-    throw new Error(`PACKAGED_GATEWAY_LINK_AUDIT_FAILED\n${detail}`);
+  // LOCATION INVARIANT (stronger than before): the engine must be an ARCHIVE
+  // ENTRY, because ASAR integrity validation only covers app.asar. The old
+  // resources/gateway location sat outside that envelope, so a substituted —
+  // still functional — engine ran with no complaint.
+  const stripLeadingSeparators = (entry) => entry.replace(/^[\\/]+/, '');
+  const toPosix = (entry) => entry.replace(/\\/g, '/');
+  const engineEntries = listPackage(archive, {})
+    .map(stripLeadingSeparators)
+    .filter((entry) => toPosix(entry).startsWith('build/gateway/'));
+  assert.ok(engineEntries.length > 0, 'PACKAGED_GATEWAY_ENGINE_NOT_IN_ASAR');
+  const entryRelative = engineEntries.find((entry) => toPosix(entry).endsWith('/server.mjs'));
+  assert.ok(entryRelative, 'PACKAGED_GATEWAY_SERVER_MISSING_IN_ASAR');
+  // The old integrity-UNCOVERED location must be gone: an executable file there
+  // could be swapped without detection, which is the hole this move closes.
+  assert.equal(fs.existsSync(path.join(unpacked, 'resources', 'gateway')), false, 'PACKAGED_GATEWAY_STILL_OUTSIDE_ASAR');
+
+  // Only Electron patches fs with asar support, so plain Node cannot read an
+  // archive member. The SHIPPED BYTES are therefore extracted verbatim and
+  // linked from a scratch copy: the property under test is the engine's CONTENT
+  // (it links as ESM, resolves to a single file, and creates no listener while
+  // linking), which extraction preserves byte-for-byte.
+  //
+  // EVERY engine entry is extracted, preserving its relative layout, so a
+  // would-be multi-module ship still reaches the LINKER and is judged by the
+  // module graph — rather than being rejected on a filename count before the
+  // graph is ever examined. The single-bundle assertions run after the link.
+  const scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nvgw-link-smoke-'));
+  const toScratch = (entry) => path.join(scratchRoot, ...toPosix(entry).split('/'));
+  const server = toScratch(entryRelative);
+  for (const entry of engineEntries) {
+    const target = toScratch(entry);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, extractFile(archive, entry));
   }
 
-  const proof = JSON.parse(result.stdout);
-  assert.equal(proof.entry, pathToFileURL(server).href, 'PACKAGED_GATEWAY_LINK_ENTRY_MISMATCH');
-  assert.equal(proof.linked, true, 'PACKAGED_GATEWAY_LINK_INCOMPLETE');
-  assert.equal(proof.evaluated, false, 'PACKAGED_GATEWAY_LINK_EVALUATED');
-  assert.equal(proof.listenerCreated, false, 'PACKAGED_GATEWAY_LISTENER_CREATED');
-  // The engine ships as ONE self-contained bundle: every former sibling module
-  // is inlined, so exactly one on-disk file may take part in the link. This
-  // replaces the old "the whole 21-file graph resolves" invariant with the
-  // stronger property that there is no graph left to ship.
-  assert.equal(proof.fileModuleCount, 1, `PACKAGED_GATEWAY_NOT_A_SINGLE_BUNDLE:${proof.fileModuleCount}`);
-  return proof;
+  try {
+    const result = spawnSync(nodePath, ['--experimental-vm-modules', fileURLToPath(import.meta.url), childMode, server], {
+      encoding: 'utf8',
+      windowsHide: true,
+      env: {}
+    });
+    if (result.error) throw result.error;
+    if (result.status !== 0) {
+      const detail = (result.stderr || result.stdout || `exit=${result.status}`).trim();
+      throw new Error(`PACKAGED_GATEWAY_LINK_AUDIT_FAILED\n${detail}`);
+    }
+
+    const proof = JSON.parse(result.stdout);
+    assert.equal(proof.entry, pathToFileURL(server).href, 'PACKAGED_GATEWAY_LINK_ENTRY_MISMATCH');
+    assert.equal(proof.linked, true, 'PACKAGED_GATEWAY_LINK_INCOMPLETE');
+    assert.equal(proof.evaluated, false, 'PACKAGED_GATEWAY_LINK_EVALUATED');
+    assert.equal(proof.listenerCreated, false, 'PACKAGED_GATEWAY_LISTENER_CREATED');
+    // The engine ships as ONE self-contained bundle: every former sibling module
+    // is inlined, so exactly one file may take part in the link. This replaces
+    // the old "the whole 21-file graph resolves" invariant with the stronger
+    // property that there is no graph left to ship.
+    assert.equal(proof.fileModuleCount, 1, `PACKAGED_GATEWAY_NOT_A_SINGLE_BUNDLE:${proof.fileModuleCount}`);
+    return { ...proof, asarEntry: toPosix(entryRelative), integrityCovered: true };
+  } finally {
+    fs.rmSync(scratchRoot, { recursive: true, force: true });
+  }
 }
 
 export async function linkPackagedGatewayModules(entryPath, { fileSystem = fs, sourceTextModuleFactory } = {}) {

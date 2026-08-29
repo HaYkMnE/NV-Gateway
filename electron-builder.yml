@@ -8,18 +8,18 @@ files:
   - "!build/src/test-support/**/*"
   - build/src/preload/**/*
   - build/renderer/**/*
+  # The gateway engine bundle ships INSIDE app.asar, not as an extraResource.
+  # This is the whole point: ASAR integrity validation (see the
+  # EnableEmbeddedAsarIntegrityValidation fuse) only covers app.asar. While the
+  # engine sat in resources/ it was outside that envelope, so a substituted —
+  # still functional — engine ran with no complaint, and it receives the user's
+  # NVIDIA keys in the clear over the state:init IPC channel. Inside the archive
+  # each entry carries a per-file integrity block, so tampering is refused.
+  - build/gateway/**/*
   - package.json
 extraResources:
-  # The gateway engine ships as ONE minified bundle (scripts/build-gateway-bundle.mjs),
-  # never as readable sources: an installed copy must not carry the engine's
-  # annotated source, whose comments document hard-won upstream behaviour.
-  # The packaged path stays resources/gateway/server.mjs, which is exactly what
-  # getGatewayServerPath() in src/main/index.ts resolves — so the spawn contract
-  # is unchanged. src/shared is deliberately NOT shipped: its only runtime
-  # consumer was the engine, and redaction.mjs is now inlined into the bundle
-  # (src/main has its own compiled ./redaction).
-  - from: build/gateway
-    to: gateway
+  # Only the tray/window icons ship outside the archive. They are inert image
+  # assets: nothing executable lives here any more.
   - from: build/assets
     to: assets
     filter:

@@ -5,6 +5,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { extractFile, listPackage } from '@electron/asar';
 
 const root = path.resolve(import.meta.dirname, '..');
 const bundlePath = path.join(root, 'build', 'gateway', 'server.mjs');
@@ -104,25 +105,37 @@ test('the built engine bundle contains none of the moat comments', () => {
   assert.deepEqual(leaked, [], `moat comments leaked into the shipped bundle: ${JSON.stringify(leaked)}`);
 });
 
-test('the packaged output ships no engine sources, only the bundle', (t) => {
-  const resources = path.join(root, 'dist', 'win-unpacked', 'resources');
+test('the packaged engine lives INSIDE app.asar and nothing executable is left in resources', (t) => {
+  const unpacked = path.join(root, 'dist', 'win-unpacked');
+  const resources = path.join(unpacked, 'resources');
   if (!fs.existsSync(resources)) {
     t.skip('no packaged output in this run (build:portable / package:dir produces it)');
     return;
   }
-  const gateway = path.join(resources, 'gateway');
-  assert.equal(fs.existsSync(gateway), true, 'resources/gateway must exist');
+  const archive = path.join(resources, 'app.asar');
+  assert.equal(fs.existsSync(archive), true, 'app.asar must exist');
 
-  // Exactly the bundle, nothing else.
-  assert.deepEqual(fs.readdirSync(gateway), ['server.mjs'],
-    'resources/gateway must hold the bundle alone');
-
-  // src/shared is no longer shipped: redaction.mjs is inlined into the bundle
-  // and src/main uses its own compiled ./redaction.
+  // THE FIX. Previously the engine shipped to resources/gateway/server.mjs,
+  // which is OUTSIDE app.asar and therefore outside the ASAR integrity envelope:
+  // a substituted — still functional — engine ran with no complaint, and the
+  // engine is handed the user's NVIDIA keys in the clear over IPC. It must now be
+  // an archive entry, where each entry carries a per-file integrity block.
+  // @electron/asar addresses entries by the NATIVE separator on Windows, so the
+  // raw form is kept for extractFile and only the ASSERTION is normalised to
+  // posix for readability. Passing a posix path to extractFile throws
+  // "was not found in this archive".
+  const toPosix = (entry) => entry.replace(/\\/g, '/');
+  const rawEntries = listPackage(archive, {}).map((entry) => entry.replace(/^[\\/]+/, ''));
+  const engineEntries = rawEntries.filter((entry) => toPosix(entry).startsWith('build/gateway/'));
+  assert.deepEqual(engineEntries.map(toPosix), ['build/gateway/server.mjs'],
+    'the engine must be exactly one entry inside app.asar');
+  assert.equal(fs.existsSync(path.join(resources, 'gateway')), false,
+    'resources/gateway must be gone: a file there is swappable without detection');
   assert.equal(fs.existsSync(path.join(resources, 'shared')), false,
-    'resources/shared must not be shipped any more');
+    'resources/shared must not be shipped');
 
-  // No engine module may appear anywhere under resources, under any name.
+  // Nothing executable may remain outside the archive at all. Counting .mjs is
+  // the direct regression guard for the old hole.
   const shipped = [];
   (function walk(directory) {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
@@ -131,13 +144,17 @@ test('the packaged output ships no engine sources, only the bundle', (t) => {
       else shipped.push(full);
     }
   })(resources);
+  assert.deepEqual(shipped.filter((file) => file.endsWith('.mjs')), [],
+    'no .mjs may ship outside app.asar');
   for (const moduleName of ENGINE_MODULES) {
     const hit = shipped.find((file) => path.basename(file) === moduleName);
-    assert.equal(hit, undefined, `engine source shipped in the package: ${hit}`);
+    assert.equal(hit, undefined, `engine source shipped outside the archive: ${hit}`);
   }
 
-  // And the packaged bundle carries no moat comments either.
-  const packaged = fs.readFileSync(path.join(gateway, 'server.mjs'), 'utf8');
+  // The moat guarantee still holds for the bytes that actually ship — now read
+  // out of the archive rather than off disk.
+  const packaged = extractFile(archive, engineEntries[0]).toString('utf8');
+  assert.equal(packaged, fs.readFileSync(bundlePath, 'utf8'), 'the archived engine must match the build output');
   const leaked = MOAT_MARKERS.filter((marker) => packaged.includes(marker));
   assert.deepEqual(leaked, [], `moat comments leaked into the package: ${JSON.stringify(leaked)}`);
 });
