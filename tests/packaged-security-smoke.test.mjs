@@ -111,10 +111,15 @@ test('fixture cleanup does not begin a retry after its deadline expires during t
 test('packaged security smoke harness exists and reports all required runtime assertions', async () => {
   const smoke = await import('../scripts/packaged-security-smoke.mjs');
   assert.equal(typeof smoke.runPackagedSecuritySmoke, 'function');
+  // The original ten static assertions are unchanged; five repackaging-defence
+  // assertions were ADDED (ASAR integrity fuses + embedded hash). Pinning the
+  // exact set keeps the guard: dropping any assertion fails this test.
   assert.deepEqual(smoke.REQUIRED_ASSERTIONS, [
     'exactPackagedUrl', 'nodeGlobalsHidden', 'preloadApiNarrow', 'cspBlocksInline',
     'cspBlocksEval', 'cspHasNoUnsafeInline', 'popupDenied', 'navigationDenied',
-    'permissionDenied', 'hashRouteIpcAllowed'
+    'permissionDenied', 'hashRouteIpcAllowed',
+    'asarIntegrityFuseEnabled', 'onlyLoadAppFromAsarFuseEnabled', 'runAsNodeFuseEnabled',
+    'asarIntegrityResourceEmbedded', 'asarIntegrityHashMatchesArchive'
   ]);
 });
 

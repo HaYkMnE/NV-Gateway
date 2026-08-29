@@ -27,6 +27,13 @@ extraResources:
       - tray-*.svg
       - tray-*-16.png
       - tray-*-32.png
+# Windows package hardening, applied to the packed directory BEFORE the nsis /
+# portable artifacts are produced from it, so the installer carries the hardened
+# executable. The hook embeds the ASAR integrity resource and then flips the two
+# integrity fuses — see scripts/harden-windows-package.mjs for why this cannot be
+# expressed as config on electron-builder 24 (no electronFuses block, and its
+# Windows branch never injects the hash).
+afterPack: scripts/harden-windows-package.mjs
 win:
   icon: build/assets/icon.png
   target:
