@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
-import { createPackage } from '@electron/asar';
+import { createPackage, uncacheAll } from '@electron/asar';
 import { linkPackagedGatewayModules, runPackagedGatewayLinkSmoke } from '../scripts/packaged-gateway-link-smoke.mjs';
 
 const fixturePrefix = `nvgw-packaged-gateway-link-${process.pid}-`;
@@ -289,6 +289,43 @@ test('canonical aliases share exactly one module identity in a static ESM cycle 
 });
 
 /**
+ * Cleanup for fixtures that PACKAGED an archive.
+ *
+ * @electron/asar caches an open view of every archive it touches, so on Windows
+ * the app.asar handle can outlive createPackage/listPackage/extractFile and make
+ * `rmdir` of the parent fail with ENOTEMPTY. uncacheAll() releases that view, and
+ * the bounded retry covers the residual close latency. This mirrors the existing
+ * precedent in packaged-security-smoke.test.mjs, whose cleanup needed the same
+ * treatment "after double packaging".
+ *
+ * Kept SEPARATE from the synchronous removeFixture on purpose: that one is itself
+ * under test (assert.throws on an unregistered root), so it must stay sync.
+ *
+ * @param {string} directory Fixture root to remove.
+ */
+async function removePackagedFixture(directory) {
+  const resolvedDirectory = path.resolve(directory);
+  if (!isFixtureOwnedRoot(resolvedDirectory)) {
+    throw new Error('Refusing to clean an unregistered test fixture root.');
+  }
+  uncacheAll();
+  try {
+    for (let attempt = 1; attempt <= 8; attempt += 1) {
+      try {
+        fs.rmSync(resolvedDirectory, { recursive: true, force: true });
+        return;
+      } catch (error) {
+        if (error?.code !== 'ENOTEMPTY' && error?.code !== 'EBUSY' && error?.code !== 'EPERM') throw error;
+        if (attempt === 8) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 25 * attempt));
+      }
+    }
+  } finally {
+    fixtureRoots.delete(resolvedDirectory);
+  }
+}
+
+/**
  * Build a fake packaged output whose engine lives INSIDE app.asar, which is where
  * it now ships: ASAR integrity validation only covers the archive, so the former
  * resources/gateway location was outside the integrity envelope. The fixtures
@@ -336,7 +373,7 @@ test('regression: a mixed packaged gateway module set fails ESM linking before s
     assert.match(thrown.message, /does not provide an export named ['"]capResponseHeaders['"]/);
     console.log('PACKAGED_GATEWAY_LINK_RED SyntaxError: requested module ./proxy-headers.mjs does not provide export named capResponseHeaders; evaluationSkipped=true');
   } finally {
-    removeFixture(fixture);
+    await removePackagedFixture(fixture);
   }
 });
 
@@ -358,7 +395,7 @@ test('package graph audit links a server without evaluating its listener startup
     assert.equal(proof.asarEntry, 'build/gateway/server.mjs');
     assert.equal(proof.integrityCovered, true);
   } finally {
-    removeFixture(fixture);
+    await removePackagedFixture(fixture);
   }
 });
 
@@ -377,6 +414,6 @@ test('the link audit refuses a packaged output whose engine sits OUTSIDE app.asa
       /PACKAGED_GATEWAY_STILL_OUTSIDE_ASAR/
     );
   } finally {
-    removeFixture(fixture);
+    await removePackagedFixture(fixture);
   }
 });

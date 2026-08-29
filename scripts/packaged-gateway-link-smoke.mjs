@@ -76,7 +76,11 @@ export function runPackagedGatewayLinkSmoke({
     assert.equal(proof.fileModuleCount, 1, `PACKAGED_GATEWAY_NOT_A_SINGLE_BUNDLE:${proof.fileModuleCount}`);
     return { ...proof, asarEntry: toPosix(entryRelative), integrityCovered: true };
   } finally {
-    fs.rmSync(scratchRoot, { recursive: true, force: true });
+    // Best-effort: this is scratch in the OS temp dir. On Windows a deletion can
+    // still be pending right after a child process read the files, and a throw
+    // from this `finally` would turn a PASSING audit into a failure — the audit
+    // verdict must not hinge on temp-dir cleanup.
+    try { fs.rmSync(scratchRoot, { recursive: true, force: true }); } catch { /* swept by the OS */ }
   }
 }
 
