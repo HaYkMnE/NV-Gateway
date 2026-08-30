@@ -30,6 +30,7 @@ import { createControlledStartupShutdown } from "./controlled-startup-shutdown";
 import { handleBeforeQuit } from "./before-quit-guard";
 import { createMigrationPhaseAudit } from "./migration-phase-audit";
 import { createTrayIconCache } from "./tray-icons";
+import { createWindowCloseGuard } from "./window-close-guard";
 import { buildApplicationMenu, buildContextMenu, getMenuStrings } from "./app-menu";
 import { saveFeedback, openGitHubIssue, type FeedbackData } from "./feedback-service";
 import { openExternalUrl } from "./external-open";
@@ -249,6 +250,9 @@ function appIconPath(): string {
 
 const trayIcons = createTrayIconCache({ resolveAssetsDir: trayAssetsDir, nativeImage });
 
+// Owns the "announce the first hide once" state for this process.
+const handleWindowClose = createWindowCloseGuard();
+
 function createTrayIcon(state?: string): Electron.NativeImage {
   return trayIcons(state) as Electron.NativeImage;
 }
@@ -325,10 +329,39 @@ function updateTray(status: GatewayStatus = gatewayLifecycle?.getStatus() ?? { s
 }
 
 function createTray(): void {
-  tray = new Tray(createTrayIcon(gatewayLifecycle?.getStatus().state));
-  logAppEvent("info", "tray_created", {});
-  updateTray();
-  tray.on("click", () => mainWindow?.show());
+  // A throwing Tray constructor used to escape into the bare `void
+  // startMainProcess(...)` call below, surface as an unhandledRejection, and be
+  // turned into process.exit(1) by fatalShutdownAndExit — a hard quit with the
+  // cause buried. Contain it here instead: the app stays usable, `tray` stays
+  // null so handleWindowClose degrades to a real close, and the reason is
+  // logged rather than silently swallowed.
+  try {
+    tray = new Tray(createTrayIcon(gatewayLifecycle?.getStatus().state));
+    logAppEvent("info", "tray_created", {});
+    updateTray();
+    tray.on("click", () => mainWindow?.show());
+  } catch (error) {
+    tray = null;
+    logAppEvent("error", "tray_create_failed", {
+      message: error instanceof Error ? error.message : String(error),
+      outcome: "window_close_will_quit_instead_of_hiding"
+    });
+  }
+}
+
+// Tells the user, once, that closing the window did not close the app. This is
+// the other half of the reported defect: Windows 11 files new tray icons in the
+// hidden overflow flyout by default, and no supported API can promote them, so
+// without this notice the first X press looks exactly like a crash.
+function notifyHiddenToTray(): void {
+  if (!tray) return;
+  const menuStr = getMenuStrings(currentLanguage());
+  tray.displayBalloon({
+    title: menuStr.hidden_to_tray_title,
+    content: menuStr.hidden_to_tray_body,
+    iconType: "info"
+  });
+  logAppEvent("info", "window_hidden_to_tray_notice", {});
 }
 
 function createWindow(): void {
@@ -363,10 +396,16 @@ function createWindow(): void {
   });
 
   mainWindow.on("close", (event) => {
-    if (!isQuiting) {
-      event.preventDefault();
-      mainWindow?.hide();
-    }
+    handleWindowClose({
+      event,
+      isQuitting: () => isQuiting,
+      // The decisive condition. Hiding is only safe when there is a tray icon to
+      // restore from; otherwise the close proceeds and window-all-closed quits.
+      hasTray: () => tray !== null,
+      hide: () => mainWindow?.hide(),
+      onFirstHide: notifyHiddenToTray,
+      log: logAppEvent
+    });
   });
 }
 
@@ -562,7 +601,18 @@ void startMainProcess({
 });
 
 app.on("window-all-closed", () => {
-  // The application remains available from the tray.
+  // Normally a no-op: the application remains available from the tray.
+  //
+  // With no tray there is neither a way back nor a way out, which is the state
+  // the bug report describes — a live, invisible, unquittable process. Quit for
+  // real instead, and do it through app.quit() so before-quit -> handleBeforeQuit
+  // -> cleanupAndQuit -> gatewayLifecycle.stop() still runs. That is the IPC
+  // shutdown path that flushes keys.json and the model-key affinity cache, so
+  // this escape hatch cannot cost the user their key state. It must NEVER be a
+  // raw process-level exit here: that would skip the flush entirely.
+  if (tray) return;
+  logAppEvent("warn", "window_all_closed_without_tray", { outcome: "quit" });
+  app.quit();
 });
 
 // ---- IPC handlers with error logging ----

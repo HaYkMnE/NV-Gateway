@@ -36,6 +36,10 @@ export interface MenuTranslation {
   gateway_starting: string;
   gateway_stopped: string;
   gateway_error: string;
+  // Shown once, the first time the X button hides the window, so a tray-resident
+  // app is never mistaken for one that just died.
+  hidden_to_tray_title: string;
+  hidden_to_tray_body: string;
 }
 
 export const MENU_STRINGS: Record<AppLanguage, MenuTranslation> = {
@@ -73,7 +77,9 @@ export const MENU_STRINGS: Record<AppLanguage, MenuTranslation> = {
     gateway_running: "Running",
     gateway_starting: "Starting",
     gateway_stopped: "Stopped",
-    gateway_error: "Error"
+    gateway_error: "Error",
+    hidden_to_tray_title: "NV-Gateway is still running",
+    hidden_to_tray_body: "The window is hidden in the notification area. Click the tray icon to reopen it, or use Quit there to exit."
   },
   ru: {
     file: "Файл",
@@ -109,7 +115,9 @@ export const MENU_STRINGS: Record<AppLanguage, MenuTranslation> = {
     gateway_running: "Работает",
     gateway_starting: "Запускается",
     gateway_stopped: "Остановлен",
-    gateway_error: "Ошибка"
+    gateway_error: "Ошибка",
+    hidden_to_tray_title: "NV-Gateway продолжает работать",
+    hidden_to_tray_body: "Окно свёрнуто в область уведомлений. Нажмите значок в трее, чтобы открыть его снова, или выберите «Выход», чтобы завершить работу."
   },
   zh: {
     file: "文件",
@@ -145,7 +153,9 @@ export const MENU_STRINGS: Record<AppLanguage, MenuTranslation> = {
     gateway_running: "运行中",
     gateway_starting: "启动中",
     gateway_stopped: "已停止",
-    gateway_error: "错误"
+    gateway_error: "错误",
+    hidden_to_tray_title: "NV-Gateway 仍在运行",
+    hidden_to_tray_body: "窗口已隐藏到通知区域。点击托盘图标可重新打开，或使用托盘菜单中的退出来结束程序。"
   },
   es: {
     file: "Archivo",
@@ -181,7 +191,9 @@ export const MENU_STRINGS: Record<AppLanguage, MenuTranslation> = {
     gateway_running: "En ejecución",
     gateway_starting: "Iniciando",
     gateway_stopped: "Detenida",
-    gateway_error: "Error"
+    gateway_error: "Error",
+    hidden_to_tray_title: "NV-Gateway sigue en ejecución",
+    hidden_to_tray_body: "La ventana está oculta en el área de notificaciones. Haz clic en el icono de la bandeja para volver a abrirla, o usa Salir para cerrar la aplicación."
   },
   hi: {
     file: "फ़ाइल",
@@ -217,7 +229,9 @@ export const MENU_STRINGS: Record<AppLanguage, MenuTranslation> = {
     gateway_running: "चल रहा है",
     gateway_starting: "प्रारंभ हो रहा है",
     gateway_stopped: "बंद है",
-    gateway_error: "त्रुटि"
+    gateway_error: "त्रुटि",
+    hidden_to_tray_title: "NV-Gateway अभी भी चल रहा है",
+    hidden_to_tray_body: "विंडो सूचना क्षेत्र में छिपी है। इसे दोबारा खोलने के लिए ट्रे आइकन पर क्लिक करें, या बाहर निकलने के लिए वहाँ बाहर निकलें चुनें।"
   },
   fr: {
     file: "Fichier",
@@ -253,7 +267,9 @@ export const MENU_STRINGS: Record<AppLanguage, MenuTranslation> = {
     gateway_running: "En cours d'exécution",
     gateway_starting: "Démarrage",
     gateway_stopped: "Arrêtée",
-    gateway_error: "Erreur"
+    gateway_error: "Erreur",
+    hidden_to_tray_title: "NV-Gateway fonctionne toujours",
+    hidden_to_tray_body: "La fenêtre est masquée dans la zone de notification. Cliquez sur l'icône de la barre d'état pour la réouvrir, ou utilisez Quitter pour fermer l'application."
   },
   ar: {
     file: "ملف",
@@ -289,7 +305,9 @@ export const MENU_STRINGS: Record<AppLanguage, MenuTranslation> = {
     gateway_running: "قيد التشغيل",
     gateway_starting: "جارٍ التشغيل",
     gateway_stopped: "متوقفة",
-    gateway_error: "خطأ"
+    gateway_error: "خطأ",
+    hidden_to_tray_title: "لا يزال NV-Gateway قيد التشغيل",
+    hidden_to_tray_body: "النافذة مخفية في منطقة الإشعارات. انقر على أيقونة شريط النظام لإعادة فتحها، أو اختر إنهاء للخروج من التطبيق."
   }
 };
 
