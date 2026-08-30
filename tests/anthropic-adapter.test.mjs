@@ -854,6 +854,56 @@ test('61. a probed entry with modes but no controlKey still drives reasoning_eff
   assert.equal(r.openaiBody.reasoning_effort, 'high');
 });
 
+// The probe measures ONE thing: which `reasoning_effort` VALUES upstream accepts.
+// Acceptance of that FIELD is not evidence that it is the model's effective switch:
+// NVIDIA accepts reasoning_effort on models whose real control is a
+// chat_template_kwargs flag, so every candidate comes back "accepted" and the probe
+// writes controlKey:'reasoning_effort'. qwen / stepfun-ai / minimaxai keep their real
+// switch in the PRIMARY controlKey, so letting a probed entry overwrite it strips the
+// only control that actually works — the same defect class as z-ai's alternateControl,
+// which merely survived because the probe never writes that field.
+for (const [family, model, field, offValue, onValue] of [
+  ['qwen', 'qwen/qwen3-next-80b-a3b-thinking', 'enable_thinking', false, true],
+  ['stepfun-ai', 'stepfun-ai/step-3', 'thinking', false, true],
+  ['minimaxai', 'minimaxai/minimax-m2', 'thinking_mode', 'disabled', 'enabled'],
+]) {
+  test(`62. [${family}] a probed reasoning_effort entry must not displace the statically-known chat_template_kwargs control`, () => {
+    // Exactly what capability-probe writes when upstream accepts the field unvalidated.
+    const probedAllAccepted = {
+      modes: ['none', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+      controlKey: 'reasoning_effort',
+      supported: true,
+      defaultMode: 'high',
+    };
+
+    withProbedCache(model, probedAllAccepted);
+    const disabled = translateAnthropicRequest(thinkingBody(model, { type: 'disabled' }));
+    assert.deepEqual(disabled.errors, []);
+    assert.equal(disabled.openaiBody.chat_template_kwargs?.[field], offValue,
+      'thinking:disabled must still switch off the control the family actually uses');
+
+    withProbedCache(model, probedAllAccepted);
+    const enabled = translateAnthropicRequest(thinkingBody(model));
+    assert.deepEqual(enabled.errors, []);
+    assert.equal(enabled.openaiBody.chat_template_kwargs?.[field], onValue,
+      'thinking:enabled must still switch on the control the family actually uses');
+  });
+}
+
+// D3's shape (`{modes:[], controlKey:null, supported:true}`) means "reasoning happens
+// but reasoning_effort is rejected". On a family with a statically-known alternate
+// control that must NOT turn thinking:disabled into a silent no-op: the alternate
+// control is the only remaining way to switch reasoning off.
+test('63. a probed implicit reasoner still honours thinking:disabled through the static alternate control', () => {
+  withProbedCache('z-ai/glm-4.5', { modes: [], controlKey: null, supported: true });
+  const r = translateAnthropicRequest(thinkingBody('z-ai/glm-4.5', { type: 'disabled' }));
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.openaiBody.chat_template_kwargs?.enable_thinking, false,
+    'thinking:disabled must reach upstream even when the probe found no usable reasoning_effort');
+  assert.ok(!('reasoning_effort' in r.openaiBody),
+    'the probe measured every reasoning_effort value as rejected; do not send one');
+});
+
 test('57. unknown family + thinking enabled keeps the tool_choice translation working', () => {
   withoutProbedCache();
   const r = translateAnthropicRequest({

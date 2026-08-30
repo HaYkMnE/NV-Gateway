@@ -353,7 +353,26 @@ export function translateAnthropicRequest(body) {
     // strips a statically-known second control (z-ai/glm-4.5 needs
     // chat_template_kwargs.enable_thinking as well as reasoning_effort) and
     // `thinking:{type:'disabled'}` stops being honoured upstream.
-    let reasoningCap = probedCap ? { ...staticCap, ...probedCap } : staticCap;
+    //
+    // Layering is not enough on its own: the probe interrogates `reasoning_effort`
+    // and NOTHING ELSE, so its `controlKey` is only ever "reasoning_effort was
+    // accepted", never "this is the switch that governs this model". NVIDIA
+    // accepts `reasoning_effort` as an unvalidated no-op on models whose real
+    // control is a chat_template_kwargs flag, so every candidate verifies and the
+    // probe writes controlKey:'reasoning_effort'. Spreading that over a family
+    // that statically names its own control (qwen, stepfun-ai, minimaxai) renames
+    // the switch to one that does nothing and drops the only field that works.
+    // Probe evidence may therefore UNLOCK reasoning on such a family, but it may
+    // not rename its control or replace a mode list describing a different axis.
+    let reasoningCap = staticCap;
+    if (probedCap) {
+      const staticControl = typeof staticCap.controlKey === 'string' && staticCap.controlKey
+        ? staticCap.controlKey
+        : null;
+      reasoningCap = staticControl && staticControl !== 'reasoning_effort'
+        ? { ...staticCap, supported: true }
+        : { ...staticCap, ...probedCap };
+    }
     if (body.thinking.type === 'enabled' && !reasoningCap.supported && !familyKnown) {
       reasoningCap = OPTIMISTIC_REASONING;
       warnings.push('thinking was translated optimistically: this model family is unknown to the capability registry, so upstream decides whether reasoning is supported');
@@ -403,16 +422,23 @@ export function translateAnthropicRequest(body) {
           if (reasoningCap.modes && reasoningCap.modes.includes('none')) {
             openaiBody.reasoning_effort = 'none';
           }
-          if (reasoningCap.alternateControl) {
-            const altKey = reasoningCap.alternateControl.key;
-            if (altKey && altKey.startsWith('chat_template_kwargs.')) {
-              if (!openaiBody.chat_template_kwargs) openaiBody.chat_template_kwargs = {};
-              openaiBody.chat_template_kwargs[altKey.split('.')[1]] = reasoningCap.alternateControl.disableValue !== undefined ? reasoningCap.alternateControl.disableValue : false;
-            }
-          }
         } else if (controlKey && controlKey.startsWith('chat_template_kwargs.')) {
           if (!openaiBody.chat_template_kwargs) openaiBody.chat_template_kwargs = {};
           openaiBody.chat_template_kwargs[controlKey.split('.')[1]] = reasoningCap.disableValue !== undefined ? reasoningCap.disableValue : false;
+        }
+        // Alternate control, mirroring the enabled path above: it must run
+        // whatever the primary controlKey turned out to be. A probed entry can
+        // legitimately report controlKey:null ("reasoning happens, but no usable
+        // reasoning_effort"), and while this block was nested inside the
+        // reasoning_effort branch that answer made `thinking:{type:'disabled'}` a
+        // silent NO-OP for exactly the model D1 was about: z-ai/glm-4.5, whose
+        // enable_thinking flag is then the only remaining way to switch off.
+        if (reasoningCap.alternateControl) {
+          const altKey = reasoningCap.alternateControl.key;
+          if (altKey && altKey.startsWith('chat_template_kwargs.')) {
+            if (!openaiBody.chat_template_kwargs) openaiBody.chat_template_kwargs = {};
+            openaiBody.chat_template_kwargs[altKey.split('.')[1]] = reasoningCap.alternateControl.disableValue !== undefined ? reasoningCap.alternateControl.disableValue : false;
+          }
         }
       }
     }
