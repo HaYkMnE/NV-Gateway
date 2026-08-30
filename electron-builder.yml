@@ -22,6 +22,25 @@ files:
   # (app-builder-lib applies the main matcher's patterns to them), so no
   # present or future dependency can re-add map bytes to app.asar.
   - "!**/*.map"
+# Ship only the Chromium locale packs for languages the app offers
+# (VALID_APP_LANGUAGES in src/main/gateway-runtime.ts). Matching is EXACT on
+# the pak basename (ElectronFramework.js removeUnusedLanguagesIfNeeded), so
+# regional variants are named in full. These paks carry Chromium's own UI
+# strings (context menus, error pages, PDF viewer) — app strings come from
+# i18next — so an unsupported OS locale degrades that built-in UI to the
+# en-US fallback instead of breaking anything. ru stays: the owner's own
+# processes launch with --lang=ru. en-US stays: it is the fallback.
+electronLanguages:
+  - ar
+  - en-GB
+  - en-US
+  - es
+  - es-419
+  - fr
+  - hi
+  - ru
+  - zh-CN
+  - zh-TW
 extraResources:
   # Only the tray/window icons ship outside the archive. They are inert image
   # assets: nothing executable lives here any more.

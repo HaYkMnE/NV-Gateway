@@ -112,3 +112,59 @@ test('the packaging config excludes source maps from app.asar', () => {
   assert.match(builder, /^  - "!\*\*\/\*\.map"$/m,
     'files: must carry a global "!**/*.map" negation so no shipped package can reintroduce source maps');
 });
+
+// ───────────────────────────────────────────────────────────────────────────
+// Shipped-size guard, Lever 3: ship only the Chromium locale packs the app
+// can actually offer.
+//
+// These .pak files carry CHROMIUM's own UI strings (context menus, error
+// pages, the PDF viewer, accessibility) — never app strings, which i18next
+// loads from the renderer bundle. Trimming therefore degrades Chromium's
+// built-in UI to the en-US fallback under an OS locale the app does not
+// support; it cannot break an app string.
+//
+// electron-builder deletes every locales/*.pak whose basename is not listed
+// in electronLanguages with an EXACT match (app-builder-lib/out/electron/
+// ElectronFramework.js, removeUnusedLanguagesIfNeeded), so variant packs must
+// be named in full: en-GB, es-419, zh-CN, zh-TW. 55 paks ship without the
+// list; the 10 below are the ones matching VALID_APP_LANGUAGES
+// (src/main/gateway-runtime.ts), measured 6,683,361 B of 40,139,718 B.
+//
+// `ru` is load-bearing beyond the language list: the owner's own processes
+// launch with --lang=ru. en-US is Chromium's fallback and stays regardless.
+// ───────────────────────────────────────────────────────────────────────────
+
+/** The exact Chromium pak basenames (sans .pak) allowed to ship. */
+const EXPECTED_ELECTRON_LANGUAGES = Object.freeze([
+  'ar', 'en-GB', 'en-US', 'es', 'es-419', 'fr', 'hi', 'ru', 'zh-CN', 'zh-TW'
+]);
+
+test('electronLanguages ships exactly the packs for the languages the app offers', async () => {
+  const { default: yaml } = await import('js-yaml');
+  const config = yaml.load(fs.readFileSync(path.join(root, 'electron-builder.yml'), 'utf8'));
+  assert.deepEqual([...(config.electronLanguages ?? [])].sort(), [...EXPECTED_ELECTRON_LANGUAGES].sort(),
+    'electronLanguages must name the exact pak basenames for VALID_APP_LANGUAGES plus their variant sets');
+
+  // The two non-negotiable entries, called out so a trim cannot drop them silently.
+  assert.ok(config.electronLanguages.includes('ru'), 'ru must ship: the owner launches with --lang=ru');
+  assert.ok(config.electronLanguages.includes('en-US'), 'en-US must ship: it is Chromium\'s fallback');
+
+  // Non-vacuous: every listed name must be a real pack in the Electron dist.
+  const localesDir = path.join(root, 'node_modules', 'electron', 'dist', 'locales');
+  assert.equal(fs.existsSync(localesDir), true, `Electron locales directory missing: ${localesDir}`);
+  for (const language of config.electronLanguages) {
+    assert.equal(fs.existsSync(path.join(localesDir, `${language}.pak`)), true,
+      `electronLanguages entry ${language} has no matching locales/${language}.pak`);
+  }
+
+  // Coverage: each language the app offers keeps at least one pack variant.
+  const runtime = fs.readFileSync(path.join(root, 'src', 'main', 'gateway-runtime.ts'), 'utf8');
+  const offered = [...runtime.matchAll(/"((?:en|ru|zh|hi|es|fr|ar))"/g)].map((match) => match[1]);
+  assert.ok(offered.length >= 7, 'VALID_APP_LANGUAGES must be readable from gateway-runtime.ts');
+  for (const language of new Set(offered)) {
+    assert.ok(
+      config.electronLanguages.some((kept) => kept === language || kept.startsWith(`${language}-`)),
+      `app offers ${language} but no locales/${language}*.pak would ship`
+    );
+  }
+});
