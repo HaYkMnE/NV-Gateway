@@ -28,6 +28,26 @@ jobs:
           node-version: 20.x
           cache: 'npm'
 
+      # The app's update feed is BAKED at package time: electron-builder expands
+      # ${env.NVGW_GH_OWNER}/${env.NVGW_GH_REPO} into resources/app-update.yml, and
+      # NVGW_GH_REPO is deliberately left unset here so the documented default
+      # (NV-Gateway-releases) applies. That is a DIFFERENT repository from the one
+      # this workflow runs in, and the default GITHUB_TOKEN cannot create releases
+      # there. Without this gate the job would happily upload the installer and
+      # latest.yml to the source repo, report success, and leave every installed
+      # copy polling a feed that never gains a release.
+      #
+      # It runs before npm ci and before the build on purpose: the answer is known
+      # at second zero, so there is no reason to spend a full Windows packaging run
+      # discovering it. It has no `if:` and no continue-on-error — a soft failure
+      # here would restore exactly the silent-success mode it removes.
+      - name: Verify the release can reach the baked update feed
+        id: release-target
+        env:
+          NVGW_GH_OWNER: ${{ github.repository_owner }}
+          NVGW_RELEASES_TOKEN: ${{ secrets.NVGW_RELEASES_TOKEN }}
+        run: node scripts/release-target-guard.mjs
+
       - name: Install dependencies
         run: npm ci
 
@@ -53,16 +73,61 @@ jobs:
           }
           Get-Content dist/SHA256SUMS.txt
 
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+      # ── Destination 1 of 2: the UPDATE FEED (github.com/<owner>/NV-Gateway-releases)
+      #
+      # This is the destination that matters for auto-update. electron-updater on the
+      # user's machine reads latest.yml from the repo baked into app-update.yml, then
+      # downloads the installer that latest.yml names. Both must be here or an update
+      # check finds nothing (no latest.yml) or resolves to a 404 (no installer).
+      #
+      # The .blockmap is listed SEPARATELY and on purpose: the installer glob ends in
+      # `.exe`, which does not match `NV-Gateway-Setup-<version>.exe.blockmap`. Without
+      # its own entry the blockmap is silently left behind and every update degrades
+      # from a differential download to a full ~82 MB one.
+      #
+      # `repository:` comes from the guard above rather than a second literal, so the
+      # upload target and the baked feed cannot drift apart again. `token:` must be the
+      # PAT: the default GITHUB_TOKEN is scoped to this repository and cannot create a
+      # release in another one. The guard has already failed the job if it is missing.
+      - name: Publish to the update feed repository
+        uses: softprops/action-gh-release@v2.6.2
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        with:
+          repository: ${{ steps.release-target.outputs.feed_repository }}
+          token: ${{ secrets.NVGW_RELEASES_TOKEN }}
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+          name: NV-Gateway ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+          draft: false
+          prerelease: false
+          # A glob that matches nothing must fail the release. A partially populated
+          # feed is worse than no release: it looks published and updates nobody.
+          fail_on_unmatched_files: true
+          files: |
+            dist/NV-Gateway-Setup-*.exe
+            dist/NV-Gateway-Setup-*.exe.blockmap
+            dist/latest.yml
+            dist/SHA256SUMS.txt
+
+      # ── Destination 2 of 2: this repository, for the README download links
+      #
+      # README.md:17 and README.md:158 send users to this repo's releases page for the
+      # installer, so it keeps getting a release. Previously that happened only because
+      # the step above had no `repository:` input and fell back to the current repo —
+      # the very accident that broke the feed. It is now a deliberate, separate step.
+      #
+      # latest.yml is intentionally NOT published here: electron-updater never reads
+      # this repo, and a stale copy sitting next to a real feed only invites confusion
+      # about which one is authoritative.
+      - name: Publish to this repository for the README download links
+        uses: softprops/action-gh-release@v2.6.2
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
           name: NV-Gateway ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
           draft: false
           prerelease: false
+          fail_on_unmatched_files: true
           files: |
             dist/NV-Gateway-Setup-*.exe
             dist/NV-Gateway-*.zip
-            dist/latest.yml
             dist/SHA256SUMS.txt
