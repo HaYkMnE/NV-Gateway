@@ -4,6 +4,10 @@ import { X } from 'lucide-react';
 
 const TITLE_MAX = 100;
 const DESCRIPTION_MAX = 2000;
+/** Auto-close delay after a plain "saved" confirmation. */
+const CLOSE_MS = 1200;
+/** Longer delay when the toast names the saved path, so it can be read. */
+const PATH_TOAST_CLOSE_MS = 4000;
 
 interface FeedbackModalProps {
   isOpen: boolean;
@@ -79,8 +83,14 @@ export function FeedbackModal({ isOpen, onClose }: FeedbackModalProps) {
       .save(buildData())
       .then((result) => {
         if (result.success) {
-          showToast(t('feedback_success'));
-          window.setTimeout(onClose, 1200);
+          // The whole point of this flow is that the user shares the file
+          // themselves, which is impossible unless we say where it landed.
+          // `path` is optional on FeedbackResult, so keep the plain confirmation
+          // as the fallback rather than rendering "undefined".
+          showToast(result.path ? t('feedback_savedTo', { path: result.path }) : t('feedback_success'));
+          // A path the user cannot finish reading is not a disclosure: give the
+          // longer message time on screen before the modal closes itself.
+          window.setTimeout(onClose, result.path ? PATH_TOAST_CLOSE_MS : CLOSE_MS);
         } else {
           showToast(t('feedback_failed', { message: result.message }));
         }
