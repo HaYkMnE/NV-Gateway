@@ -59,6 +59,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
     openGitHubIssue: (data: { type: 'suggestion' | 'bug'; title: string; description: string; email?: string; attachDiagnostic: boolean }) => ipcRenderer.invoke('feedback:open-github-issue', data)
   },
   openExternal: (url: string) => ipcRenderer.invoke('shell:open-external', url),
+  // Write-only by design: no read counterpart is exposed, so a renderer can put
+  // text on the clipboard but never pull it back.
+  clipboard: {
+    writeText: (text: string) => ipcRenderer.invoke('clipboard:write-text', text)
+  },
   diagnostic: {
     export: () => ipcRenderer.invoke('diagnostic:export')
   },

@@ -1,4 +1,4 @@
-﻿import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, safeStorage, session, Tray } from "electron";
+﻿import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, safeStorage, session, Tray } from "electron";
 import * as crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
@@ -606,6 +606,20 @@ const updateAppConfig = createAppConfigUpdateHandler({
   getStatus: () => gatewayLifecycle?.getStatus() ?? { state: "stopped" }
 });
 
+// Upper bound for a renderer clipboard write. The largest legitimate payload is
+// a generated client-config block or a cURL snippet (Endpoint/Models views), all
+// far below this; the cap simply stops a renderer from pushing arbitrary volume
+// into the OS clipboard.
+const CLIPBOARD_TEXT_MAX = 1_000_000;
+
+// Validation mirrors the style of validators in ipc-security.ts: assert the type,
+// bound the size, throw a generic Error. The value itself is NEVER echoed into
+// the message -- it can be an NVIDIA API key or the local gateway token.
+function assertClipboardText(value: unknown): asserts value is string {
+  if (typeof value !== "string") throw new Error("Invalid clipboard text.");
+  if (value.length > CLIPBOARD_TEXT_MAX) throw new Error("Invalid clipboard text.");
+}
+
 function secure<T extends (event: Electron.IpcMainInvokeEvent, ...args: any[]) => unknown>(handler: T): T {
   return ((event: Electron.IpcMainInvokeEvent, ...args: unknown[]) => { if (!mainWindow) throw new Error("Window unavailable."); validateIpcSender(event, mainWindow.webContents, allowedRendererUrls()); return handler(event, ...args); }) as T;
 }
@@ -710,3 +724,16 @@ ipcMain.handle("feedback:open-github-issue", wrapIpcHandler("feedback:open-githu
 ipcMain.handle("shell:open-external", wrapIpcHandler("shell:open-external", secure((_event, url: unknown) => openExternalUrl(url))));
 ipcMain.handle("diagnostic:export", wrapIpcHandler("diagnostic:export", secure(() => exportDiagnostic())));
 ipcMain.handle("about:get-info", wrapIpcHandler("about:get-info", secure(() => getAboutInfo())));
+
+// Clipboard: WRITE-ONLY, on purpose. navigator.clipboard in the renderer rejects
+// with NotAllowedError ("Document is not focused") whenever the window is not
+// focused -- measured under this app's own webPreferences and CSP -- and this app
+// is tray-resident, so an unfocused window is an ordinary state. Electron's own
+// clipboard module is focus-independent, so the write happens here instead.
+// There is deliberately NO read channel: a renderer must not be able to pull back
+// clipboard contents. The text is never logged; it may be a credential.
+ipcMain.handle("clipboard:write-text", wrapIpcHandler("clipboard:write-text", secure((_event, text: unknown) => {
+  assertClipboardText(text);
+  clipboard.writeText(text);
+  return undefined;
+})));

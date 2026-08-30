@@ -133,31 +133,6 @@ const PANEL_ROWS: Record<TabKey, ReadonlyArray<DonationRow>> = {
   ],
 };
 
-/** Clipboard write with execCommand fallback (Electron/permission safe). */
-function copyViaExecCommand(text: string): void {
-  const ta = document.createElement('textarea');
-  ta.value = text;
-  ta.setAttribute('readonly', '');
-  ta.style.position = 'fixed';
-  ta.style.opacity = '0';
-  document.body.appendChild(ta);
-  ta.select();
-  try {
-    document.execCommand('copy');
-  } catch {
-    /* clipboard unavailable — nothing else we can do */
-  }
-  ta.remove();
-}
-
-function copyText(text: string): void {
-  if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).catch(() => copyViaExecCommand(text));
-  } else {
-    copyViaExecCommand(text);
-  }
-}
-
 /** Dashed placeholder QR glyph (pure vector, no real payload). */
 function QrGlyph({ size }: { size: number }): React.JSX.Element {
   return (
@@ -340,6 +315,13 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
     return () => document.removeEventListener('keydown', handler);
   }, [open, qrRow, onClose]);
 
+  /** Show a transient message in the modal's role="status" speech bubble. */
+  const showBubble = useCallback((message: string): void => {
+    setBubble(message);
+    if (bubbleTimerRef.current !== null) window.clearTimeout(bubbleTimerRef.current);
+    bubbleTimerRef.current = window.setTimeout(() => setBubble(null), 4000);
+  }, []);
+
   /** Full Ascension sequence shared by COPY / QR confirm / external links. */
   const triggerAscension = useCallback((): void => {
     petAudio.playAscensionRitual();
@@ -348,25 +330,34 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
     } catch {
       /* storage unavailable — VIP flag simply won't persist */
     }
-    setBubble(t('pet_thanks'));
-    if (bubbleTimerRef.current !== null) window.clearTimeout(bubbleTimerRef.current);
-    bubbleTimerRef.current = window.setTimeout(() => setBubble(null), 4000);
+    showBubble(t('pet_thanks'));
     onAscension();
-  }, [onAscension, t]);
+  }, [onAscension, showBubble, t]);
 
   const handleTabSwitch = useCallback((tab: TabKey): void => {
     setActiveTab(tab);
     petAudio.playActionCheer();
   }, []);
 
+  // Copy goes through the main process: navigator.clipboard rejects with
+  // NotAllowedError whenever this tray-resident window is not focused. The COPIED
+  // tick and the Ascension ritual now wait for the write to actually succeed --
+  // previously they fired unconditionally, so the UI cheerfully confirmed a copy
+  // that never happened and the user pasted nothing.
   const handleCopy = useCallback(
     (row: DonationRow): void => {
-      copyText(row.value);
-      setCopiedId(row.id);
-      window.setTimeout(() => setCopiedId((current) => (current === row.id ? null : current)), 1000);
-      triggerAscension();
+      void window.electronAPI.clipboard
+        .writeText(row.value)
+        .then(() => {
+          setCopiedId(row.id);
+          window.setTimeout(() => setCopiedId((current) => (current === row.id ? null : current)), 1000);
+          triggerAscension();
+        })
+        .catch(() => {
+          showBubble(t('copy_failed'));
+        });
     },
-    [triggerAscension],
+    [triggerAscension, showBubble, t],
   );
 
   /** Open a link row's URL externally via the safe IPC channel + Ascension. */

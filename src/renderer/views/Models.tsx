@@ -322,13 +322,17 @@ export function Models() {
     });
   };
 
+  // Copy goes through the main process: navigator.clipboard rejects with
+  // NotAllowedError whenever this tray-resident window is not focused. Failures
+  // surface through the view's existing error banner instead of being discarded.
   const copy = async (text: string, id: string) => {
     try {
-      await navigator.clipboard.writeText(text);
+      await window.electronAPI.clipboard.writeText(text);
+      setMutationError(null);
       setCopiedId(id);
       window.setTimeout(() => setCopiedId(null), 2000);
-    } catch {
-      /* ignore */
+    } catch (err) {
+      setMutationError(`${t('copy_failed')} ${safeError(err, t('unknown_error'))}`);
     }
   };
 

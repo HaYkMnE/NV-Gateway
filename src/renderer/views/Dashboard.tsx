@@ -34,7 +34,9 @@ export function Dashboard() {
   };
   const move = (index: number, direction: -1 | 1) => { const next = moveItem(keys, index, index + direction); if (next !== keys) reorder.mutate(next); };
   const announce = (message: string) => { setFeedback(''); window.setTimeout(() => setFeedback(message), 0); };
-  const copy = async (masked: string) => { try { await navigator.clipboard.writeText(masked); announce(t('copied')); setMutationError(''); } catch (error) { announce(t('copy_failed')); setMutationError(`${t('clipboard_failed')} ${safeError(error, t('unknown_error'))}`); } };
+  // Copy goes through the main process: navigator.clipboard rejects with
+  // NotAllowedError whenever this tray-resident window is not focused.
+  const copy = async (masked: string) => { try { await window.electronAPI.clipboard.writeText(masked); announce(t('copied')); setMutationError(''); } catch (error) { announce(t('copy_failed')); setMutationError(`${t('clipboard_failed')} ${safeError(error, t('unknown_error'))}`); } };
   const number = (value = 0) => value >= 1000 ? `${(value / 1000).toFixed(1)}K` : String(value);
 
   if (unavailable) {

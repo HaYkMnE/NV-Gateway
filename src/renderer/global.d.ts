@@ -37,6 +37,9 @@ interface Window {
       openGitHubIssue: (data: FeedbackData) => Promise<void>;
     };
     openExternal: (url: string) => Promise<void>;
+    clipboard: {
+      writeText: (text: string) => Promise<void>;
+    };
     diagnostic: {
       export: () => Promise<DiagnosticExportResult>;
     };

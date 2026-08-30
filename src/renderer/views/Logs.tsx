@@ -121,9 +121,11 @@ export function Logs() {
     setFeedback('');
     window.setTimeout(() => setFeedback(message), 0);
   };
+  // Copy goes through the main process: navigator.clipboard rejects with
+  // NotAllowedError whenever this tray-resident window is not focused.
   const copy = async () => {
     try {
-      await navigator.clipboard.writeText(lines.join('\n'));
+      await window.electronAPI.clipboard.writeText(lines.join('\n'));
       announce(t('copied'));
     } catch {
       announce(t('copy_failed'));

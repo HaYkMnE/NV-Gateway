@@ -17,6 +17,7 @@ import {
   Server,
 } from 'lucide-react';
 import { api, queryKeys } from '../lib/api';
+import { safeError } from '../lib/frontend-state';
 import { useGatewayLifecycle } from '../lib/gateway-lifecycle';
 import { useConfigStore } from '../stores/config';
 import { ProviderGlyph, resolveProvider } from '../components/ProviderGlyph';
@@ -33,6 +34,7 @@ export function Endpoint() {
   const { gatewayPort } = useConfigStore();
   const [showToken, setShowToken] = useState(false);
   const [copiedField, setCopiedField] = useState<string | null>(null);
+  const [copyError, setCopyError] = useState<string | null>(null);
   const [configTab, setConfigTab] = useState<ConfigTab>('opencode');
   const [isConfigOpen, setIsConfigOpen] = useState(true);
 
@@ -61,13 +63,18 @@ export function Endpoint() {
   });
   const keysCount = keysQuery.data?.keys?.length ?? 0;
 
+  // Copy goes through the main process: navigator.clipboard rejects with
+  // NotAllowedError whenever this tray-resident window is not focused. A failure
+  // is reported rather than discarded -- silently swallowing it is what made the
+  // Copy buttons look like they did nothing.
   const copy = async (text: string, field: string) => {
     try {
-      await navigator.clipboard.writeText(text);
+      await window.electronAPI.clipboard.writeText(text);
+      setCopyError(null);
       setCopiedField(field);
       window.setTimeout(() => setCopiedField(null), 2000);
-    } catch {
-      /* ignore clipboard errors */
+    } catch (error) {
+      setCopyError(`${t('copy_failed')} ${safeError(error, t('unknown_error'))}`);
     }
   };
 
@@ -179,6 +186,14 @@ export function Endpoint() {
           <h2 className="text-2xl font-bold text-textMain tracking-tight">{t('endpoint_title')}</h2>
         </div>
       </div>
+
+      {/* A failed copy must be visible: this view copies the base URL and the
+          gateway token, so a silent failure leaves the user pasting nothing. */}
+      {copyError && (
+        <div role="alert" className="border border-error bg-error/10 text-error p-3 mb-4 break-words rounded">
+          {copyError}
+        </div>
+      )}
 
       {/* Live Status HUD */}
       <section className="bg-surface/90 border border-border/90 rounded-xl p-5 mb-6 shadow-lg backdrop-blur-md">
