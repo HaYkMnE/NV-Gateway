@@ -213,8 +213,11 @@ export function FeedbackModal({ isOpen, onClose }: FeedbackModalProps) {
         </label>
 
         {/* Nothing here is transmitted. Saying so next to the action keeps the
-            dialog honest: the report is a local file the user shares themselves. */}
-        <p className="mb-6 text-xs text-textMuted">{t('feedback_localNote')}</p>
+            dialog honest: the report is a local file the user shares themselves.
+            The id is referenced by the save button's aria-describedby, so the
+            disclosure reaches a screen-reader user too — sighted-only honesty is
+            not honesty. */}
+        <p id="feedback-local-note" className="mb-6 text-xs text-textMuted">{t('feedback_localNote')}</p>
 
         {/* Actions */}
         <div className="flex flex-wrap gap-3 justify-end">
@@ -228,6 +231,7 @@ export function FeedbackModal({ isOpen, onClose }: FeedbackModalProps) {
           <button
             onClick={handleSave}
             disabled={submitting}
+            aria-describedby="feedback-local-note"
             className="bg-nvidia text-bg px-4 py-2 disabled:opacity-50"
           >
             {t('feedback_save')}
