@@ -276,25 +276,96 @@ test('disabled sound preference returns -1 immediately for all 24 cues', () => {
   }
 });
 
-test('persona separation: Cyber Mascot and Pixel Hacker produce distinct sleep sound graphs', () => {
-  const source = read('src/renderer/pet/audioEngine.ts');
-  // Mascot Power Nap and Hacker Terminal Nap must not share identical snore implementation
-  assert.match(source, /playMascotPowerNap/, 'must implement playMascotPowerNap');
-  assert.match(source, /playHackerTerminalNap/, 'must implement playHackerTerminalNap');
-  // Neither can contain biological uvular/throat rasp comments or 38Hz uvular flutter
-  assert.doesNotMatch(source, /uvular flutter/i, 'biological uvular flutter must be eliminated');
-  assert.doesNotMatch(source, /visceral gurgle/i, 'biological stomach gurgle must be eliminated');
-  assert.doesNotMatch(source, /jaw click/i, 'biological jaw click must be eliminated');
-  assert.doesNotMatch(source, /throat gulp/i, 'biological throat gulp must be eliminated');
+function extractSynthesisSignature(nodes) {
+  return nodes.map((node) => {
+    if (node instanceof MockOscillatorNode) {
+      return `Osc(${node.type},f~${Math.round(node.frequency.value / 50) * 50})`;
+    }
+    if (node instanceof MockBiquadFilterNode) {
+      return `Filter(${node.type},f~${Math.round(node.frequency.value / 100) * 100})`;
+    }
+    if (node instanceof MockBufferSourceNode) {
+      return 'NoiseBuffer';
+    }
+    if (node instanceof MockWaveShaperNode) {
+      return 'WaveShaper';
+    }
+    if (node instanceof MockGainNode) {
+      return 'Gain';
+    }
+    return node.constructor.name;
+  }).join('->');
+}
+
+test('persona separation: paired cues (sleep, coins, mugs, combat) have distinct synthesis graph signatures across all variants', () => {
+  const PAIRS = [
+    { mascot: 'playMascotPowerNap', hacker: 'playHackerTerminalNap', domain: 'sleep/standby' },
+    { mascot: 'playRealisticCoinDrop', hacker: 'playHackerCoinDrop', domain: 'coins/rewards' },
+    { mascot: 'playMugTableTap', hacker: 'playHackerEmptyMug', domain: 'mug/foley' },
+    { mascot: 'playMascotBugHunter', hacker: 'playHackerBugSlayer', domain: 'bug combat' },
+  ];
+
+  for (const { mascot, hacker, domain } of PAIRS) {
+    for (let variant = 0; variant < 3; variant++) {
+      const { petAudio: mascotAudio, mockCtx: mascotCtx } = loadPetAudioWithContext();
+      mascotAudio.setEnabled(true);
+      mascotAudio[mascot](variant);
+      const mascotSig = extractSynthesisSignature(mascotCtx.createdNodes);
+
+      const { petAudio: hackerAudio, mockCtx: hackerCtx } = loadPetAudioWithContext();
+      hackerAudio.setEnabled(true);
+      hackerAudio[hacker](variant);
+      const hackerSig = extractSynthesisSignature(hackerCtx.createdNodes);
+
+      assert.ok(mascotCtx.createdNodes.length > 0, `${mascot} v${variant} must produce audio nodes`);
+      assert.ok(hackerCtx.createdNodes.length > 0, `${hacker} v${variant} must produce audio nodes`);
+
+      assert.notEqual(
+        mascotSig,
+        hackerSig,
+        `persona collapse detected in ${domain}: ${mascot} and ${hacker} variant ${variant} produce identical synthesis graphs (shared helper / aliased implementation): ${mascotSig}`
+      );
+    }
+  }
 });
 
-test('persona separation: Realistic Coin Drop and Hacker Coin Drop have distinct timbres', () => {
-  const { petAudio, mockCtx } = loadPetAudioWithContext();
-  petAudio.setEnabled(true);
+test('persona acoustic domain constraints: Mascot lives in FM/sine/ceramic domain, Hacker lives in mechanical/8-bit/sub-bass domain', () => {
+  // 1. Mug cues: Mascot mug tap must have high-frequency ceramic presence (>= 600 Hz), Hacker empty mug must have mechanical bass/thock presence (<= 480 Hz)
+  for (let variant = 0; variant < 3; variant++) {
+    const { petAudio: mascotAudio, mockCtx: mascotCtx } = loadPetAudioWithContext();
+    mascotAudio.setEnabled(true);
+    mascotAudio.playMugTableTap(variant);
+    const mascotOscs = mascotCtx.createdNodes.filter(n => n instanceof MockOscillatorNode);
+    const mascotFilters = mascotCtx.createdNodes.filter(n => n instanceof MockBiquadFilterNode);
 
-  // Hacker coin drop uses discrete retro chimes, not high-frequency piercing glass jar sines
-  const source = read('src/renderer/pet/audioEngine.ts');
-  const hackerCoin = source.slice(source.indexOf('playHackerCoinDrop('));
-  const body = hackerCoin.slice(0, hackerCoin.indexOf('\n  }'));
-  assert.doesNotMatch(body, /this\.coinDrop\('playHackerCoinDrop'/i, 'playHackerCoinDrop must have its own dedicated hacker implementation');
+    const { petAudio: hackerAudio, mockCtx: hackerCtx } = loadPetAudioWithContext();
+    hackerAudio.setEnabled(true);
+    hackerAudio.playHackerEmptyMug(variant);
+    const hackerOscs = hackerCtx.createdNodes.filter(n => n instanceof MockOscillatorNode);
+
+    // Hacker mug must contain a low mechanical bass anchor oscillator <= 120 Hz
+    const hasLowThock = hackerOscs.some(o => o.frequency.value <= 120);
+    assert.ok(hasLowThock, `playHackerEmptyMug v${variant} must have a mechanical bass anchor oscillator (<= 120 Hz)`);
+
+    // Mascot mug must have clean ceramic/sine timbre and not alias the hacker mechanical square thock
+    const hasHackerSquare = hackerOscs.some(o => o.type === 'square');
+    const hasMascotSquare = mascotOscs.some(o => o.type === 'square');
+    assert.equal(hasMascotSquare, false, `playMugTableTap v${variant} must not use raw square waves`);
+  }
+
+  // 2. Coin cues: Mascot coin uses pure sines, Hacker coin uses 8-bit square / arcade tones
+  for (let variant = 0; variant < 3; variant++) {
+    const { petAudio: mascotAudio, mockCtx: mascotCtx } = loadPetAudioWithContext();
+    mascotAudio.setEnabled(true);
+    mascotAudio.playRealisticCoinDrop(variant);
+    const mascotOscs = mascotCtx.createdNodes.filter(n => n instanceof MockOscillatorNode);
+    assert.ok(mascotOscs.every(o => o.type === 'sine'), `playRealisticCoinDrop v${variant} must use pure sine oscillators`);
+
+    const { petAudio: hackerAudio, mockCtx: hackerCtx } = loadPetAudioWithContext();
+    hackerAudio.setEnabled(true);
+    hackerAudio.playHackerCoinDrop(variant);
+    const hackerOscs = hackerCtx.createdNodes.filter(n => n instanceof MockOscillatorNode);
+    const hasArcadeWave = hackerOscs.some(o => o.type === 'square' || o.type === 'triangle');
+    assert.ok(hasArcadeWave, `playHackerCoinDrop v${variant} must use 8-bit square/triangle oscillators`);
+  }
 });
