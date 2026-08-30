@@ -1079,17 +1079,43 @@ async function startGatewayWithLocalUpstream(upstreamPort, timeoutOverrides = {}
   throw new Error('Gateway did not become healthy after three free-port selections.');
 }
 
+// Stops the gateway the way production does: ASK over ipc first, then escalate.
+//
+// MEASURED RACE this removes. logger.mjs buffers entries and flushes on
+// setTimeout(flushLogs, 1000); an entry was observed reaching the file at 981ms,
+// i.e. 119ms inside waitForGatewayLogFlush()'s 1100ms. A plain child.kill() sends
+// SIGTERM, which on Windows is TerminateProcess — the child's handlers never run,
+// so the flush-on-exit path cannot rescue a still-buffered entry (measured:
+// present-after-SIGTERM = false, present-after-ipc-shutdown = true). On a loaded
+// runner the 119ms margin disappears and a log assertion fails for timing reasons
+// alone, which is what happened in CI.
+//
+// The ipc request makes the flush deterministic instead of widening the sleep, and
+// the unchanged SIGTERM -> SIGKILL escalation still guarantees the child dies.
 async function stopGateway(child) {
   if (!child) return;
   if (child.exitCode !== null) return;
-  await new Promise((resolve) => {
-    const killTimer = setTimeout(() => child.kill('SIGKILL'), 1_000);
-    child.once('exit', () => {
-      clearTimeout(killTimer);
-      resolve();
-    });
-    child.kill();
+
+  const waitForExit = (timeoutMs) => new Promise((resolve) => {
+    if (child.exitCode !== null) { resolve(true); return; }
+    const timer = setTimeout(() => resolve(child.exitCode !== null), timeoutMs);
+    child.once('exit', () => { clearTimeout(timer); resolve(true); });
   });
+
+  // A confirmed send earns the short grace; an unconfirmed one falls straight
+  // through to signals rather than waiting on a request that never arrived.
+  let requested = false;
+  try {
+    requested = child.connected === true && typeof child.send === 'function' && child.send({ type: 'shutdown' }) === true;
+  } catch {
+    requested = false;
+  }
+  if (requested && await waitForExit(2_000)) return;
+
+  child.kill();
+  if (await waitForExit(1_000)) return;
+  child.kill('SIGKILL');
+  await waitForExit(1_000);
 }
 
 function readGatewayLogs(logPath) {
