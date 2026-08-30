@@ -57,14 +57,36 @@ test('the packaging guard rejects every rule that could place the engine outside
   // degenerate into a permanently red assertion.
   assert.doesNotThrow(() => assertArchiveEnvelopeIsSealed(realConfig));
 
+  const withPrefix = (text) => realConfig.replace(/^extraResources:/m, `${text}\nextraResources:`);
+  // Replaces the whole win: block (header plus its indented body) so an injected
+  // flow mapping stays valid YAML instead of orphaning the lines beneath it.
+  const replacingWinBlock = (text) => realConfig.replace(/^win:\r?\n(?:[ \t]+.*\r?\n)*/m, text);
+
   // Any asarUnpack pattern is refused — the guard is absolute rather than
   // pattern-matching, because a matcher would have to out-guess electron-builder's
   // glob semantics and one missed form silently reopens the hole.
-  for (const pattern of ['build/gateway/**/*', 'build/**', '**/*.mjs', '**/gateway/**', '**']) {
+  for (const pattern of ['build/gateway/**/*', 'build/**', 'build/gateway/server.mjs']) {
     assert.throws(
-      () => assertArchiveEnvelopeIsSealed(realConfig.replace(/^extraResources:/m, `asarUnpack:\n  - ${pattern}\nextraResources:`)),
+      () => assertArchiveEnvelopeIsSealed(withPrefix(`asarUnpack:\n  - ${pattern}`)),
       /PACKAGING_ASAR_UNPACK_FORBIDDEN:asarUnpack/,
       `asarUnpack pattern must be refused: ${pattern}`
+    );
+  }
+  // A leading `*` opens an ALIAS in YAML, so these can only appear QUOTED in a
+  // real config. Quoted is therefore the honest fixture, and it proves they are
+  // caught as unpack RULES rather than merely as a syntax error.
+  for (const pattern of ['**/*.mjs', '**/gateway/**', '**']) {
+    assert.throws(
+      () => assertArchiveEnvelopeIsSealed(withPrefix(`asarUnpack:\n  - "${pattern}"`)),
+      /PACKAGING_ASAR_UNPACK_FORBIDDEN:asarUnpack/,
+      `quoted asarUnpack pattern must be refused: ${pattern}`
+    );
+    // Unquoted the document is invalid YAML; the guard must still refuse it
+    // (fail closed) rather than read an unparseable file as "nothing forbidden".
+    assert.throws(
+      () => assertArchiveEnvelopeIsSealed(withPrefix(`asarUnpack:\n  - ${pattern}`)),
+      /PACKAGING_(ASAR_UNPACK_FORBIDDEN|CONFIG_UNPARSEABLE)/,
+      `bare asarUnpack pattern must still be refused: ${pattern}`
     );
   }
 
@@ -75,31 +97,133 @@ test('the packaging guard rejects every rule that could place the engine outside
     'a rule nested under win: must be refused as well'
   );
   assert.throws(
-    () => assertArchiveEnvelopeIsSealed(realConfig.replace(/^extraResources:/m, "asarUnpack: ['build/gateway/**/*']\nextraResources:")),
+    () => assertArchiveEnvelopeIsSealed(withPrefix("asarUnpack: ['build/gateway/**/*']")),
     /PACKAGING_ASAR_UNPACK_FORBIDDEN:asarUnpack/,
     'the inline array form must be refused'
   );
   assert.throws(
-    () => assertArchiveEnvelopeIsSealed(realConfig.replace(/^extraResources:/m, 'asarUnpacked:\n  - build/gateway/**/*\nextraResources:')),
+    () => assertArchiveEnvelopeIsSealed(withPrefix('asarUnpacked:\n  - build/gateway/**/*')),
     /PACKAGING_ASAR_UNPACK_FORBIDDEN:asarUnpacked/,
     'the legacy asarUnpacked spelling must be refused'
   );
 
+  // THE SIX SPELLINGS A LINE MATCHER MISSED. The previous implementation tested
+  // `^\s*asarUnpack\s*:` per line, so it only ever saw an unquoted block key.
+  // js-yaml — the parser electron-builder reads the config with — resolves all of
+  // these to the same forbidden key, so the guard must too.
+  assert.throws(
+    () => assertArchiveEnvelopeIsSealed(withPrefix('"asarUnpack": ["build/gateway/**/*"]')),
+    /PACKAGING_ASAR_UNPACK_FORBIDDEN:asarUnpack/,
+    'a double-quoted key must be refused'
+  );
+  assert.throws(
+    () => assertArchiveEnvelopeIsSealed(withPrefix("'asarUnpack': ['build/gateway/**/*']")),
+    /PACKAGING_ASAR_UNPACK_FORBIDDEN:asarUnpack/,
+    'a single-quoted key must be refused'
+  );
+  assert.throws(
+    () => assertArchiveEnvelopeIsSealed(withPrefix('? asarUnpack\n: ["build/gateway/**/*"]')),
+    /PACKAGING_ASAR_UNPACK_FORBIDDEN:asarUnpack/,
+    'the explicit-key syntax must be refused'
+  );
+  assert.throws(
+    () => assertArchiveEnvelopeIsSealed(replacingWinBlock('win: {icon: build/assets/icon.png, asarUnpack: ["build/gateway/**/*"]}\n')),
+    /PACKAGING_ASAR_UNPACK_FORBIDDEN:asarUnpack/,
+    'a flow mapping must be refused'
+  );
+  assert.throws(
+    () => assertArchiveEnvelopeIsSealed(realConfig.replace(/^win:\r?\n/m, 'win:\n  "asarUnpack":\n    - build/gateway/**/*\n')),
+    /PACKAGING_ASAR_UNPACK_FORBIDDEN:asarUnpack/,
+    'a quoted key nested under win: must be refused'
+  );
+  assert.throws(
+    () => assertArchiveEnvelopeIsSealed(withPrefix('"asar": false')),
+    /PACKAGING_ASAR_MUST_STAY_ENABLED/,
+    'a quoted asar key must be refused'
+  );
+
+  // ANCHOR + ALIAS with a merge key: structurally unreachable for a line matcher,
+  // and the clearest demonstration of why parsing beats text matching.
+  assert.throws(
+    () => assertArchiveEnvelopeIsSealed(replacingWinBlock([
+      '.engineUnpack: &engineUnpack',
+      '  asarUnpack:',
+      '    - build/gateway/**/*',
+      'win:',
+      '  <<: *engineUnpack',
+      '  icon: build/assets/icon.png',
+      ''
+    ].join('\n'))),
+    /PACKAGING_ASAR_UNPACK_FORBIDDEN:asarUnpack/,
+    'a merge key pulling in an anchored rule must be refused'
+  );
+  assert.throws(
+    () => assertArchiveEnvelopeIsSealed(replacingWinBlock([
+      '.engineUnpack: &engineUnpack',
+      '  - build/gateway/**/*',
+      'win:',
+      '  asarUnpack: *engineUnpack',
+      '  icon: build/assets/icon.png',
+      ''
+    ].join('\n'))),
+    /PACKAGING_ASAR_UNPACK_FORBIDDEN:asarUnpack/,
+    'an alias supplying the value must be refused'
+  );
+
   // SECOND VECTOR: `asar` and `asarUnpack` are the only asar keys in the
   // app-builder-lib schema, and disabling archiving ships everything loose.
-  for (const value of ['false', 'False', '"false"']) {
+  // js-yaml 4 keeps no/off/0 as STRINGS rather than booleans, so strict equality
+  // to `true` is what collapses the whole truthiness zoo into one rejected case.
+  for (const value of ['false', 'False', '"false"', "'false'", 'FALSE', 'no', 'off', '0']) {
     assert.throws(
-      () => assertArchiveEnvelopeIsSealed(realConfig.replace(/^extraResources:/m, `asar: ${value}\nextraResources:`)),
+      () => assertArchiveEnvelopeIsSealed(withPrefix(`asar: ${value}`)),
       /PACKAGING_ASAR_MUST_STAY_ENABLED/,
       `archiving must not be disabled: asar: ${value}`
     );
   }
-  assert.doesNotThrow(() => assertArchiveEnvelopeIsSealed(realConfig.replace(/^extraResources:/m, 'asar: true\nextraResources:')));
+  // An AsarOptions mapping is refused as well: options such as smartUnpack unpack
+  // files, so only the literal `true` is accepted.
+  assert.throws(
+    () => assertArchiveEnvelopeIsSealed(withPrefix('asar:\n  smartUnpack: true')),
+    /PACKAGING_ASAR_MUST_STAY_ENABLED/,
+    'an asar options mapping must be refused'
+  );
+  assert.doesNotThrow(() => assertArchiveEnvelopeIsSealed(withPrefix('asar: true')));
 
-  // A comment documenting the invariant must not trip the guard on its own prose.
+  // FAIL CLOSED: a document that cannot be parsed, or is not a mapping at all,
+  // must never be mistaken for "no forbidden keys present".
+  assert.throws(
+    () => assertArchiveEnvelopeIsSealed('files:\n  - a\n  bad: [unclosed'),
+    /PACKAGING_CONFIG_UNPARSEABLE/,
+    'an unparseable config must be refused'
+  );
+  assert.throws(
+    () => assertArchiveEnvelopeIsSealed('- just\n- a\n- list'),
+    /PACKAGING_CONFIG_NOT_A_MAPPING/,
+    'a non-mapping document must be refused'
+  );
+
+  // A comment documenting the invariant must not trip the guard on its own prose
+  // (the parser discards comments, so this holds for free) — while a quoted value
+  // that merely CONTAINS '#' is still a real rule and must be refused.
   assert.doesNotThrow(() => assertArchiveEnvelopeIsSealed(
-    realConfig.replace(/^extraResources:/m, '# asarUnpack would put the engine outside app.asar\nextraResources:')
+    withPrefix('# asarUnpack would put the engine outside app.asar')
   ));
+  assert.throws(
+    () => assertArchiveEnvelopeIsSealed(withPrefix('asarUnpack:\n  - "build/#gateway/**/*"')),
+    /PACKAGING_ASAR_UNPACK_FORBIDDEN:asarUnpack/,
+    'a quoted value containing # is a rule, not a comment'
+  );
+
+  // The message must tell whoever hits this WHERE to go and WHAT the legitimate
+  // case looks like, not just name the broken rule.
+  assert.throws(
+    () => assertArchiveEnvelopeIsSealed(withPrefix('asarUnpack:\n  - build/gateway/**/*')),
+    (error) => /shipping-credential-scan\.mjs/.test(error.message)
+      && /\.node/.test(error.message)
+      && /targeted test/.test(error.message),
+    'the failure must point at the guard and describe the legitimate exception'
+  );
 });
 
 test('lifecycle requires initial state before spawn, listener setup, or state persistence', async () => {

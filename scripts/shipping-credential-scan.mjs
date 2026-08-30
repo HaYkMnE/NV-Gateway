@@ -3,6 +3,10 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+// Declared explicitly in devDependencies at the version already resolved in the
+// tree (4.3.0), so this guard never depends on electron-builder continuing to
+// pull js-yaml in transitively — and so no second copy appears.
+import yaml from 'js-yaml';
 
 export const DENIED_CREDENTIAL_LITERALS = [
   'test-gateway-token',
@@ -102,50 +106,117 @@ export function deriveScannedRoots(root) {
 // `**` + `/*.mjs`, `**` + `/gateway/**` all reach it), and one missed form
 // silently reopens the hole. Needing asarUnpack later therefore demands an
 // explicit, reviewed edit of this guard — that is the intent, not an obstacle.
-const ARCHIVE_UNPACK_KEYS = ['asarUnpack', 'asarUnpacked'];
+//
+// DETECTED BY PARSING, NOT BY LINE MATCHING. The previous implementation tested
+// `^\s*asarUnpack\s*:` per line, which only ever saw an UNQUOTED block-style key.
+// Six equivalent YAML spellings slipped past it silently while js-yaml — the very
+// parser electron-builder reads the config with — resolved every one of them:
+//   "asarUnpack": [...]        quoted key
+//   'asarUnpack': [...]        single-quoted key
+//   ? asarUnpack / : [...]     explicit key syntax
+//   win: {asarUnpack: [...]}   flow mapping
+//   "asarUnpack": nested       quoted key inside a platform block
+//   "asar": false              quoted key for the archive switch
+// So the guard now loads the document and walks the resulting object. Anything
+// js-yaml resolves to one of these keys is caught regardless of how it was
+// written, comments included — the parser discards those on its own, which is why
+// the old stripYamlComments helper is gone.
+const ARCHIVE_UNPACK_KEYS = Object.freeze(['asarUnpack', 'asarUnpacked']);
+
+const UNPACK_REMEDY = 'Unpacking copies entries to app.asar.unpacked/, i.e. OUTSIDE the ASAR integrity envelope, where the engine bundle could be swapped undetected. If an unpack rule is genuinely needed — the canonical case is a native .node addon that cannot be loaded from inside an archive — treat it as a deliberate decision: narrow ARCHIVE_UNPACK_KEYS in scripts/shipping-credential-scan.mjs and add a targeted test proving build/gateway/server.mjs is still a single entry inside app.asar.';
+
+const ASAR_REMEDY = `Archiving must stay on: with it off the whole app, engine included, ships as loose files with no integrity coverage. Only the literal value true is accepted — an AsarOptions mapping is refused too, because options such as smartUnpack unpack files as well. ${UNPACK_REMEDY}`;
 
 /**
  * Reject any packaging rule able to place the engine outside app.asar.
- * Scans EVERY indentation level, because asarUnpack is also valid inside the
- * platform blocks (win:, nsis:, …), not just at the top level.
+ *
+ * Parses the document and inspects EVERY mapping at EVERY depth: `asarUnpack` is
+ * equally valid at the top level and inside the platform blocks (win:, nsis:, …).
  *
  * @param {string} builder Raw electron-builder.yml contents.
  * @returns {void}
  */
 export function assertArchiveEnvelopeIsSealed(builder) {
-  // Comments are stripped FIRST so the prose documenting this invariant (in the
-  // yml itself) cannot trip the guard on its own explanation.
-  const sanitized = stripYamlComments(builder);
+  const config = parseBuilderConfig(builder);
 
-  for (const key of ARCHIVE_UNPACK_KEYS) {
-    const present = new RegExp(`^\\s*${key}\\s*:`, 'm').test(sanitized);
-    assert.equal(present, false, `PACKAGING_ASAR_UNPACK_FORBIDDEN:${key}`);
-  }
-
-  // `asar` may be absent (defaults to true) but must never be turned off.
-  const asarValue = sanitized.match(/^\s*asar\s*:\s*(.*)$/m);
-  if (asarValue) {
-    const value = asarValue[1].trim().replace(/^["']|["']$/g, '').toLowerCase();
-    assert.equal(value, 'true', `PACKAGING_ASAR_MUST_STAY_ENABLED:${value || '(empty)'}`);
+  for (const { key, value, path: where } of walkMappings(config)) {
+    if (ARCHIVE_UNPACK_KEYS.includes(key)) {
+      assert.fail(`PACKAGING_ASAR_UNPACK_FORBIDDEN:${key} at ${where}. ${UNPACK_REMEDY}`);
+    }
+    // `asar` may be absent (electron-builder defaults it to true) but must never
+    // be anything other than the literal true. Strict equality is what makes the
+    // YAML truthiness zoo — false/False/FALSE plus the strings "no"/"off"/0 that
+    // js-yaml 4 no longer coerces to booleans — collapse into one rejected case.
+    if (key === 'asar' && value !== true) {
+      assert.fail(`PACKAGING_ASAR_MUST_STAY_ENABLED:${describeValue(value)} at ${where}. ${ASAR_REMEDY}`);
+    }
   }
 }
 
-/** Drop YAML comments, honouring quoted '#' characters. */
-function stripYamlComments(builder) {
-  return builder.split(/\r?\n/).map((line) => {
-    let quote = null;
-    for (let index = 0; index < line.length; index += 1) {
-      const character = line[index];
-      if (quote) {
-        if (character === quote) quote = null;
-      } else if (character === '"' || character === "'") {
-        quote = character;
-      } else if (character === '#' && (index === 0 || /\s/.test(line[index - 1]))) {
-        return line.slice(0, index);
-      }
+/**
+ * Load the config, failing CLOSED: an unparseable or non-mapping document must
+ * never be read as "no forbidden keys found".
+ *
+ * @param {string} builder
+ * @returns {Record<string, unknown>}
+ */
+function parseBuilderConfig(builder) {
+  let config;
+  try {
+    config = yaml.load(builder, { filename: 'electron-builder.yml' });
+  } catch (error) {
+    assert.fail(`PACKAGING_CONFIG_UNPARSEABLE:${error instanceof Error ? error.message.split('\n')[0] : 'unknown'}`);
+  }
+  assert.ok(
+    config !== null && typeof config === 'object' && !Array.isArray(config),
+    'PACKAGING_CONFIG_NOT_A_MAPPING'
+  );
+  return config;
+}
+
+/**
+ * Yield every mapping key in the document, depth first, with a readable path.
+ *
+ * Cycle-guarded: YAML anchors and aliases can produce a self-referential graph,
+ * and a security guard must not be turned into an infinite loop by a config.
+ *
+ * @param {unknown} node
+ * @param {string[]} [trail]
+ * @param {WeakSet<object>} [seen]
+ * @returns {Generator<{ key: string, value: unknown, path: string }>}
+ */
+function* walkMappings(node, trail = [], seen = new WeakSet()) {
+  if (node === null || typeof node !== 'object' || seen.has(node)) return;
+  seen.add(node);
+
+  if (Array.isArray(node)) {
+    for (let index = 0; index < node.length; index += 1) {
+      yield* walkMappings(node[index], [...trail, `[${index}]`], seen);
     }
-    return line;
-  }).join('\n');
+    return;
+  }
+
+  for (const [key, value] of Object.entries(node)) {
+    const here = [...trail, key];
+    yield { key, value, path: formatPath(here) };
+    yield* walkMappings(value, here, seen);
+  }
+}
+
+function formatPath(trail) {
+  return trail.reduce((accumulator, segment) => {
+    if (segment.startsWith('[')) return `${accumulator}${segment}`;
+    return accumulator ? `${accumulator}.${segment}` : segment;
+  }, '') || '(root)';
+}
+
+function describeValue(value) {
+  if (value === undefined) return '(empty)';
+  try {
+    return typeof value === 'object' && value !== null ? JSON.stringify(value) : String(value);
+  } catch {
+    return '(unserializable)';
+  }
 }
 
 function extractListSection(builder, section) {
