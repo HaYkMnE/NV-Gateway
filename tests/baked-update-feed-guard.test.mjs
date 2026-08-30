@@ -187,98 +187,349 @@ test('the guard refuses to guess the feed when NVGW_GH_OWNER is absent', () => {
 // (a build that cannot auto-update must not become a published release).
 // ───────────────────────────────────────────────────────────────────────────
 
-test('release.yml runs the baked-feed guard after packaging and before every upload', () => {
-  const workflow = yaml.load(fs.readFileSync(path.join(root, '.github/workflows/release.yml'), 'utf8'));
+const GUARD_SCRIPT = 'scripts/verify-baked-update-feed.mjs';
 
-  const GUARD_SCRIPT = 'scripts/verify-baked-update-feed.mjs';
+// Actions REVIEWED as incapable of publishing a GitHub release. Every OTHER
+// `uses:` in a release job is treated as publish-capable and must therefore be
+// routed and ordered like an upload.
+//
+// This is fail-CLOSED on purpose, and it is the lesson of a measured defect:
+// recognising uploads by PATTERN (`action-gh-release`, `gh release upload`)
+// while ENFORCING an allowlist meant any publisher outside the pattern received
+// no enforcement at all. Measured — each of these published with the guard
+// unable to gate it, while this test stayed green:
+//   * ncipollo/release-action@v1 in a parallel job (a real release publisher);
+//   * `gh api --method POST /repos/.../releases/1/assets` (no `gh release` text);
+//   * `uses: ./.github/actions/upload-release` (a local composite wrapper).
+// Enumerating every publisher on the marketplace is impossible, so the polarity
+// is inverted: an UNKNOWN action in a release job is a review prompt, not a
+// silent pass. Adding one line here is the remedy, and it forces a human to
+// confirm the action cannot publish.
+// upload-artifact/download-artifact write to the WORKFLOW RUN's artifact store,
+// which electron-updater never reads and which cannot create a release — they are
+// pre-approved so the commonest safe additions to a release job are not blocked.
+const REVIEWED_NON_PUBLISHING_ACTIONS = Object.freeze([
+  'actions/checkout@',
+  'actions/setup-node@',
+  'actions/upload-artifact@',
+  'actions/download-artifact@',
+  'actions/cache@'
+]);
+/** The single reviewed publish path: fail_on_unmatched_files + repository routing. */
+const APPROVED_PUBLISHER = 'softprops/action-gh-release@';
+
+/**
+ * Audit the release workflow's guard wiring and return every problem found.
+ *
+ * Returned as a list rather than thrown so the same logic can be driven against
+ * synthetic bypass shapes in-process, instead of only against the real file.
+ *
+ * @param {any} workflow Parsed .github/workflows/release.yml.
+ * @returns {string[]} Human-readable problems; empty means correctly wired.
+ */
+function auditReleaseWiring(workflow) {
+  const problems = [];
+  const jobs = Object.entries(workflow?.jobs ?? {});
   const isGuardStep = (step) => typeof step.run === 'string' && step.run.includes(GUARD_SCRIPT);
-  // An upload is anything that PUBLISHES release artifacts: the audited action,
-  // or a run: command driving `gh release upload/create`. (Mere mentions —
-  // `gh release view/list` — publish nothing and are not uploads.)
-  const isUploadStep = (step) =>
-    (typeof step.uses === 'string' && step.uses.includes('action-gh-release')) ||
-    (typeof step.run === 'string' && /\bgh\s+release\s+(?:upload|create)\b/.test(step.run));
   // Status-check functions that let a step or job run even though something
   // FAILED re-open the silent-success mode. success() is the default and safe.
   const hasBypassCondition = (value) =>
     typeof value === 'string' && /\b(?:always|failure|cancelled)\s*\(/i.test(value);
+  const isApprovedPublisher = (step) =>
+    typeof step.uses === 'string' && step.uses.startsWith(APPROVED_PUBLISHER);
+  const isReviewedInert = (step) =>
+    typeof step.uses === 'string' &&
+    REVIEWED_NON_PUBLISHING_ACTIONS.some((prefix) => step.uses.startsWith(prefix));
+  // `gh release <anything>` and a REST asset/release POST both publish. Matching
+  // `gh release` broadly (not just upload/create) costs nothing: a read-only
+  // `gh release view` in a release job is still worth a human glance.
+  const runCanPublish = (step) =>
+    typeof step.run === 'string' &&
+    (/\bgh\s+release\b/.test(step.run) || /\bgh\s+api\b[^\n]*releases?\b/.test(step.run));
+  const isPublishCapable = (step) =>
+    isApprovedPublisher(step) || runCanPublish(step) ||
+    (typeof step.uses === 'string' && !isReviewedInert(step));
 
   // Locate the guard and ITS JOB. Ordering is only meaningful within one job:
   // YAML job order is not execution order — jobs run in parallel absent needs:.
-  const guardJobEntry = Object.entries(workflow.jobs)
-    .find(([, job]) => (job.steps ?? []).some(isGuardStep));
-  assert.ok(guardJobEntry, 'release.yml must run scripts/verify-baked-update-feed.mjs');
+  const guardJobEntry = jobs.find(([, job]) => (job?.steps ?? []).some(isGuardStep));
+  if (!guardJobEntry) return [`release.yml must run ${GUARD_SCRIPT}`];
   const [guardJobName, guardJob] = guardJobEntry;
   const guardSteps = guardJob.steps ?? [];
   const guardAt = guardSteps.findIndex(isGuardStep);
   const guard = guardSteps[guardAt];
 
-  // The guard's run must be the invocation and NOTHING else. Any shell chaining
-  // (`|| true`, `;`, `&&`, a second line ending in `exit 0`) can swallow the
-  // guard's exit code while a name search still finds the script. Compared
-  // against the PARSED scalar, so quoting/re-indentation of keys stays fine.
-  assert.equal(guard.run.trim(), `node ${GUARD_SCRIPT}`,
-    'the baked-feed guard must be invoked exactly as `node scripts/verify-baked-update-feed.mjs` — shell chaining can swallow its exit code');
+  // The guard's `run` must be ONE command that invokes the script, with no shell
+  // chaining or substitution able to swallow its exit code. Arguments are fine —
+  // forbidding them would block legitimate maintenance (`--verbose`) without
+  // closing any hole. What must never appear: `|| true`, `; exit 0`, a pipeline,
+  // a second command line, or a command substitution.
+  const runLines = String(guard.run).trim().split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith('#'));
+  if (runLines.length !== 1) {
+    problems.push(`the baked-feed guard's run must be a SINGLE command — ${runLines.length} command lines can swallow its exit code (a trailing \`exit 0\` reports success after a failure)`);
+  } else {
+    const [command] = runLines;
+    if (/[&|;`$()<>]/.test(command)) {
+      problems.push(`the baked-feed guard's run must not use shell chaining or substitution (found in \`${command}\`) — \`|| true\` and friends swallow its exit code`);
+    }
+    if (!new RegExp(`^node\\s+${GUARD_SCRIPT.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\s|$)`).test(command)) {
+      problems.push(`the baked-feed guard must be invoked as \`node ${GUARD_SCRIPT}\` (optionally with arguments), found \`${command}\``);
+    }
+  }
 
   // Packaging must precede the guard IN THE SAME JOB: app-update.yml exists on
   // that runner's disk only after build:release ran there.
   const buildAt = guardSteps.findIndex((step) =>
     typeof step.run === 'string' && step.run.includes('build:release'));
-  assert.ok(buildAt >= 0, `release.yml must still build the release in the guard's job ("${guardJobName}")`);
-  assert.ok(guardAt > buildAt,
-    'the baked-feed guard must run AFTER packaging — app-update.yml does not exist before it');
+  if (buildAt < 0) problems.push(`release.yml must still build the release in the guard's job ("${guardJobName}")`);
+  else if (!(guardAt > buildAt)) {
+    problems.push('the baked-feed guard must run AFTER packaging — app-update.yml does not exist before it');
+  }
 
-  // Every artifact upload must be gated by the guard, or a feed-less build
+  // Resolve each job's transitive needs: closure. A chain
+  // (publish -> gate -> build) genuinely orders publish after the guard, so
+  // demanding a DIRECT needs: would block a legitimate refactor. A named job
+  // that does not exist contributes nothing, so it still fails.
+  const needsOf = (job) => (Array.isArray(job?.needs) ? job.needs : (job?.needs ? [job.needs] : []));
+  const jobsByName = new Map(jobs);
+  const closureOf = (name) => {
+    const seen = new Set();
+    const queue = [...needsOf(jobsByName.get(name))];
+    while (queue.length > 0) {
+      const next = queue.shift();
+      if (typeof next !== 'string' || seen.has(next) || !jobsByName.has(next)) continue;
+      seen.add(next);
+      queue.push(...needsOf(jobsByName.get(next)));
+    }
+    return seen;
+  };
+
+  // Every publish-capable step must be gated by the guard, or a feed-less build
   // could still be published before anyone notices.
-  const uploadJobs = Object.entries(workflow.jobs)
-    .map(([name, job]) => ({
-      name,
-      job,
-      uploads: (job.steps ?? [])
-        .map((step, index) => ({ step, index }))
-        .filter(({ step }) => isUploadStep(step))
-    }))
-    .filter(({ uploads }) => uploads.length > 0);
-  assert.ok(uploadJobs.length >= 1, 'release.yml must upload release artifacts');
-  for (const { name, job, uploads } of uploadJobs) {
-    for (const { step, index } of uploads) {
-      assert.ok(!hasBypassCondition(step.if),
-        `upload step "${step.name ?? `#${index}`}" carries always()/failure()/cancelled() — it would publish even after the guard failed`);
-      assert.ok(typeof step.uses === 'string' && step.uses.startsWith('softprops/action-gh-release@'),
-        `upload step "${step.name ?? `#${index}`}" must publish through the pinned, audited softprops/action-gh-release — ` +
-        'an ad-hoc upload path (a fork, a run: command) is not reviewed for fail-closed artifact semantics (fail_on_unmatched_files, repository routing)');
-      if (name === guardJobName) {
-        assert.ok(guardAt < index,
-          'the baked-feed guard must run BEFORE any upload so a feed-less build is never published');
+  let publishCapableCount = 0;
+  for (const [name, job] of jobs) {
+    const steps = job?.steps ?? [];
+    const candidates = steps.map((step, index) => ({ step, index })).filter(({ step }) => isPublishCapable(step));
+    if (candidates.length === 0) continue;
+    publishCapableCount += candidates.length;
+    for (const { step, index } of candidates) {
+      const label = `"${step.name ?? step.uses ?? `#${index}`}" in job "${name}"`;
+      if (hasBypassCondition(step.if)) {
+        problems.push(`upload step ${label} carries always()/failure()/cancelled() — it would publish even after the guard failed`);
+      }
+      if (!isApprovedPublisher(step)) {
+        problems.push(typeof step.uses === 'string'
+          ? `step ${label} uses "${step.uses}", which is neither the approved publisher (${APPROVED_PUBLISHER}) nor a reviewed non-publishing action — an unreviewed action in a release job may publish artifacts the baked-feed guard cannot gate. Either route it through the approved publisher, or add it to REVIEWED_NON_PUBLISHING_ACTIONS once confirmed it cannot publish.`
+          : `upload step ${label} publishes through an ad-hoc command instead of the pinned, audited ${APPROVED_PUBLISHER} — an ad-hoc path is not reviewed for fail-closed artifact semantics (fail_on_unmatched_files, repository routing)`);
+      }
+      if (name === guardJobName && !(guardAt < index)) {
+        problems.push(`the baked-feed guard must run BEFORE any upload so a feed-less build is never published (${label})`);
       }
     }
     if (name !== guardJobName) {
-      // An upload in ANOTHER job runs in parallel with the guard unless it
-      // explicitly needs the guard's job — YAML job order is not execution order.
-      const needs = Array.isArray(job.needs) ? job.needs : (job.needs ? [job.needs] : []);
-      assert.ok(needs.includes(guardJobName),
-        `upload job "${name}" must declare needs: ["${guardJobName}"] — jobs run in parallel, so without it the upload can publish before the guard finishes`);
-      assert.ok(!hasBypassCondition(job.if),
-        `upload job "${name}" carries always()/failure()/cancelled() at job level — it would publish even after the guard's job failed`);
+      // A publish in ANOTHER job runs in parallel with the guard unless it
+      // reaches the guard's job through needs: — directly or transitively.
+      const closure = closureOf(name);
+      if (!closure.has(guardJobName)) {
+        problems.push(`upload job "${name}" must reach needs: ["${guardJobName}"] — jobs run in parallel, so without it the upload can publish before the guard finishes`);
+      }
+      // A bypass condition ANYWHERE on the chain re-opens the hole: an
+      // intermediate `if: always()` lets the publish run after the guard failed.
+      for (const link of [name, ...closure]) {
+        if (hasBypassCondition(jobsByName.get(link)?.if)) {
+          problems.push(`job "${link}" on upload job "${name}"'s needs: chain carries always()/failure()/cancelled() at job level — it would publish even after the guard's job failed`);
+        }
+      }
     }
   }
+  if (publishCapableCount === 0) problems.push('release.yml must upload release artifacts');
 
   // Job-level continue-on-error converts the guard's failure into a green check
   // (and lets needs:-dependent jobs run) exactly as step-level would.
-  assert.equal(guardJob['continue-on-error'] ?? false, false,
-    `job "${guardJobName}" runs the baked-feed guard, so it must not continue-on-error`);
-
+  if ((guardJob['continue-on-error'] ?? false) !== false) {
+    problems.push(`job "${guardJobName}" runs the baked-feed guard, so it must not continue-on-error`);
+  }
   // Not optional on the step either: an `if:` or continue-on-error restores the
   // silent-success mode.
-  assert.equal('if' in guard, false, 'the baked-feed guard must not be conditional');
-  assert.equal('continue-on-error' in guard, false, 'the baked-feed guard must not fail softly');
+  if ('if' in guard) problems.push('the baked-feed guard must not be conditional');
+  if ('continue-on-error' in guard) problems.push('the baked-feed guard must not fail softly');
 
   // It must resolve the expected feed from the same owner used at package time,
-  // and must NOT set NVGW_GH_REPO (that would redirect the baked feed).
-  assert.equal(guard.env?.NVGW_GH_OWNER, '${{ github.repository_owner }}',
-    'the guard must resolve the expected feed from the packaging owner');
-  assert.equal(Object.hasOwn(guard.env ?? {}, 'NVGW_GH_REPO'), false,
-    'the guard must not set NVGW_GH_REPO — the baked feed stays on the releases repo');
+  // and must NOT set NVGW_GH_REPO (that would redirect the baked feed). The
+  // value may live at step, job or workflow level — GitHub's own precedence is
+  // step > job > workflow, and all three are equally effective, so pinning it to
+  // the step would block a legitimate hoist to workflow-level env.
+  const envLayers = [guard.env, guardJob.env, workflow.env];
+  const effective = (key) => {
+    for (const layer of envLayers) if (layer && Object.hasOwn(layer, key)) return layer[key];
+    return undefined;
+  };
+  if (effective('NVGW_GH_OWNER') !== '${{ github.repository_owner }}') {
+    problems.push('the guard must resolve the expected feed from the packaging owner (NVGW_GH_OWNER: ${{ github.repository_owner }} at step, job or workflow level)');
+  }
+  if (envLayers.some((layer) => layer && Object.hasOwn(layer, 'NVGW_GH_REPO'))) {
+    problems.push('the guard must not set NVGW_GH_REPO at any level — the baked feed stays on the releases repo');
+  }
+  return problems;
+}
+
+test('release.yml runs the baked-feed guard after packaging and before every upload', () => {
+  const workflow = yaml.load(fs.readFileSync(path.join(root, '.github/workflows/release.yml'), 'utf8'));
+  assert.deepEqual(auditReleaseWiring(workflow), [],
+    'release.yml is no longer wired so the baked-feed guard gates every publish');
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// The wiring audit is itself mutation-tested. A wiring test that recognises
+// only the publishers it already knows about enforces nothing on the others —
+// MEASURED: ncipollo/release-action, a `gh api` asset POST and a local
+// composite action each published with the guard unable to gate them while the
+// previous version of this test stayed green.
+// ───────────────────────────────────────────────────────────────────────────
+
+test('the wiring audit CATCHES every way to publish around the guard', () => {
+  const guardJobSteps = (extra = []) => [
+    { uses: 'actions/checkout@v4' },
+    { run: 'npm run build:release' },
+    ...extra,
+    { run: `node ${GUARD_SCRIPT}`, env: { NVGW_GH_OWNER: '${{ github.repository_owner }}' } },
+    { uses: 'softprops/action-gh-release@v2.6.2', with: { files: 'dist/x.exe' } }
+  ];
+  const wellWired = () => ({ jobs: { 'build-release': { steps: guardJobSteps() } } });
+  // Control: the shape the assertions below mutate must itself be clean.
+  assert.deepEqual(auditReleaseWiring(wellWired()), [], 'the control workflow must audit clean');
+
+  const PUBLISHERS = [
+    ['a different release action', { name: 'p', uses: 'ncipollo/release-action@v1' }],
+    ['a gh api asset POST', { name: 'p', run: 'gh api --method POST /repos/o/r/releases/1/assets -f name=x' }],
+    ['a local composite action', { name: 'p', uses: './.github/actions/upload-release' }],
+    ['a FORK of the approved action', { name: 'p', uses: 'evil-fork/action-gh-release@v2.6.2' }],
+    ['the approved action', { name: 'p', uses: 'softprops/action-gh-release@v2.6.2' }],
+    ['a gh release upload command', { name: 'p', run: 'gh release upload v1 dist/x.exe' }]
+  ];
+  for (const [label, publisher] of PUBLISHERS) {
+    // (a) publishing in a PARALLEL job the guard cannot gate.
+    const parallel = wellWired();
+    parallel.jobs['publish-elsewhere'] = { steps: [publisher] };
+    assert.notEqual(auditReleaseWiring(parallel).length, 0,
+      `${label} in a parallel job must be caught — it publishes before the guard finishes`);
+    // (b) publishing BEFORE the guard in the guard's own job.
+    const early = { jobs: { 'build-release': { steps: guardJobSteps([publisher]) } } };
+    assert.notEqual(auditReleaseWiring(early).length, 0,
+      `${label} before the guard must be caught — the feed is unverified at that point`);
+  }
+
+  // Neutralisations of the guard step itself.
+  const NEUTRALISATIONS = [
+    ['|| true swallowing the exit code', (w) => { w.jobs['build-release'].steps[2].run = `node ${GUARD_SCRIPT} || true`; }],
+    ['a trailing exit 0', (w) => { w.jobs['build-release'].steps[2].run = `node ${GUARD_SCRIPT}\nexit 0`; }],
+    ['a command substitution', (w) => { w.jobs['build-release'].steps[2].run = `node ${GUARD_SCRIPT} $(echo)`; }],
+    ['a piped-away failure', (w) => { w.jobs['build-release'].steps[2].run = `node ${GUARD_SCRIPT} | cat`; }],
+    ['not invoking node at all', (w) => { w.jobs['build-release'].steps[2].run = `echo ${GUARD_SCRIPT}`; }],
+    ['step continue-on-error', (w) => { w.jobs['build-release'].steps[2]['continue-on-error'] = true; }],
+    ['a conditional guard', (w) => { w.jobs['build-release'].steps[2].if = 'success()'; }],
+    ['job continue-on-error', (w) => { w.jobs['build-release']['continue-on-error'] = true; }],
+    ['the guard placed before packaging', (w) => { w.jobs['build-release'].steps.splice(1, 0, w.jobs['build-release'].steps.splice(2, 1)[0]); }],
+    ['NVGW_GH_REPO redirecting the expectation', (w) => { w.jobs['build-release'].steps[2].env.NVGW_GH_REPO = 'NV-Gateway'; }],
+    ['NVGW_GH_REPO hoisted to workflow level', (w) => { w.env = { NVGW_GH_REPO: 'NV-Gateway' }; }],
+    ['a wrong owner expectation', (w) => { w.jobs['build-release'].steps[2].env.NVGW_GH_OWNER = 'someone-else'; }],
+    ['always() on the upload step', (w) => { w.jobs['build-release'].steps[3].if = 'always()'; }],
+    ['packaging removed entirely', (w) => { w.jobs['build-release'].steps.splice(1, 1); }],
+    ['the guard removed entirely', (w) => { w.jobs['build-release'].steps.splice(2, 1); }]
+  ];
+  for (const [label, mutate] of NEUTRALISATIONS) {
+    const workflow = wellWired();
+    mutate(workflow);
+    assert.notEqual(auditReleaseWiring(workflow).length, 0, `${label} must be caught`);
+  }
+
+  // Cross-job bypasses.
+  const crossJob = (publishJob) => {
+    const workflow = wellWired();
+    workflow.jobs['publish-elsewhere'] = { ...publishJob, steps: [{ name: 'p', uses: 'softprops/action-gh-release@v2.6.2' }] };
+    return workflow;
+  };
+  for (const [label, job] of [
+    ['no needs: at all', {}],
+    ['needs: naming a job that does not exist', { needs: ['nope'] }],
+    ['needs: the guard job but job-level always()', { needs: ['build-release'], if: 'always()' }]
+  ]) {
+    assert.notEqual(auditReleaseWiring(crossJob(job)).length, 0, `a cross-job upload with ${label} must be caught`);
+  }
+  // An intermediate job with a bypass condition breaks the chain's guarantee.
+  const brokenChain = wellWired();
+  brokenChain.jobs.gate = { needs: ['build-release'], if: 'always()', steps: [{ run: 'echo ok' }] };
+  brokenChain.jobs['publish-elsewhere'] = { needs: ['gate'], steps: [{ uses: 'softprops/action-gh-release@v2.6.2' }] };
+  assert.notEqual(auditReleaseWiring(brokenChain).length, 0,
+    'a needs: chain whose intermediate job carries always() must be caught');
+});
+
+test('the wiring audit ACCEPTS legitimate, safe maintenance edits', () => {
+  const base = () => ({
+    jobs: {
+      'build-release': {
+        steps: [
+          { uses: 'actions/checkout@v4' },
+          { uses: 'actions/setup-node@v4', with: { 'node-version': '20.x' } },
+          { run: 'npm run build:release' },
+          { run: `node ${GUARD_SCRIPT}`, env: { NVGW_GH_OWNER: '${{ github.repository_owner }}' } },
+          { uses: 'softprops/action-gh-release@v2.6.2', if: "startsWith(github.ref, 'refs/tags/')" }
+        ]
+      }
+    }
+  });
+
+  const LEGITIMATE = [
+    // Pinning to a commit SHA is a SECURITY IMPROVEMENT. A wiring test that
+    // blocks it would push maintainers to delete the test instead.
+    ['the action pinned to a commit SHA', (w) => {
+      w.jobs['build-release'].steps[4].uses = 'softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65';
+    }],
+    ['the action bumped to a newer tag', (w) => { w.jobs['build-release'].steps[4].uses = 'softprops/action-gh-release@v2.7.0'; }],
+    ['a legitimate flag on the guard', (w) => { w.jobs['build-release'].steps[3].run = `node ${GUARD_SCRIPT} --verbose`; }],
+    ['the guard run as a block scalar', (w) => { w.jobs['build-release'].steps[3].run = `node ${GUARD_SCRIPT}\n`; }],
+    ['extra whitespace in the guard run', (w) => { w.jobs['build-release'].steps[3].run = `  node  ${GUARD_SCRIPT}  `; }],
+    ['timeout-minutes on the guard', (w) => { w.jobs['build-release'].steps[3]['timeout-minutes'] = 5; }],
+    ['shell: pwsh on the guard', (w) => { w.jobs['build-release'].steps[3].shell = 'pwsh'; }],
+    ['NVGW_GH_OWNER hoisted to workflow level', (w) => {
+      delete w.jobs['build-release'].steps[3].env;
+      w.env = { NVGW_GH_OWNER: '${{ github.repository_owner }}' };
+    }],
+    ['NVGW_GH_OWNER hoisted to job level', (w) => {
+      delete w.jobs['build-release'].steps[3].env;
+      w.jobs['build-release'].env = { NVGW_GH_OWNER: '${{ github.repository_owner }}' };
+    }],
+    ['a third upload after the guard', (w) => {
+      w.jobs['build-release'].steps.push({ uses: 'softprops/action-gh-release@v2.6.2', with: { files: 'dist/SHA256SUMS.txt' } });
+    }],
+    ['a tag condition on the upload', (w) => { w.jobs['build-release'].steps[4].if = "startsWith(github.ref, 'refs/tags/')"; }],
+    ['a strategy.matrix of one', (w) => { w.jobs['build-release'].strategy = { matrix: { os: ['windows-latest'] } }; }],
+    // Writes to the workflow-run artifact store, which cannot create a release.
+    ['actions/upload-artifact added after the guard', (w) => {
+      w.jobs['build-release'].steps.push({ uses: 'actions/upload-artifact@v4', with: { path: 'dist/*.exe' } });
+    }],
+    ['actions/cache added before packaging', (w) => {
+      w.jobs['build-release'].steps.splice(2, 0, { uses: 'actions/cache@v4', with: { path: '~/.npm' } });
+    }],
+    ['a cross-job upload with a DIRECT needs:', (w) => {
+      w.jobs['publish-readme'] = { needs: ['build-release'], steps: [{ uses: 'softprops/action-gh-release@v2.6.2' }] };
+    }],
+    ['a cross-job upload with needs: as a STRING', (w) => {
+      w.jobs['publish-readme'] = { needs: 'build-release', steps: [{ uses: 'softprops/action-gh-release@v2.6.2' }] };
+    }],
+    ['a cross-job upload reached TRANSITIVELY', (w) => {
+      w.jobs.gate = { needs: ['build-release'], steps: [{ run: 'echo ok' }] };
+      w.jobs['publish-readme'] = { needs: ['gate'], steps: [{ uses: 'softprops/action-gh-release@v2.6.2' }] };
+    }]
+  ];
+  for (const [label, mutate] of LEGITIMATE) {
+    const workflow = base();
+    mutate(workflow);
+    assert.deepEqual(auditReleaseWiring(workflow), [],
+      `${label} is a legitimate edit and must NOT be blocked — a wiring test that cries wolf gets deleted`);
+  }
 });
 
 test('the baked-feed guard reports the real packaged output when one exists', { skip: !fs.existsSync(path.join(root, 'dist', 'win-unpacked')) }, (t) => {
