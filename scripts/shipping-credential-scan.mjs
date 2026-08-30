@@ -25,7 +25,13 @@ const EXPECTED_FILES_RULES = [
   // The engine bundle moved INTO app.asar so ASAR integrity validation covers
   // it; it used to be an extraResource, i.e. outside the integrity envelope.
   'build/gateway/**/*',
-  'package.json'
+  'package.json',
+  // Deliberate, reviewed addition (source-map exclusion, shipped-size work):
+  // a pure NEGATION, so it adds no payload root and the scanned roots below
+  // are unchanged. It also filters the collected production node_modules —
+  // electron-builder applies the main matcher's patterns to them
+  // (app-builder-lib/out/util/appFileCopier.js:168-170).
+  '!**/*.map'
 ];
 // Only inert image assets ship OUTSIDE app.asar now. The engine bundle moved into
 // the archive (see EXPECTED_FILES_RULES) so ASAR integrity validation covers it,
