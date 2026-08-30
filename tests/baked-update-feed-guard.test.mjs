@@ -110,6 +110,54 @@ test('the guard REFUSES a baked releaseType that would serve drafts or prereleas
   }
 });
 
+test('the guard REFUSES feed fields that are collections instead of scalars', () => {
+  // String(['HaYkMnE']) === 'HaYkMnE' — without a type gate, js-yaml hands a
+  // one-item list back as an Array and String() flattens it into the EXPECTED
+  // value: a structurally odd document would be silently accepted.
+  const cases = [
+    ['owner as a one-item list', 'provider: github\nowner: [HaYkMnE]\nrepo: NV-Gateway-releases\nreleaseType: release\n'],
+    ['repo as a one-item list', 'provider: github\nowner: HaYkMnE\nrepo: [NV-Gateway-releases]\nreleaseType: release\n'],
+    ['provider as a one-item list', 'provider: [github]\nowner: HaYkMnE\nrepo: NV-Gateway-releases\nreleaseType: release\n'],
+    ['releaseType as a one-item list', 'provider: github\nowner: HaYkMnE\nrepo: NV-Gateway-releases\nreleaseType: [release]\n'],
+    ['all four fields as one-item lists', 'provider: [github]\nowner: [HaYkMnE]\nrepo: [NV-Gateway-releases]\nreleaseType: [release]\n'],
+    ['owner as a mapping', 'provider: github\nowner: {name: HaYkMnE}\nrepo: NV-Gateway-releases\nreleaseType: release\n'],
+    ['releaseType as a multi-item list', 'provider: github\nowner: HaYkMnE\nrepo: NV-Gateway-releases\nreleaseType: [release, draft]\n'],
+    ['a wrong value inside a list', 'provider: github\nowner: [someone-else]\nrepo: NV-Gateway-releases\nreleaseType: release\n']
+  ];
+  for (const [label, body] of cases) {
+    const directory = packagedOutput(body);
+    try {
+      const result = verifyBakedUpdateFeed({ root, packageOutputDirectory: directory, env: OWNER_ENV });
+      assert.equal(result.ok, false, `${label} must be refused, not flattened into a passing value`);
+      assert.match(result.error, /expected a scalar/, `${label} must fail on the TYPE, not on a coerced value`);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test('the guard ACCEPTS unusual-but-valid scalar encodings of the correct feed', () => {
+  // Regression shield for the scalar gate above: it must reject COLLECTIONS,
+  // not encodings. All of these parse to the correct scalars.
+  const correct = 'provider: github\nowner: HaYkMnE\nrepo: NV-Gateway-releases\nreleaseType: release\n';
+  const cases = [
+    ['extra unexpected keys', correct + 'updaterCacheDirName: nv-gateway-updater\nfutureKey: [1, 2]\n'],
+    ['unquoted surrounding whitespace (YAML strips it)', 'provider: github\nowner:   HaYkMnE  \nrepo: NV-Gateway-releases\nreleaseType: release\n'],
+    ['an anchor/alias resolving to the right value', 'provider: github\nowner: &o HaYkMnE\nrepo: NV-Gateway-releases\nreleaseType: release\nx-copy: *o\n'],
+    ['a UTF-8 BOM', '﻿' + correct],
+    ['CRLF line endings', correct.replace(/\n/g, '\r\n')]
+  ];
+  for (const [label, body] of cases) {
+    const directory = packagedOutput(body);
+    try {
+      const result = verifyBakedUpdateFeed({ root, packageOutputDirectory: directory, env: OWNER_ENV });
+      assert.equal(result.ok, true, `${label} must still pass, got: ${result.ok ? '' : result.error}`);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
 test('the guard fails CLOSED on an unparseable or non-mapping app-update.yml', () => {
   for (const [label, body] of [['unparseable', 'provider: [github\n'], ['not a mapping', '- github\n']]) {
     const directory = packagedOutput(body);

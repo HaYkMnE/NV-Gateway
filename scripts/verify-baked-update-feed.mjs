@@ -93,9 +93,24 @@ export function verifyBakedUpdateFeed({
     return { ok: false, error: `${APP_UPDATE_FILE} did not parse to a mapping, so the baked feed cannot be read.` };
   }
 
+  // Every expected field must be a YAML SCALAR. js-yaml hands collections back
+  // as arrays/objects, and String(['HaYkMnE']) === 'HaYkMnE' — without this
+  // gate a one-item list is silently flattened into the expected value and a
+  // structurally odd document passes. Scalars (string/number/boolean) go on to
+  // the value comparisons below; null means "absent" and is caught there too.
+  const expected = { provider: 'github', owner: publish.owner, repo: publish.repo };
+  const nonScalar = [...Object.keys(expected), 'releaseType']
+    .filter((key) => document[key] !== null && typeof document[key] === 'object')
+    .map((key) => `${key}: expected a scalar, baked ${Array.isArray(document[key]) ? 'a list' : 'a mapping'}`);
+  if (nonScalar.length > 0) {
+    return {
+      ok: false,
+      error: `${APP_UPDATE_FILE} has a non-scalar feed field, so the baked feed cannot be trusted:\n  ${nonScalar.join('\n  ')}`
+    };
+  }
+
   // The baked values must match the SAME resolution the packaging wrapper used.
   // A mismatch means the app would poll a repository the release never reaches.
-  const expected = { provider: 'github', owner: publish.owner, repo: publish.repo };
   const mismatched = Object.entries(expected)
     .filter(([key, value]) => String(document[key] ?? '') !== String(value))
     .map(([key, value]) => `${key}: expected "${value}", baked "${document[key] ?? '(absent)'}"`);
