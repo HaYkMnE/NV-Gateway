@@ -8,8 +8,15 @@
  *
  * Every play* method takes an optional variant index 0|1|2; when omitted the
  * Shuffle Round-Robin pool picks a variant with NO consecutive repeats.
- * Each method returns the variant that was chosen (-1 if audio is disabled
- * or the AudioContext is unavailable).
+ * Each method returns the variant that was chosen (-1 if audio is disabled,
+ * the window is not currently audible, or the AudioContext is unavailable).
+ *
+ * AUDIBILITY GATE (see setAudibleGate). Sound must only exist while the window
+ * is genuinely active. That is enforced by POLLING a caller-supplied predicate
+ * at the moment sound would be produced, not by reacting to blur/hide events:
+ * the reported defect was precisely that a hide whose transition never reached
+ * the renderer left the ambient cadence armed and the pet audible in the tray.
+ * A polled gate cannot be defeated by a missed event.
  */
 
 type SfxKey =
@@ -74,6 +81,12 @@ class PetAudioEngine {
   private enabled = false;
   private activeVoices: ActiveVoice[] = [];
   private readonly variantHistory = new Map<SfxKey, number>();
+
+  /**
+   * Window-audibility predicate. Default `true` keeps standalone/legacy use
+   * (and any caller that never installs a gate) behaving exactly as before.
+   */
+  private audibleGate: () => boolean = () => true;
 
   // Autonomous ambient scheduler state
   private ambientTimer: ReturnType<typeof setTimeout> | null = null;
@@ -182,6 +195,46 @@ class PetAudioEngine {
 
   isEnabled(): boolean {
     return this.enabled && this.ctx !== null;
+  }
+
+  /**
+   * Install the window-audibility predicate. Composes WITH {@link setEnabled}
+   * (the user's `nv_pet_sound` preference) rather than replacing it: sound
+   * requires enabled AND audible, and neither can override the other.
+   *
+   * Deliberately a POLLED predicate, not an event subscription. The defect this
+   * fixes was a hide-to-tray whose blur/visibilitychange never reached the
+   * renderer, leaving the ambient cadence armed; a predicate consulted at the
+   * moment of sound production cannot be defeated by a transition we missed.
+   */
+  setAudibleGate(gate: () => boolean): void {
+    this.audibleGate = gate;
+  }
+
+  /**
+   * Evaluate the audibility gate. A throwing gate resolves to SILENCE and is
+   * swallowed: the caller lives in a React effect, where an escaping error
+   * unmounts the pet. Losing a sound is cosmetic, losing the widget is not.
+   * Not a latch — the next tick re-evaluates, so a gate that recovers restores
+   * sound on its own.
+   */
+  private canPlayNow(): boolean {
+    try {
+      return this.audibleGate() !== false;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Go silent immediately: stop and RELEASE every live voice (not merely duck
+   * it — a muted graph with running oscillators is a leak) and stop the ambient
+   * cadence. Idempotent; safe with no AudioContext. Leaves `enabled` alone, so
+   * the user's sound preference survives an attention loss untouched.
+   */
+  silenceNow(): void {
+    this.stealVoices(3);
+    this.stopAmbient();
   }
 
   // ------------------------------------------------------------------
@@ -328,6 +381,10 @@ class PetAudioEngine {
 
   private createVoice(options: VoiceOptions = {}): VoiceHandle | null {
     if (!this.enabled) return null;
+    // Single choke point: EVERY play* method funnels through here, so gating
+    // audibility at this one spot covers the one-shot activity SFX and the
+    // donation cues too — not just the ambient cadence.
+    if (!this.canPlayNow()) return null;
     this.init();
     if (!this.ctx || !this.masterBus) return null;
     const t = this.ctx.currentTime;
@@ -414,7 +471,15 @@ class PetAudioEngine {
     this.ambientTimer = setTimeout(() => {
       this.ambientTimer = null;
       if (!this.enabled) return;
-      this.fireAmbientSound();
+      // Window not currently active: SKIP this tick's sound, but keep the
+      // cadence rolling so audibility can return on its own without any
+      // re-arm. Skipping rather than QUEUEING is what makes the return
+      // thunder-free — nothing is ever stored to be replayed later, so at most
+      // the single next tick can fire whether we were away 10 s or 10 hours.
+      // Exactly one timer is armed at a time, so repeated cycles cannot stack.
+      if (this.canPlayNow()) {
+        this.fireAmbientSound();
+      }
       this.scheduleNextAmbient();
     }, delay);
   }

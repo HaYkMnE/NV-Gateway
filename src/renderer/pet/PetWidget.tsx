@@ -85,6 +85,46 @@ function persistSoundPreference(on: boolean): void {
 }
 
 // ==========================================
+// WINDOW AUDIBILITY (П7 — silence unless the window is genuinely active)
+// ==========================================
+
+/** The minimal window surface this predicate needs (keeps it unit-testable). */
+export interface AudibilityWindow {
+  document: {
+    visibilityState?: string;
+    hasFocus?: () => boolean;
+  };
+}
+
+/**
+ * Whether the window is active enough to make noise.
+ *
+ * WHY hasFocus() IS THE PRIMARY SIGNAL — measured, not assumed. Three states
+ * must be told apart, and `visibilityState` alone cannot do it:
+ *
+ *   1. visible but UNFOCUSED (user working in another app):
+ *      hasFocus() false, visibilityState stays "visible".
+ *   2. MINIMISED: hasFocus() false, visibilityState "hidden".
+ *   3. HIDDEN TO TRAY (the reported complaint — renderer keeps running):
+ *      hasFocus() false; whether visibilityState flips to "hidden" is not
+ *      something this code may rely on.
+ *
+ * Case 1 proves visibilityState is insufficient, and case 3 is the one the user
+ * actually complained about, so hasFocus() carries the decision. visibilityState
+ * is kept as a cheap additional veto, never as the sole signal.
+ *
+ * Degrades rather than going permanently mute: in an environment without
+ * document.hasFocus, gating falls back to visibility alone instead of silencing
+ * the pet forever.
+ */
+export function windowAudible(win: AudibilityWindow): boolean {
+  const doc = win.document;
+  if (doc.visibilityState !== undefined && doc.visibilityState !== 'visible') return false;
+  if (typeof doc.hasFocus === 'function') return doc.hasFocus() === true;
+  return true;
+}
+
+// ==========================================
 // THOUGHT CLOUD CONTENT (per activity)
 // Texts live in the i18n pet_* namespace (pet_thought_<slug>_<variant>,
 // see src/renderer/i18n/resources.ts); only the emoji glyphs stay in-code.
@@ -327,6 +367,13 @@ export function PetWidget({ onOpenDonation }: PetWidgetProps): React.JSX.Element
     });
     engineRef.current = engine;
 
+    // П7 — install the window-audibility gate FIRST, before anything can make
+    // a sound. Polled at every sound-production point, so a hide whose
+    // blur/visibilitychange never reaches the renderer (the tray case) still
+    // ends up silent. This COMPOSES with setEnabled below: the engine requires
+    // enabled AND audible, so the user's mute preference is never overridden.
+    petAudio.setAudibleGate(() => windowAudible(window));
+
     // Enable audio BEFORE the first seeded activity so its SFX is audible,
     // and register a user-gesture unlock: Chromium autoplay policy keeps the
     // AudioContext `suspended` until a resume() runs inside a real gesture.
@@ -343,12 +390,27 @@ export function PetWidget({ onOpenDonation }: PetWidgetProps): React.JSX.Element
     // Single attention-listener path: the engine's attachFocusListeners owns
     // ALL blur/focus/visibilitychange wiring. Ambient audio gating rides the
     // same listeners via hooks (no duplicate listener set here).
+    // Attention lost: hard-silence. silenceNow() stops AND RELEASES live
+    // oscillator/gain nodes rather than ducking them — a muted graph with
+    // running oscillators is a resource leak — and stops the cadence.
+    //
+    // Both hooks are wrapped: they run from window event listeners, and the
+    // same reasoning as window-close-guard.ts applies — a failed sound must
+    // never turn into a failed attention transition or take the widget down.
     const stopAmbient = (): void => {
-      petAudio.stopAmbient();
+      try {
+        petAudio.silenceNow();
+      } catch {
+        /* audio teardown is best-effort — never break the pet's visuals */
+      }
     };
     const startAmbient = (): void => {
       if (!soundRef.current) return;
-      petAudio.scheduleAmbient(() => engineRef.current?.getActivity() ?? 'idle');
+      try {
+        petAudio.scheduleAmbient(() => engineRef.current?.getActivity() ?? 'idle');
+      } catch {
+        /* re-arming the cadence is best-effort — visuals must survive */
+      }
     };
     const detachFocus = engine.attachFocusListeners(window, {
       onAttentionLost: stopAmbient,
