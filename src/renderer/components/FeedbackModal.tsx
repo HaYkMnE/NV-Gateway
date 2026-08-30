@@ -69,7 +69,10 @@ export function FeedbackModal({ isOpen, onClose }: FeedbackModalProps) {
     return true;
   }, [title, description, showToast, t]);
 
-  const handleSend = useCallback(() => {
+  // Writes feedback.jsonl under userData via saveFeedback(). Nothing is
+  // transmitted — automatic transmission was removed for privacy, so the button
+  // this is wired to must name SAVING rather than sending.
+  const handleSave = useCallback(() => {
     if (!validate()) return;
     setSubmitting(true);
     window.electronAPI.feedback
@@ -200,7 +203,7 @@ export function FeedbackModal({ isOpen, onClose }: FeedbackModalProps) {
         </div>
 
         {/* Attach diagnostic checkbox */}
-        <label className="flex items-center gap-2 mb-6 text-sm text-textMuted">
+        <label className="flex items-center gap-2 mb-3 text-sm text-textMuted">
           <input
             type="checkbox"
             checked={attachDiagnostic}
@@ -208,6 +211,10 @@ export function FeedbackModal({ isOpen, onClose }: FeedbackModalProps) {
           />
           {t('feedback_attachDiagnostic')}
         </label>
+
+        {/* Nothing here is transmitted. Saying so next to the action keeps the
+            dialog honest: the report is a local file the user shares themselves. */}
+        <p className="mb-6 text-xs text-textMuted">{t('feedback_localNote')}</p>
 
         {/* Actions */}
         <div className="flex flex-wrap gap-3 justify-end">
@@ -219,11 +226,11 @@ export function FeedbackModal({ isOpen, onClose }: FeedbackModalProps) {
             {t('feedback_openGithub')}
           </button>
           <button
-            onClick={handleSend}
+            onClick={handleSave}
             disabled={submitting}
             className="bg-nvidia text-bg px-4 py-2 disabled:opacity-50"
           >
-            {t('feedback_send')}
+            {t('feedback_save')}
           </button>
         </div>
 
