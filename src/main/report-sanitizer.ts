@@ -95,11 +95,21 @@ export function sanitizeDiagnosticEntry(entry: unknown): Record<string, unknown>
       ? (entry as Record<string, unknown>)
       : {};
 
-  // redact() blanks values whose key name matches its own SENSITIVE list
-  // (authorization, api_key, token, gatewayToken, adminToken, cookie, …).
-  const redacted = redact(source) as Record<string, unknown>;
+  // Walked ONE level, deliberately. Only primitives survive this function, so
+  // recursing into a nested value merely to discard it was both wasted work and the
+  // measured cause of `RangeError: Maximum call stack size exceeded` on a deeply
+  // nested line — redact() recurses per level. Non-primitives are marked without
+  // being entered, which is what the contract above always claimed.
   const safe: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(redacted)) {
+  for (const key of safeKeys(source)) {
+    const read = safeRead(source, key);
+    // A property that cannot even be read is reported as omitted rather than
+    // allowed to abort the entry.
+    if (!read.ok) {
+      safe[key] = "[omitted]";
+      continue;
+    }
+    const value = read.value;
     // WIDER than redaction.ts in the spellings it accepts, but still ANCHORED on
     // the whole field name. redaction.ts matches the bare name only (^api[-_]?key$),
     // so a real-world header like `x-api-key` slips past it — measured. Here the
@@ -111,7 +121,10 @@ export function sanitizeDiagnosticEntry(entry: unknown): Record<string, unknown>
       continue;
     }
     if (typeof value === "string") {
-      safe[key] = stripUserPaths(value);
+      // The VALUE rules (nvapi- prefix, `Bearer …`, registered runtime secrets, URL
+      // query/fragment) live in redaction.ts and still run on every string.
+      const redacted = safeRedact(value);
+      safe[key] = redacted.ok ? stripUserPaths(String(redacted.value)) : "[omitted]";
     } else if (typeof value === "number" || typeof value === "boolean" || value === null) {
       safe[key] = value;
     } else {
@@ -141,6 +154,41 @@ const CREDENTIAL_HEAD_NOUNS = [
   "key", "token",
   "secret", "secrets", "password", "passwords", "passwd", "passphrase"
 ];
+
+/**
+ * CARRIER words: they name the CONTAINER of a value, not a fact about it, so they
+ * are transparent for classification. `apiKeyValue` is the key, `authorizationHeader`
+ * is the header line, `sessionSecretData` is the secret — measured leaking verbatim
+ * before this list existed, because head-noun matching stopped at the last word.
+ *
+ * Stripping is repeated, so `apiKeyHeaderValue` reduces to `apiKey` too. A name made
+ * ONLY of carriers (`text`, `data` — `text` is a logged field) keeps no head to judge
+ * and is therefore NOT a credential.
+ *
+ * `hash`/`digest` are carriers on purpose, which REVERSES the earlier stated
+ * trade-off that `gatewayTokenHash` may pass because "a hash is derived". A password
+ * or token hash is offline-crackable credential material; a diagnostic bundle has no
+ * use for it, and dropping it costs nothing.
+ */
+const CARRIER_SUFFIXES = [
+  "header", "headers", "value", "values", "material", "payload", "string",
+  "data", "hash", "digest", "blob", "bytes", "raw", "plain", "text", "content",
+  "param", "params"
+];
+
+/**
+ * Words that name WHICH credential system a plural belongs to. `keys`/`tokens` stay
+ * counting plurals (`activeKeys`, `promptTokens` must survive — that is the defect
+ * this file exists to fix), but a domain qualifier turns the plural back into the
+ * credentials themselves: `apiKeys` and `x-api-keys` are keys, not a count of them.
+ */
+const CREDENTIAL_DOMAIN_QUALIFIERS = [
+  "api", "nvapi", "auth", "authorization", "access", "refresh", "bearer",
+  "secret", "private", "session", "client", "gateway", "admin", "local"
+];
+
+/** Plurals with a legitimate counting sense, hence never credentials on their own. */
+const COUNTING_PLURALS = ["keys", "tokens"];
 
 /**
  * Split a field name into lowercase words on `-`, `_` and camelCase boundaries, so
@@ -188,11 +236,69 @@ function isCredentialFieldName(key: string): boolean {
   const tokens = fieldNameTokens(key);
   if (tokens.length === 0) return false;
 
-  const head = tokens[tokens.length - 1];
+  // Carrier words are transparent: judge `apiKeyValue` as `apiKey`.
+  const meaningful = [...tokens];
+  while (meaningful.length > 0 && CARRIER_SUFFIXES.includes(meaningful[meaningful.length - 1])) {
+    meaningful.pop();
+  }
+  // Nothing but carriers (`text`, `data`) leaves no head noun to judge.
+  if (meaningful.length === 0) return false;
+
+  const head = meaningful[meaningful.length - 1];
   if (CREDENTIAL_HEAD_NOUNS.includes(head)) return true;
+
+  // A counting plural is a credential only once a domain qualifier names the system
+  // the keys belong to, so `apiKeys` is caught while `activeKeys` stays a count.
+  if (COUNTING_PLURALS.includes(head)) {
+    return meaningful
+      .slice(0, -1)
+      .some((token) => CREDENTIAL_DOMAIN_QUALIFIERS.includes(token));
+  }
+
   // No separator to split on (`GATEWAYTOKEN`): match the credential noun the name
-  // ends with, which is the same head-noun position.
-  return tokens.length === 1 && CREDENTIAL_HEAD_NOUNS.some((noun) => head.endsWith(noun));
+  // ends with, which is the same head-noun position. A carrier fused into the same
+  // run (`GATEWAYTOKENVALUE`) is stripped off the string first, for the same reason.
+  if (meaningful.length !== 1) return false;
+  const endings = [head, ...CARRIER_SUFFIXES
+    .filter((carrier) => head.endsWith(carrier) && head.length > carrier.length)
+    .map((carrier) => head.slice(0, -carrier.length))];
+  return endings.some((ending) => CREDENTIAL_HEAD_NOUNS.some((noun) => ending.endsWith(noun)));
+}
+
+/**
+ * Run redact() without letting it escalate a hostile input into a thrown error.
+ *
+ * MEASURED: redact() recurses once per nesting level, so a 5000-deep JSONL line
+ * raised `RangeError: Maximum call stack size exceeded` straight out of
+ * sanitizeDiagnosticEntry, and a property getter that throws propagated too. Both
+ * abort the whole diagnostic export (diagnostic-export.ts calls this per parsed
+ * line), turning one bad line into a total loss of the bundle. A sanitizer is a
+ * boundary: it must degrade to a marker, never propagate.
+ */
+function safeRedact(value: unknown): { ok: true; value: unknown } | { ok: false } {
+  try {
+    return { ok: true, value: redact(value) };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/** Own enumerable keys, tolerating an exotic or hostile object. */
+function safeKeys(value: unknown): string[] {
+  try {
+    return Object.keys(value as Record<string, unknown>);
+  } catch {
+    return [];
+  }
+}
+
+/** Read one property, tolerating a getter that throws. */
+function safeRead(container: unknown, key: string): { ok: true; value: unknown } | { ok: false } {
+  try {
+    return { ok: true, value: (container as Record<string, unknown>)[key] };
+  } catch {
+    return { ok: false };
+  }
 }
 
 /**
