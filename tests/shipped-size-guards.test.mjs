@@ -90,3 +90,25 @@ test('the pinned dependency set is exactly what the shipped code loads (non-vacu
   assert.ok(specifiers.has('electron-updater'), 'scan must see electron-updater (auto-update path)');
   assert.ok(specifiers.has('jsonc-parser'), 'scan must see jsonc-parser (opencode config sync)');
 });
+
+// ───────────────────────────────────────────────────────────────────────────
+// Shipped-size guard, Lever 2: source maps must not ship.
+//
+// A .map file is a build-time debugging aid; nothing at runtime reads one (a
+// missing map is a silent devtools 404, never an error). Measured before this
+// guard: 1,992 .map entries = 59.6% of asar entry bytes. Lever 1 removes most
+// of them with the packages that carried them, but the 17 packages that stay
+// still hold ~1.1 MiB of maps (64 files), and any future dependency can add
+// more — so the exclusion is declared once, globally.
+//
+// The pattern lands in `files:` because electron-builder applies the main
+// matcher's patterns to the collected production node_modules as well
+// (app-builder-lib/out/util/appFileCopier.js:168-170, "use main matcher
+// patterns, so, user can exclude some files in such hoisted node modules").
+// ───────────────────────────────────────────────────────────────────────────
+
+test('the packaging config excludes source maps from app.asar', () => {
+  const builder = fs.readFileSync(path.join(root, 'electron-builder.yml'), 'utf8');
+  assert.match(builder, /^  - "!\*\*\/\*\.map"$/m,
+    'files: must carry a global "!**/*.map" negation so no shipped package can reintroduce source maps');
+});

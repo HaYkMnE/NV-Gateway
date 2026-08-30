@@ -17,6 +17,11 @@ files:
   # each entry carries a per-file integrity block, so tampering is refused.
   - build/gateway/**/*
   - package.json
+  # Source maps are build-time debugging aids; nothing at runtime reads them.
+  # This global negation also filters the collected production node_modules
+  # (app-builder-lib applies the main matcher's patterns to them), so no
+  # present or future dependency can re-add map bytes to app.asar.
+  - "!**/*.map"
 extraResources:
   # Only the tray/window icons ship outside the archive. They are inert image
   # assets: nothing executable lives here any more.
