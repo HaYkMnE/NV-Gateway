@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useReducer, useState } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { HashRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
@@ -14,7 +14,7 @@ import { AboutDialog } from './components/AboutDialog';
 import { DonationModal } from './pet/DonationModal';
 import { ModalContext, type ModalContextValue } from './lib/modal-context';
 import { useConfigStore } from './stores/config';
-import i18n from './i18n/config';
+import { applyStoredLanguage } from './i18n/config';
 import { reduceHydration } from './lib/frontend-behavior';
 import { queryKeys } from './lib/api';
 
@@ -31,6 +31,15 @@ const queryClient = new QueryClient({
 export default function App() {
   const { hydrated, setupComplete, hydrate } = useConfigStore();
   const { t } = useTranslation();
+  // Keep a stable ref to `t`: react-i18next hands every subscriber a NEW `t`
+  // identity on each `languageChanged` emission, and i18next emits even for a
+  // no-op changeLanguage. If `t` flowed into retryHydration's deps, every
+  // emission would rebuild the callback and re-fire the hydration effect —
+  // which re-applies the language and closes an infinite loop (measured: ~470
+  // DOM mutations/s of <html lang> sets, ~90% of one CPU core, while idle).
+  // Same tRef pattern as PetWidget.tsx.
+  const tRef = useRef(t);
+  useEffect(() => { tRef.current = t; }, [t]);
   const [hydration, dispatchHydration] = useReducer(reduceHydration, { state: 'loading' });
   const retryHydration = useCallback(async () => {
     dispatchHydration({ type: 'retry' });
@@ -41,12 +50,12 @@ export default function App() {
       if (state.status) {
         queryClient.setQueryData(['gateway-status'], state.status);
       }
-      await i18n.changeLanguage(state.language);
+      await applyStoredLanguage(state.language);
       dispatchHydration({ type: 'resolve' });
     } catch (error) {
-      dispatchHydration({ type: 'reject', message: error instanceof Error ? error.message : t('unknown_error') });
+      dispatchHydration({ type: 'reject', message: error instanceof Error ? error.message : tRef.current('unknown_error') });
     }
-  }, [hydrate, t]);
+  }, [hydrate]);
   useEffect(() => { void retryHydration(); }, [retryHydration]);
 
   const [aboutDialogOpen, setAboutDialogOpen] = useState(false);
