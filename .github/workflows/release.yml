@@ -58,6 +58,29 @@ jobs:
         run: |
           npm run build:release
 
+      # The update feed is BAKED into resources/app-update.yml at package time, and
+      # that file is the ONLY thing telling electron-updater which repository to
+      # poll. It is not written unconditionally: app-builder-lib returns early
+      # unless a target is updater-aware (PublishManager.js:81-84 +
+      # isSuitableWindowsTarget at :361-366 — nsis, nsis-*, updater-aware appx).
+      #
+      # So the CI `Packaged audit` job can NEVER see it: that job packages with
+      # `--dir`, which builds no installer target and therefore writes no
+      # app-update.yml. Measured against a real `npm run package:dir`:
+      # dist/win-unpacked/resources/ held app.asar and assets/ only.
+      #
+      # An absent or misdirected feed fails SILENTLY — the installer works, the app
+      # runs, and update checks just never find anything. The owner's installed
+      # build has no app-update.yml at all and nothing ever reported it. This gate
+      # runs AFTER packaging (the file cannot exist before) and BEFORE both uploads,
+      # so a build that cannot auto-update never becomes a published release.
+      - name: Verify the update feed was baked into the package
+        env:
+          # Same owner packaging used, so the expectation cannot drift from what was
+          # baked. NVGW_GH_REPO stays UNSET here, exactly as above.
+          NVGW_GH_OWNER: ${{ github.repository_owner }}
+        run: node scripts/verify-baked-update-feed.mjs
+
       - name: Archive Portable Distribution as ZIP
         shell: pwsh
         run: |
