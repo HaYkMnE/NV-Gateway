@@ -16,6 +16,7 @@ import { app } from "electron";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import { sanitizeReportEntry } from "./report-sanitizer";
 import { REPORTS_BASE_URL } from "./reports-endpoint";
 
 // Reporting endpoint of the deployed Cloudflare Worker (POST /v1/error).
@@ -29,12 +30,10 @@ const SEND_TIMEOUT_MS = 15000;
 const RETENTION_DAYS = 10;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
-const RE_NVAPI = /nvapi-[A-Za-z0-9_-]+/g;
-// Word boundary + minimum 20 chars so common words like "disk", "task",
-// "risk", "ask-" are not matched.
-const RE_SK = /\bsk-[A-Za-z0-9_-]{20,}/g;
-const RE_USERPATH = /C:\\Users\\[^\\]+\\/g;
-const RE_EMAIL = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+// Sanitization lives in ./report-sanitizer, which builds on ./redaction — the
+// same redactor the app logger uses. The regex-only sanitizer that used to live
+// here could not see gatewayToken / adminToken (random, unprefixed base64url) and
+// inspected values only, never key names.
 
 export interface ErrorEntry {
   timestamp: string;
@@ -67,20 +66,12 @@ function reportsDir(): string {
   return path.join(dataDir(), "reports");
 }
 
-function sanitizeText(value: string): string {
-  return value
-    .replace(RE_NVAPI, "nvapi-***")
-    .replace(RE_SK, "sk-***")
-    .replace(RE_USERPATH, "C:\\Users\\***\\")
-    .replace(RE_EMAIL, "***@***.***");
-}
-
+// Delegates to the shared, fail-closed sanitizer: allow-listed fields only, each
+// passed through ./redaction (runtime secrets by exact match + sensitive key
+// names + Bearer stripping). The previous local implementation forwarded every
+// field it was handed and could not see an unprefixed gatewayToken/adminToken.
 function sanitizeEntry(entry: Record<string, unknown>): Record<string, unknown> {
-  const safe: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(entry)) {
-    safe[key] = typeof value === "string" ? sanitizeText(value) : value;
-  }
-  return safe;
+  return sanitizeReportEntry(entry);
 }
 
 // Clamps the report bundle to the worker's serialized-size limit by dropping
