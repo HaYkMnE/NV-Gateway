@@ -212,9 +212,9 @@ const ACTIVITY_SFX: Record<string, () => number> = {
   'coin-drop': () => petAudio.playHackerCoinDrop(),
   flowchart: () => petAudio.playHackerFlowchart(),
   'terminal-nap': () => petAudio.playHackerTerminalNap(),
-  'syndicate-salute': () => petAudio.playAscensionRitual(),
+  'syndicate-salute': () => petAudio.playActionCheer(),
   'espresso-toast': () => petAudio.playMascotNanoCoffee(),
-  'fourth-wall-wink': () => petAudio.playMascotSensorPolish(),
+  'fourth-wall-wink': () => petAudio.playChime(),
   'hyper-hack': () => petAudio.playHackerCodeFrenzy(),
   'quantum-meditation': () => petAudio.playAscensionRitual(),
 };
