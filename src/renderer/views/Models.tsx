@@ -14,6 +14,7 @@ import {
   RefreshCw,
   Search,
   Sparkles,
+  Tag,
   Terminal,
   Wrench,
   X,
@@ -21,6 +22,15 @@ import {
 import { ProviderGlyph, resolveProvider } from '../components/ProviderGlyph';
 import { api, queryKeys } from '../lib/api';
 import { classifyDataState, safeError } from '../lib/frontend-state';
+import {
+  DEFAULT_MODEL_FILTERS,
+  POPULARITY_THRESHOLDS,
+  applyModelFilters,
+  collectModelLabels,
+  hasActiveFilters,
+  resetModelFilters,
+} from '../lib/models-filter';
+import type { ModelFilterState, ModelSortBy } from '../lib/models-filter';
 import { useGatewayLifecycle } from '../lib/gateway-lifecycle';
 import { useModelsStore } from '../stores/models';
 import { useConfigStore } from '../stores/config';
@@ -30,17 +40,12 @@ interface AdminKey {
   accessibleModels?: string[];
 }
 type ModelMode = 'day' | 'night' | 'auto';
-type SortBy = 'popular' | 'name' | 'updated';
 
 const isMac = typeof navigator !== 'undefined' && /mac/i.test(navigator.platform);
 const searchShortcut = isMac ? '⌘K' : 'Ctrl+K';
 
 function providerSlugOf(m: { publisher?: string | null; provider?: string | null; id: string }): string | null {
   return m.publisher ?? m.provider ?? (m.id.includes('/') ? m.id.split('/')[0] : null);
-}
-
-function nameOf(id: string): string {
-  return id.includes('/') ? id.split('/').slice(1).join('/') : id;
 }
 
 function formatPopularity(pop?: number | null): string | null {
@@ -162,15 +167,23 @@ export function Models() {
   const [refreshPending, setRefreshPending] = useState(false);
   const [toggleAllPending, setToggleAllPending] = useState(false);
 
-  // Search + sort state + Ctrl+K focus
-  const [query, setQuery] = useState('');
-  const [sortBy, setSortBy] = useState<SortBy>('popular');
-  const [companyFilter, setCompanyFilter] = useState<string>('');
+  // Search + sort + the narrowing filters, held in ONE object so "reset" is a
+  // single call and so every axis composes by construction. The logic itself
+  // lives in ../lib/models-filter — extracted so it can be unit-tested, since
+  // this repo has no jsdom and components cannot be rendered in tests.
+  const [filters, setFilters] = useState<ModelFilterState>(DEFAULT_MODEL_FILTERS);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
-  const deferredQuery = useDeferredValue(query);
+  const deferredQuery = useDeferredValue(filters.query);
   const searchRef = useRef<HTMLInputElement | null>(null);
+
+  const patchFilters = (patch: Partial<ModelFilterState>) => setFilters((prev) => ({ ...prev, ...patch }));
+  const toggleLabel = (label: string) =>
+    setFilters((prev) => ({
+      ...prev,
+      labels: prev.labels.includes(label) ? prev.labels.filter((l) => l !== label) : [...prev.labels, label],
+    }));
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -205,50 +218,20 @@ export function Models() {
     });
   }, [models]);
 
-  const filteredModels = useMemo(() => {
-    const useQ = (deferredQuery || query).trim().toLowerCase();
-    const filtered = useQ
-      ? models.filter((m) => {
-          if (m.id?.toLowerCase().includes(useQ)) return true;
-          if (m.name?.toLowerCase().includes(useQ)) return true;
-          if (nameOf(m.id ?? '').toLowerCase().includes(useQ)) return true;
-          const slug = providerSlugOf(m);
-          if (slug?.toLowerCase().includes(useQ)) return true;
-          if (m.shortDescription?.toLowerCase().includes(useQ)) return true;
-          if (m.publisher?.toLowerCase().includes(useQ)) return true;
-          if (m.provider?.toLowerCase().includes(useQ)) return true;
-          if (Array.isArray(m.labels) && m.labels.some((l: string) => typeof l === 'string' && l.toLowerCase().includes(useQ))) return true;
-          return false;
-        })
-      : models;
+  // Every distinct label the loaded catalogue actually carries, so a chip can
+  // never be offered for a label nothing matches.
+  const availableLabels = useMemo(() => collectModelLabels(models), [models]);
 
-    const companyFiltered = companyFilter ? filtered.filter((m) => providerSlugOf(m) === companyFilter) : filtered;
-    const sorted = [...companyFiltered].sort((a, b) => {
-      switch (sortBy) {
-        case 'name': {
-          return nameOf(a.id ?? '').localeCompare(nameOf(b.id ?? ''));
-        }
-        case 'updated': {
-          const timeA = a.lastUpdated ? Date.parse(a.lastUpdated) : 0;
-          const timeB = b.lastUpdated ? Date.parse(b.lastUpdated) : 0;
-          const validA = Number.isFinite(timeA) && timeA > 0;
-          const validB = Number.isFinite(timeB) && timeB > 0;
-          if (validA && validB && timeA !== timeB) return timeB - timeA;
-          if (validA) return -1;
-          if (validB) return 1;
-          return (a.id ?? '').localeCompare(b.id ?? '');
-        }
-        case 'popular':
-        default: {
-          const popA = typeof a.popularity === 'number' ? a.popularity : 0;
-          const popB = typeof b.popularity === 'number' ? b.popularity : 0;
-          if (popA !== popB) return popB - popA;
-          return (a.id ?? '').localeCompare(b.id ?? '');
-        }
-      }
-    });
-    return sorted;
-  }, [models, query, deferredQuery, sortBy, companyFilter]);
+  // Sorting + narrowing in one pass. deferredQuery keeps typing responsive on a
+  // large catalogue; the trailing `|| filters.query` preserves the pre-existing
+  // first-keystroke behaviour.
+  const filteredModels = useMemo(
+    () => applyModelFilters(models, { ...filters, query: deferredQuery || filters.query }),
+    [models, filters, deferredQuery]
+  );
+
+  const filtersActive = hasActiveFilters(filters);
+  const resetFilters = () => setFilters((prev) => resetModelFilters(prev));
 
   const state = classifyDataState({
     pending: modelsQuery.isPending,
@@ -432,15 +415,16 @@ export function Models() {
                 <input
                   ref={searchRef}
                   type="text"
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
+                  value={filters.query}
+                  onChange={(e) => patchFilters({ query: e.target.value })}
                   placeholder={t('models_search_placeholder')}
                   aria-label={t('models_search_placeholder')}
                   className="w-full bg-bg border border-border/90 pl-9 pr-16 py-2 text-sm rounded-lg focus:border-accent-neon/80 focus:shadow-[0_0_10px_rgba(89,255,0,0.2)] outline-none text-textMain transition-all"
                 />
-                {query && (
+                {filters.query && (
                   <button
-                    onClick={() => setQuery('')}
+                    type="button"
+                    onClick={() => patchFilters({ query: '' })}
                     className="absolute right-9 top-1/2 -translate-y-1/2 text-textMuted hover:text-textMain p-1"
                     aria-label={t('models_clear_search')}
                   >
@@ -456,14 +440,35 @@ export function Models() {
               <label className="flex items-center gap-2 text-xs font-medium text-textMuted">
                 <span>{t('models_sort_label')}</span>
                 <select
-                  value={sortBy}
-                  onChange={(e) => setSortBy(e.target.value as SortBy)}
+                  value={filters.sortBy}
+                  onChange={(e) => patchFilters({ sortBy: e.target.value as ModelSortBy })}
                   className="bg-bg border border-border/90 text-textMain px-2.5 py-1.5 text-xs rounded-lg outline-none focus:border-accent-neon/60"
                   aria-label={t('models_sort_label')}
                 >
                   <option value="popular">{t('models_sort_popular')}</option>
                   <option value="name">{t('models_sort_name')}</option>
                   <option value="updated">{t('models_sort_updated')}</option>
+                </select>
+              </label>
+
+              {/* Minimum popularity. popularity is an int >= 0 for EVERY model
+                  (admin-api.mjs substitutes 0 when NGC has no match), so a
+                  threshold is always well-defined and 0 hides nothing. */}
+              <label className="flex items-center gap-2 text-xs font-medium text-textMuted">
+                <span>{t('models_filter_popularity_label')}</span>
+                <select
+                  value={String(filters.minPopularity)}
+                  onChange={(e) => patchFilters({ minPopularity: Number(e.target.value) })}
+                  className="bg-bg border border-border/90 text-textMain px-2.5 py-1.5 text-xs rounded-lg outline-none focus:border-accent-neon/60"
+                  aria-label={t('models_filter_popularity_label')}
+                >
+                  {POPULARITY_THRESHOLDS.map((threshold) => (
+                    <option key={threshold} value={String(threshold)}>
+                      {threshold === 0
+                        ? t('models_filter_popularity_any')
+                        : t('models_filter_popularity_threshold', { threshold: formatPopularity(threshold) })}
+                    </option>
+                  ))}
                 </select>
               </label>
 
@@ -496,23 +501,23 @@ export function Models() {
                   <button
                     type="button"
                     role="button"
-                    aria-pressed={companyFilter === ''}
+                    aria-pressed={filters.company === ''}
                     aria-label={t('models_all_companies')}
-                    onClick={() => setCompanyFilter('')}
+                    onClick={() => patchFilters({ company: '' })}
                     className={`group flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs transition-all cursor-pointer select-none animate-tactile-tick border ${
-                      companyFilter === ''
+                      filters.company === ''
                         ? 'border-accent-neon/80 bg-accent-neon/15 text-accent-neon shadow-[0_0_10px_rgba(89,255,0,0.25)] font-bold'
                         : 'border-border/80 bg-surface/50 text-textMuted hover:text-textMain hover:border-border hover:bg-surface font-medium'
                     }`}
                   >
-                    <Layers size={13} className={`shrink-0 ${companyFilter === '' ? 'text-accent-neon' : 'text-textMuted group-hover:text-textMain'}`} />
+                    <Layers size={13} className={`shrink-0 ${filters.company === '' ? 'text-accent-neon' : 'text-textMuted group-hover:text-textMain'}`} />
                     <span>{t('models_all_companies')}</span>
                   </button>
 
                   {/* Individual Company Chips */}
                   {companies.map((slug) => {
                     const providerInfo = resolveProvider(slug);
-                    const isSelected = companyFilter === slug;
+                    const isSelected = filters.company === slug;
                     return (
                       <button
                         key={slug}
@@ -520,7 +525,7 @@ export function Models() {
                         role="button"
                         aria-pressed={isSelected}
                         aria-label={providerInfo.name}
-                        onClick={() => setCompanyFilter((prev) => (prev === slug ? '' : slug))}
+                        onClick={() => patchFilters({ company: filters.company === slug ? '' : slug })}
                         style={
                           isSelected
                             ? {
@@ -545,12 +550,101 @@ export function Models() {
                 </div>
               </div>
             )}
+
+            {/* Label chips (any-of) + the two catalogue boolean narrowers. The
+                chips are derived from the loaded models, so a chip can never be
+                offered for a label nothing carries. */}
+            <div className="mt-3 pt-3 border-t border-border/50 flex flex-wrap items-center gap-x-4 gap-y-2">
+              {availableLabels.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 items-center" role="group" aria-label={t('models_filter_labels_label')}>
+                  <span className="flex items-center gap-1.5 text-xs font-medium text-textMuted mr-0.5">
+                    <Tag aria-hidden size={13} className="shrink-0" />
+                    <span>{t('models_filter_labels_label')}</span>
+                  </span>
+                  {availableLabels.map((label) => (
+                    <button
+                      key={label}
+                      type="button"
+                      aria-pressed={filters.labels.includes(label)}
+                      onClick={() => toggleLabel(label)}
+                      className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs transition-all cursor-pointer select-none animate-tactile-tick border ${
+                        filters.labels.includes(label)
+                          ? 'border-accent-neon/80 bg-accent-neon/15 text-accent-neon shadow-[0_0_10px_rgba(89,255,0,0.25)] font-bold'
+                          : 'border-border/80 bg-surface/50 text-textMuted hover:text-textMain hover:border-border hover:bg-surface font-medium'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              <label className="flex items-center gap-2 text-xs font-medium text-textMuted cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={filters.freeOnly}
+                  onChange={(e) => patchFilters({ freeOnly: e.target.checked })}
+                  className="accent-accent-neon cursor-pointer"
+                />
+                <span>{t('models_filter_free_only')}</span>
+              </label>
+
+              <label className="flex items-center gap-2 text-xs font-medium text-textMuted cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={filters.downloadableOnly}
+                  onChange={(e) => patchFilters({ downloadableOnly: e.target.checked })}
+                  className="accent-accent-neon cursor-pointer"
+                />
+                <span>{t('models_filter_downloadable_only')}</span>
+              </label>
+            </div>
           </div>
 
-          {/* Catalog Grid */}
+          {/* Result count + reset. The count is always visible so an empty list
+              reads as a filter outcome rather than a broken view, and the
+              sr-only polite live region below mirrors it (same idiom as
+              Logs.tsx:237) so a shrinking list is not a silent change. When the
+              result is empty the grid's role="status" adds the explanation, so
+              a reader hears the count and then the reason. */}
+          <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
+            <p className="text-xs font-mono text-textMuted">
+              {t('models_filter_results', { count: filteredModels.length, total: models.length })}
+            </p>
+            {filtersActive && (
+              <button
+                type="button"
+                onClick={resetFilters}
+                className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold border border-border hover:border-accent-neon/50 bg-bg hover:bg-surface text-textMuted hover:text-accent-neon rounded-lg transition-all cursor-pointer animate-tactile-tick"
+              >
+                <X aria-hidden size={13} />
+                <span>{t('models_filter_reset')}</span>
+              </button>
+            )}
+          </div>
+          <p className="sr-only" aria-live="polite">
+            {t('models_filter_results', { count: filteredModels.length, total: models.length })}
+          </p>
+
+          {/* Catalog Grid. An empty result is EXPLAINED and offers a one-click
+              way out, so it never reads as a broken list. role="status" matches
+              the view's existing non-error status idiom. */}
           {filteredModels.length === 0 ? (
-            <div className="flex-1 grid place-items-center text-textMuted py-12">
-              <p className="text-sm font-mono">{t('models_no_models_found')}</p>
+            <div role="status" className="flex-1 grid place-items-center text-textMuted py-12">
+              <div className="text-center space-y-3">
+                <Cpu aria-hidden size={36} className="mx-auto text-textMuted/60" />
+                <p className="text-sm font-mono">{t('models_no_models_found')}</p>
+                {filtersActive && (
+                  <button
+                    type="button"
+                    onClick={resetFilters}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold border border-border hover:border-accent-neon/50 bg-bg hover:bg-surface text-textMain hover:text-accent-neon rounded-lg transition-all cursor-pointer animate-tactile-tick"
+                  >
+                    <X aria-hidden size={13} />
+                    <span>{t('models_filter_reset')}</span>
+                  </button>
+                )}
+              </div>
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 2xl:grid-cols-3 gap-4 pb-6">

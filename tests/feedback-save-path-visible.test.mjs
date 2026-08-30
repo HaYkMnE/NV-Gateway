@@ -65,8 +65,16 @@ test('every locale stays key-complete and the key count grew by exactly one', ()
   const exports = loadTypeScriptExports('src/renderer/i18n/resources.ts');
 
   const enKeys = Object.keys(exports.en);
-  assert.equal(enKeys.length, 293,
-    'measured baseline was 292 keys per locale; this defect adds exactly one');
+  // Counter maintenance only — the strictness below is untouched.
+  // Lineage: 292 baseline, +1 for this defect's feedback_savedTo = 293, then +8
+  // for the Models filter controls (models_filter_* — popularity label/any/
+  // threshold, labels label, the two narrowing toggles, reset, result count)
+  // = 301. This number is a snapshot of the CURRENT key set; the assertions that
+  // actually protect the 7-locale contract are the key-completeness ones below
+  // (no missing keys, no keys EN does not define), which remain exactly as
+  // strict as before.
+  assert.equal(enKeys.length, 301,
+    'EN key count: 292 baseline + 1 (feedback_savedTo) + 8 (models_filter_*)');
 
   for (const locale of LOCALE_NAMES) {
     const localeKeys = Object.keys(exports[locale]);
@@ -74,7 +82,7 @@ test('every locale stays key-complete and the key count grew by exactly one', ()
     const extra = localeKeys.filter((key) => !enKeys.includes(key));
     assert.deepEqual(missing, [], `${locale} is missing keys: ${missing.join(', ')}`);
     assert.deepEqual(extra, [], `${locale} has keys EN does not define: ${extra.join(', ')}`);
-    assert.equal(localeKeys.length, 293, `${locale} must hold 293 keys`);
+    assert.equal(localeKeys.length, 301, `${locale} must hold 301 keys`);
   }
 });
 
