@@ -100,12 +100,13 @@ export function sanitizeDiagnosticEntry(entry: unknown): Record<string, unknown>
   const redacted = redact(source) as Record<string, unknown>;
   const safe: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(redacted)) {
-    // BROADER than redaction.ts on purpose. That list is anchored (^…$), so a
-    // real-world header name like `x-api-key` slips past it — measured. Here any
-    // field whose NAME suggests a credential is blanked regardless of what it
-    // holds, because a diagnostic log line has no fixed schema and guessing from
-    // the value alone is what let credentials through before.
-    if (CREDENTIAL_NAME_HINT.test(key)) {
+    // WIDER than redaction.ts in the spellings it accepts, but still ANCHORED on
+    // the whole field name. redaction.ts matches the bare name only (^api[-_]?key$),
+    // so a real-world header like `x-api-key` slips past it — measured. Here the
+    // name is normalised first, so `x-api-key`, `X_API_KEY` and `xApiKey` are one
+    // name, and a qualifier such as `upstreamAuthorization` is still caught —
+    // without blanking a field that merely CONTAINS a credential-ish word.
+    if (isCredentialFieldName(key)) {
       safe[key] = "[REDACTED]";
       continue;
     }
@@ -121,11 +122,78 @@ export function sanitizeDiagnosticEntry(entry: unknown): Record<string, unknown>
 }
 
 /**
- * Field names that must never carry a value into a diagnostic bundle. Substring
- * matching, unlike the anchored list in redaction.ts, so prefixed and suffixed
- * spellings (`x-api-key`, `gatewayTokenHash`, `upstreamAuthorization`) are caught.
+ * Nouns that NAME a credential rather than describe one. A compound field name is
+ * treated as a credential when one of these is its HEAD — its last word — because
+ * that is what makes `apiKey` the key itself while `keyCount` is a number ABOUT
+ * keys.
+ *
+ * PLURALS, deliberately asymmetric. `secrets`/`credentials`/`passwords` are listed
+ * because those words have no counting sense in a log field. `keys` and `tokens`
+ * are NOT, because they demonstrably do: `activeKeys` is how many keys are live and
+ * `promptTokens` is a usage count, and blanking those is the defect being fixed. A
+ * plural credential COLLECTION is still covered without the name rule — an array or
+ * object value becomes "[omitted]" below, and a joined string is still subject to
+ * the value rules in redaction.ts (nvapi- prefix, `Bearer …`, runtime secrets).
  */
-const CREDENTIAL_NAME_HINT = /(key|token|secret|auth|password|passwd|credential|bearer|cookie|session)/i;
+const CREDENTIAL_HEAD_NOUNS = [
+  "authorization", "auth", "bearer", "cookie", "session",
+  "credential", "credentials",
+  "key", "token",
+  "secret", "secrets", "password", "passwords", "passwd", "passphrase"
+];
+
+/**
+ * Split a field name into lowercase words on `-`, `_` and camelCase boundaries, so
+ * `x-api-key`, `X_API_KEY` and `xApiKey` all normalise to the same three words.
+ */
+function fieldNameTokens(key: string): string[] {
+  return key
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .split(/[^A-Za-z0-9]+/)
+    .filter((token) => token.length > 0)
+    .map((token) => token.toLowerCase());
+}
+
+/**
+ * Decide whether a field NAME denotes a credential.
+ *
+ * ANCHORED on the whole name, unlike the substring alternation this replaced. That
+ * pattern fired on any name merely CONTAINING a credential-ish word, so the
+ * key-rotation and rate-limit counters this product logs — `activeKeys`,
+ * `keyCount`, `keyIndex`, `keysTried` — were blanked, which is exactly the data a
+ * 429 investigation needs. All 53 field names that reach a JSONL log line were
+ * enumerated from the logger call sites; none of them carries a credential.
+ *
+ * The rule is the HEAD NOUN: a name is a credential when its last word is one of
+ * CREDENTIAL_HEAD_NOUNS (`apiKey`, `x-api-key`, `gatewayToken`, `set-cookie`,
+ * `clientSecret`, `privateKey`), and is not when the credential word is a mere
+ * modifier of a benign head (`keyCount`, `keyIndex`, `keysTried`). A separator-less
+ * all-caps spelling has no boundaries to split on, so `GATEWAYTOKEN` is matched on
+ * its ending instead.
+ *
+ * Fail-closed on the unknown NAME SHAPE: an unrecognised compound is still redacted
+ * whenever its head is a credential noun, so a future `upstreamAuthorization` or
+ * `sessionToken` needs no listing.
+ *
+ * STATED TRADE-OFFS, both narrowed by the value-based rules that still run:
+ *   * a benign head carrying a credential word inside it is no longer blanked by
+ *     NAME, e.g. `gatewayTokenHash` — a hash is derived, not the secret;
+ *   * `keys`/`tokens` are not head nouns (see CREDENTIAL_HEAD_NOUNS), so a plural
+ *     name like `apiKeys` is not blanked by NAME either.
+ * In both cases redaction.ts still applies to the VALUE (nvapi- prefix, `Bearer …`,
+ * registered runtime secrets), and a non-primitive value becomes "[omitted]".
+ */
+function isCredentialFieldName(key: string): boolean {
+  const tokens = fieldNameTokens(key);
+  if (tokens.length === 0) return false;
+
+  const head = tokens[tokens.length - 1];
+  if (CREDENTIAL_HEAD_NOUNS.includes(head)) return true;
+  // No separator to split on (`GATEWAYTOKEN`): match the credential noun the name
+  // ends with, which is the same head-noun position.
+  return tokens.length === 1 && CREDENTIAL_HEAD_NOUNS.some((noun) => head.endsWith(noun));
+}
 
 /**
  * Remove the local account name from Windows paths and e-mail addresses.
