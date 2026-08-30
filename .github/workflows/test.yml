@@ -40,3 +40,92 @@ jobs:
 
       - name: Run test suite
         run: npm test
+
+  # The strongest packaging assertions are DIST-GATED: without dist/win-unpacked
+  # they skip (or, in final-migration, return early and still print "ok"). The job
+  # above therefore never exercised them, and that blind spot is exactly how an
+  # `asarUnpack` rule could put the engine back outside app.asar behind a fully
+  # green CI. This job produces a package and runs them for real.
+  #
+  # `--dir` on purpose: it packs win-unpacked (which is all the audits need) and
+  # skips building the nsis/portable installers. The afterPack hook still runs, so
+  # the ASAR integrity resource and the fuses are applied exactly as in a release.
+  packaged-audit:
+    name: Packaged audit on ${{ matrix.os }} (Node ${{ matrix.node-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest]
+        node-version: [20.x]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Create sandbox dir
+        shell: pwsh
+        run: New-Item -ItemType Directory -Path "C:\OPENCODE-SANDBOX" -Force -ErrorAction SilentlyContinue
+
+      - name: Package the app (dir target, no installers)
+        env:
+          # scripts/run-electron-builder.mjs fails fast without this; NVGW_GH_REPO
+          # defaults to NV-Gateway-releases inside that wrapper.
+          NVGW_GH_OWNER: HaYkMnE
+        run: npm run package:dir
+
+      # package:dir already chains package:audit, but it is run again explicitly so
+      # the audit still happens if that chain is ever changed, and so its verdict
+      # has its own step in the log.
+      - name: Audit the packaged output
+        run: npm run package:audit
+
+      - name: Run the packaged (dist-gated) tests
+        shell: pwsh
+        run: |
+          node --test tests/gateway-bundle-shipping.test.mjs tests/packaged-security-smoke.test.mjs tests/final-migration.test.mjs 2>&1 |
+            Tee-Object -FilePath packaged-tests.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Prove the packaged assertions EXECUTED (not skipped)
+        shell: pwsh
+        run: |
+          $lines = Get-Content packaged-tests.log
+          $failed = $false
+
+          # These two are gated by t.skip / skip:, so a skip is visible in TAP as
+          # "# SKIP" on the ok line. Presence alone is not enough — absence of SKIP
+          # is the actual proof.
+          foreach ($name in @(
+            'the packaged engine lives INSIDE app.asar',
+            'packaged credential smoke statically audits the existing unpacked output when present'
+          )) {
+            $line = $lines | Where-Object { $_ -match '^ok \d+ - ' -and $_.Contains($name) } | Select-Object -First 1
+            if (-not $line) { Write-Host "MISSING : $name"; $failed = $true }
+            elseif ($line -match '# SKIP') { Write-Host "SKIPPED : $line"; $failed = $true }
+            else { Write-Host "EXECUTED: $line" }
+          }
+
+          # final-migration's packaged-layout test is gated by an early RETURN, which
+          # still prints a plain "ok" — indistinguishable from a real pass in TAP. It
+          # emits this marker only after its assertions have run.
+          $marker = $lines | Where-Object { $_ -match 'PACKAGED_LAYOUT_VERIFIED' } | Select-Object -First 1
+          if (-not $marker) { Write-Host 'MISSING : PACKAGED_LAYOUT_VERIFIED marker'; $failed = $true }
+          else { Write-Host "EXECUTED: $($marker.Trim())" }
+
+          if (-not ($lines | Where-Object { $_ -match '^# fail 0$' })) {
+            Write-Host 'MISSING : "# fail 0" — the packaged test run reported failures'
+            $failed = $true
+          }
+
+          if ($failed) { Write-Host 'PACKAGED_ASSERTIONS_NOT_PROVEN'; exit 1 }
+          Write-Host 'ALL_PACKAGED_ASSERTIONS_EXECUTED'

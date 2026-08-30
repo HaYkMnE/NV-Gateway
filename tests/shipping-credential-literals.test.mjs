@@ -41,6 +41,67 @@ test('shipping credential scanner captures buffers, derives every builder payloa
   }), /SHIPPING_CREDENTIAL_SCAN_CHANGED/);
 });
 
+test('the packaging guard rejects every rule that could place the engine outside app.asar', async () => {
+  // MEASURED HOLE this pins: with `asarUnpack: - build/gateway/**/*` the engine
+  // ships to resources/app.asar.unpacked/build/gateway/server.mjs — a loose file
+  // outside the ASAR integrity envelope, swappable without detection. The packaged
+  // migration / gateway-link / credential smokes ALL still exited 0 on that layout;
+  // only the dist-gated bundle-shipping test noticed, and it SKIPS in CI.
+  //
+  // This test is deliberately NOT dist-gated, so the guard is verified on the path
+  // that actually runs in the ordinary Test Suite.
+  const { assertArchiveEnvelopeIsSealed } = await import('../scripts/shipping-credential-scan.mjs');
+  const realConfig = fs.readFileSync(path.join(root, 'electron-builder.yml'), 'utf8');
+
+  // POSITIVE CONTROL FIRST: the shipped config must pass, so this can never
+  // degenerate into a permanently red assertion.
+  assert.doesNotThrow(() => assertArchiveEnvelopeIsSealed(realConfig));
+
+  // Any asarUnpack pattern is refused — the guard is absolute rather than
+  // pattern-matching, because a matcher would have to out-guess electron-builder's
+  // glob semantics and one missed form silently reopens the hole.
+  for (const pattern of ['build/gateway/**/*', 'build/**', '**/*.mjs', '**/gateway/**', '**']) {
+    assert.throws(
+      () => assertArchiveEnvelopeIsSealed(realConfig.replace(/^extraResources:/m, `asarUnpack:\n  - ${pattern}\nextraResources:`)),
+      /PACKAGING_ASAR_UNPACK_FORBIDDEN:asarUnpack/,
+      `asarUnpack pattern must be refused: ${pattern}`
+    );
+  }
+
+  // Nested placement counts too: asarUnpack is valid inside the platform blocks.
+  assert.throws(
+    () => assertArchiveEnvelopeIsSealed(realConfig.replace(/^win:\r?\n/m, 'win:\n  asarUnpack:\n    - build/gateway/**/*\n')),
+    /PACKAGING_ASAR_UNPACK_FORBIDDEN:asarUnpack/,
+    'a rule nested under win: must be refused as well'
+  );
+  assert.throws(
+    () => assertArchiveEnvelopeIsSealed(realConfig.replace(/^extraResources:/m, "asarUnpack: ['build/gateway/**/*']\nextraResources:")),
+    /PACKAGING_ASAR_UNPACK_FORBIDDEN:asarUnpack/,
+    'the inline array form must be refused'
+  );
+  assert.throws(
+    () => assertArchiveEnvelopeIsSealed(realConfig.replace(/^extraResources:/m, 'asarUnpacked:\n  - build/gateway/**/*\nextraResources:')),
+    /PACKAGING_ASAR_UNPACK_FORBIDDEN:asarUnpacked/,
+    'the legacy asarUnpacked spelling must be refused'
+  );
+
+  // SECOND VECTOR: `asar` and `asarUnpack` are the only asar keys in the
+  // app-builder-lib schema, and disabling archiving ships everything loose.
+  for (const value of ['false', 'False', '"false"']) {
+    assert.throws(
+      () => assertArchiveEnvelopeIsSealed(realConfig.replace(/^extraResources:/m, `asar: ${value}\nextraResources:`)),
+      /PACKAGING_ASAR_MUST_STAY_ENABLED/,
+      `archiving must not be disabled: asar: ${value}`
+    );
+  }
+  assert.doesNotThrow(() => assertArchiveEnvelopeIsSealed(realConfig.replace(/^extraResources:/m, 'asar: true\nextraResources:')));
+
+  // A comment documenting the invariant must not trip the guard on its own prose.
+  assert.doesNotThrow(() => assertArchiveEnvelopeIsSealed(
+    realConfig.replace(/^extraResources:/m, '# asarUnpack would put the engine outside app.asar\nextraResources:')
+  ));
+});
+
 test('lifecycle requires initial state before spawn, listener setup, or state persistence', async () => {
   const { GatewayLifecycle } = await import(built('gateway-lifecycle.js'));
   const runtimePaths = {

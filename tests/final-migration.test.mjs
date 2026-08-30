@@ -1278,4 +1278,10 @@ test('packaged gateway layout is self-contained inside app.asar after --dir pack
   const source = extractFile(archive, engine[0]).toString('utf8');
   const relativeImports = [...source.matchAll(/from\s*["'](\.{1,2}\/[^"']+)["']/g)].map((match) => match[1]);
   assert.deepEqual(relativeImports, [], 'a bundled engine must carry no relative imports');
+
+  // POSITIVE EXECUTION MARKER. This test is dist-gated by the early return above,
+  // and an early return still prints "ok" with no "# SKIP" — so TAP output alone
+  // cannot distinguish "verified" from "silently did nothing". The CI packaged-audit
+  // job greps this line to PROVE the assertions above actually ran.
+  console.log(`PACKAGED_LAYOUT_VERIFIED asarEntry=${toPosix(engine[0])} relativeImports=${relativeImports.length}`);
 });
