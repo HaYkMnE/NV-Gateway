@@ -43,7 +43,7 @@ const LOCALE_NAMES = ['en', 'ru', 'zh', 'es', 'hi', 'fr', 'ar'];
 //   * tests/clipboard-write-via-main.test.mjs:133 pins the exact literal
 //     announce(t('copy_failed')) in Logs.
 //   * tests/feedback-save-path-visible.test.mjs:68,77 pins every locale at
-//     EXACTLY 293 keys, so a brand-new i18n key would break a passing test.
+//     EXACTLY 301 keys, so a brand-new i18n key would break a passing test.
 // The fix therefore composes the already-localized keys clipboard_failed,
 // feedback_charCount ("{{count}}/{{max}} characters") and unknown_error, and
 // classification lives in a pure, directly testable helper.
@@ -133,16 +133,16 @@ test('every string the failure message composes exists in all 7 locales', () => 
   }
 });
 
-test('the fix adds no new i18n key, so every locale stays key-complete at 293', () => {
+test('the fix adds no new i18n key, so every locale stays key-complete at 301', () => {
   // Composing existing localized strings keeps the sibling contract intact
-  // (tests/feedback-save-path-visible.test.mjs pins exactly 293) and avoids
+  // (tests/feedback-save-path-visible.test.mjs pins exactly 301) and avoids
   // shipping machine-translated English.
   const exports_ = loadTypeScriptExports('src/renderer/i18n/resources.ts');
   const enKeys = Object.keys(exports_.en);
-  assert.equal(enKeys.length, 293, 'EN must stay at 293 keys');
+  assert.equal(enKeys.length, 301, 'EN must stay at 301 keys');
   for (const locale of LOCALE_NAMES) {
     const keys = Object.keys(exports_[locale]);
-    assert.equal(keys.length, 293, `${locale} must hold 293 keys`);
+    assert.equal(keys.length, 301, `${locale} must hold 301 keys`);
     assert.deepEqual(enKeys.filter((k) => !keys.includes(k)), [], `${locale} is missing keys`);
   }
 });
