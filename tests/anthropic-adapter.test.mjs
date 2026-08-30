@@ -1,6 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { translateAnthropicRequest, translateAnthropicResponse, translateAnthropicSseStream } from '../src/gateway/anthropic-adapter.mjs';
+import * as probe from '../src/gateway/capability-probe.mjs';
 
 // Helpers for consuming the SSE async generator into parseable events.
 async function collectSseEvents(asyncGen) {
@@ -656,4 +660,142 @@ test('47. absent tool_choice adds neither the field nor a warning', () => {
   assert.ok(!('tool_choice' in r.openaiBody));
   assert.ok(!('parallel_tool_calls' in r.openaiBody));
   assert.ok(!r.warnings.some(w => w.includes('tool_choice')));
+});
+
+// ---------------------------------------------------------------------------
+// The static family table must INFORM, never VETO, a capability for a model it
+// does not know. NVIDIA adds and changes models without our releases, so an
+// unknown model id is the NORMAL case. Measured before the fix: a model whose
+// family is absent from the registry was hard-rejected 400 locally with
+// "This model does not support thinking" and NO upstream request was attempted,
+// while the same model on /v1/chat/completions was forwarded verbatim and
+// answered 200 — the two facades disagreed. A probed cache entry that already
+// proved reasoning support was also ignored at this decision point.
+// ---------------------------------------------------------------------------
+
+const probeTempRoot = fs.mkdtempSync(path.join(os.tmpdir(), `nv-anthropic-adapter-cache-${process.pid}-`));
+
+test.after(() => {
+  fs.rmSync(probeTempRoot, { recursive: true, force: true });
+});
+
+// Memory-only cache (cachePath: null) ⇒ no probed knowledge for any model.
+function withoutProbedCache() {
+  probe.resetCapabilityProbeState({ cachePath: null });
+}
+
+// Seed a persisted PROBED entry, then point the probe module at it.
+function withProbedCache(modelId, entry) {
+  const cacheFile = path.join(probeTempRoot, `cache-${Math.random().toString(36).slice(2)}.json`);
+  fs.writeFileSync(cacheFile, JSON.stringify({
+    version: 2,
+    savedAt: new Date().toISOString(),
+    entries: { [modelId]: { probedAt: Date.now(), source: 'probed', ...entry } },
+  }));
+  probe.resetCapabilityProbeState({ cachePath: cacheFile });
+}
+
+const thinkingBody = (model, thinking = { type: 'enabled', budget_tokens: 20000 }) => ({
+  model, max_tokens: 100, messages: [{ role: 'user', content: 'Think hard' }], thinking,
+});
+
+test('48. unknown family + thinking enabled is NOT hard-rejected by the static table', () => {
+  withoutProbedCache();
+  const r = translateAnthropicRequest(thinkingBody(HERMES_ID));
+  assert.deepEqual(r.errors, [], 'an unknown family must not be vetoed locally');
+  assert.ok(r.openaiBody, 'the request must be translated, not nulled out');
+  assert.equal(r.openaiBody.model, HERMES_ID);
+});
+
+test('49. unknown family + thinking enabled translates a reasoning control for upstream to judge', () => {
+  withoutProbedCache();
+  const r = translateAnthropicRequest(thinkingBody(HERMES_ID));
+  assert.equal(r.errors.length, 0);
+  assert.equal(r.openaiBody.reasoning_effort, 'high', 'budget 20000 maps to high');
+  assert.ok(
+    r.warnings.some(w => /unknown|not in the .*registry|upstream/i.test(w)),
+    `expected a diagnosable warning about the unknown family, got ${JSON.stringify(r.warnings)}`
+  );
+});
+
+test('50. unknown family honours the budget_tokens → effort mapping (4000 → low)', () => {
+  withoutProbedCache();
+  const r = translateAnthropicRequest(thinkingBody(HERMES_ID, { type: 'enabled', budget_tokens: 4000 }));
+  assert.equal(r.errors.length, 0);
+  assert.equal(r.openaiBody.reasoning_effort, 'low');
+});
+
+test('51. a KNOWN genuinely-non-reasoning family is still rejected (that is knowledge we have)', () => {
+  withoutProbedCache();
+  const r = translateAnthropicRequest(thinkingBody('meta/llama-4-maverick-17b-128e-instruct'));
+  assert.ok(r.errors.some(e => e.includes('does not support thinking')));
+  assert.equal(r.openaiBody, null);
+});
+
+test('52. probed cache proving reasoning support WINS over the static default', () => {
+  withProbedCache(HERMES_ID, {
+    modes: ['low', 'medium', 'high'],
+    controlKey: 'reasoning_effort',
+    defaultMode: 'high',
+    supported: true,
+  });
+  const r = translateAnthropicRequest(thinkingBody(HERMES_ID));
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.openaiBody.reasoning_effort, 'high');
+});
+
+test('53. probed cache modes clamp the requested effort (max is not in the probed set)', () => {
+  withProbedCache(HERMES_ID, {
+    modes: ['low', 'medium'],
+    controlKey: 'reasoning_effort',
+    defaultMode: 'medium',
+    supported: true,
+  });
+  const r = translateAnthropicRequest(thinkingBody(HERMES_ID, { type: 'enabled', budget_tokens: 90000 }));
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.openaiBody.reasoning_effort, 'medium', 'effort must clamp down into the probed modes');
+});
+
+test('54. probed cache WINS over a known family the static table calls non-reasoning', () => {
+  withProbedCache('meta/llama-4-maverick-17b-128e-instruct', {
+    modes: ['low', 'high'],
+    controlKey: 'reasoning_effort',
+    defaultMode: 'high',
+    supported: true,
+  });
+  const r = translateAnthropicRequest(thinkingBody('meta/llama-4-maverick-17b-128e-instruct'));
+  assert.deepEqual(r.errors, [], 'live probed evidence outranks the static guess');
+  assert.equal(r.openaiBody.reasoning_effort, 'high');
+});
+
+test('55. a probed entry reporting NO reasoning_effort support introduces no new local veto', () => {
+  // The probe only discovers `reasoning_effort`; a chat_template_kwargs-driven
+  // model probes as unsupported. So a probed `supported:false` is not authority
+  // over every reasoning style and must not start rejecting requests.
+  withProbedCache(HERMES_ID, { modes: [], controlKey: null, supported: false });
+  const r = translateAnthropicRequest(thinkingBody(HERMES_ID));
+  assert.deepEqual(r.errors, []);
+  assert.ok(r.openaiBody);
+});
+
+test('56. unknown family + thinking DISABLED stays a no-op (no reasoning fields invented)', () => {
+  withoutProbedCache();
+  const r = translateAnthropicRequest(thinkingBody(HERMES_ID, { type: 'disabled' }));
+  assert.equal(r.errors.length, 0);
+  assert.ok(!('reasoning_effort' in r.openaiBody));
+  assert.ok(!('chat_template_kwargs' in r.openaiBody));
+});
+
+test('57. unknown family + thinking enabled keeps the tool_choice translation working', () => {
+  withoutProbedCache();
+  const r = translateAnthropicRequest({
+    ...thinkingBody(HERMES_ID),
+    tools: oneTool,
+    tool_choice: { type: 'any', disable_parallel_tool_use: true },
+  });
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.openaiBody.tool_choice, 'required');
+  assert.equal(r.openaiBody.parallel_tool_calls, false);
+  assert.equal(r.openaiBody.tools[0].function.name, 'get_weather');
+  assert.equal(r.openaiBody.reasoning_effort, 'high');
 });

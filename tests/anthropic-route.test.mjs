@@ -391,6 +391,69 @@ test('42. POST /v1/messages without auth → 401', async () => {
   }
 });
 
+// An unknown model family must not be vetoed locally: NVIDIA serves models we
+// have no static entry for, so UPSTREAM is the authority on whether a model can
+// think. Measured before the fix: 400 with no upstream request attempted, while
+// /v1/chat/completions forwarded the same model and answered 200.
+test('44. POST /v1/messages thinking enabled on an UNKNOWN family reaches upstream (no local veto)', async () => {
+  let capturedBody = null;
+  let upstreamHits = 0;
+  const upstream = await createLocalUpstream((req, response) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      if (String(req.url).includes('chat/completions')) {
+        upstreamHits += 1;
+        try { capturedBody = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { capturedBody = null; }
+      }
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(openaiCompletionJson({ model: 'nousresearch/hermes-4-405b' }));
+    });
+  });
+  const { child, gatewayPort } = await startGatewayWithLocalUpstream(upstream.address().port);
+  try {
+    const body = JSON.stringify({
+      model: 'nousresearch/hermes-4-405b',
+      messages: [{ role: 'user', content: 'Think hard' }],
+      max_tokens: 200,
+      thinking: { type: 'enabled', budget_tokens: 20000 }
+    });
+    const result = await rawRequest({ port: gatewayPort, pathname: '/v1/messages', body, headers: authHeaders() });
+    assert.equal(result.statusCode, 200, `body=${result.body}`);
+    assert.equal(upstreamHits, 1, 'the gateway must actually ask upstream instead of rejecting locally');
+    assert.equal(capturedBody?.reasoning_effort, 'high', 'the reasoning request must be translated for upstream');
+  } finally {
+    await stopGateway(child);
+    await closeServer(upstream);
+  }
+});
+
+test('45. POST /v1/messages surfaces the UPSTREAM reasoning rejection in Anthropic error shape', async () => {
+  const upstream = await createLocalUpstream((_req, response) => {
+    response.writeHead(400, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ error: { message: 'reasoning_effort is not supported for this model' } }));
+  });
+  const { child, gatewayPort } = await startGatewayWithLocalUpstream(upstream.address().port);
+  try {
+    const body = JSON.stringify({
+      model: 'nousresearch/hermes-4-405b',
+      messages: [{ role: 'user', content: 'Think hard' }],
+      max_tokens: 200,
+      thinking: { type: 'enabled', budget_tokens: 20000 }
+    });
+    const result = await rawRequest({ port: gatewayPort, pathname: '/v1/messages', body, headers: authHeaders() });
+    assert.equal(result.statusCode, 400);
+    const parsed = JSON.parse(result.body);
+    assert.equal(parsed.type, 'error');
+    assert.equal(parsed.error.type, 'invalid_request_error');
+    // The upstream's own words must reach the client, not a gateway-invented mask.
+    assert.match(parsed.error.message, /reasoning_effort is not supported for this model/);
+  } finally {
+    await stopGateway(child);
+    await closeServer(upstream);
+  }
+});
+
 test('43. POST /v1/messages exhausted failover with a pool-wide 500 propagates the upstream 500', async () => {
   const upstream = await createLocalUpstream((_req, response) => {
     response.writeHead(500, { 'content-type': 'application/json' });

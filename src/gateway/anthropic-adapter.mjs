@@ -1,7 +1,52 @@
 // Anthropic Messages API → OpenAI Chat Completions request translator.
-// Pure logic: no network, no I/O, no side effects.
+// No network, no mutation of caller input, no side effects. The one non-pure
+// touch is a READ of the persisted reasoning-capability cache
+// (capability-probe.mjs), consulted so a model already PROVEN to reason is not
+// second-guessed by a static table — see the precedence note on `thinking`.
 
-import { getReasoningCapability } from "./capability-registry.mjs";
+import { getReasoningCapability, isFamilyKnown } from "./capability-registry.mjs";
+import { getCachedReasoningCapability } from "./capability-probe.mjs";
+
+/**
+ * Capability used when NOTHING is known about a model that was asked to think:
+ * translate with the control NVIDIA uses most (`reasoning_effort`, the one the
+ * probe itself discovers) and declare no mode list, so no effort value is
+ * clamped away on a guess. Upstream gets the final say.
+ */
+const OPTIMISTIC_REASONING = Object.freeze({
+  supported: true,
+  modes: Object.freeze([]),
+  controlKey: 'reasoning_effort',
+  defaultMode: 'high',
+});
+
+/**
+ * Read LIVE probed reasoning evidence for a model, or null when there is none.
+ *
+ * Only a positive result is returned: the probe discovers `reasoning_effort`
+ * support specifically, so a cached `supported:false` means "no
+ * reasoning_effort", NOT "cannot think at all" — treating it as the latter
+ * would invent a new local veto out of an inconclusive measurement.
+ *
+ * @param {unknown} modelId
+ * @returns {{ supported: true, modes: string[], controlKey: string, defaultMode?: string } | null}
+ */
+function readProbedReasoning(modelId) {
+  let entry;
+  try {
+    entry = getCachedReasoningCapability(modelId);
+  } catch {
+    return null; // a broken cache must never fail a client request
+  }
+  if (!entry || entry.supported !== true) return null;
+  const modes = Array.isArray(entry.modes) ? entry.modes.filter(m => typeof m === 'string') : [];
+  return {
+    supported: true,
+    modes,
+    controlKey: typeof entry.controlKey === 'string' && entry.controlKey ? entry.controlKey : 'reasoning_effort',
+    ...(typeof entry.defaultMode === 'string' && entry.defaultMode ? { defaultMode: entry.defaultMode } : {}),
+  };
+}
 
 export function translateAnthropicRequest(body) {
   const errors = [];
@@ -253,8 +298,40 @@ export function translateAnthropicRequest(body) {
   }
 
   // thinking → per-model reasoning translation
+  //
+  // PRECEDENCE (deliberate): probed evidence > static family table > optimism.
+  //
+  // The static family table may INFORM a capability decision but must never
+  // VETO one for a model it does not know. NVIDIA adds and changes models
+  // without our releases, so an unknown model id is the NORMAL case, not an
+  // error case. Fail-closed is right for security decisions; it is wrong here,
+  // because UPSTREAM is the real authority on whether a model can think — and
+  // its rejection already reaches the client verbatim through the normal error
+  // path (buildAnthropicUpstreamError in server.mjs).
+  //
+  // Measured behaviour before this fix: `thinking:{type:"enabled"}` on a model
+  // whose family is absent from the table returned a hard local 400
+  // ("This model does not support thinking") and never contacted upstream,
+  // while the SAME model on /v1/chat/completions was forwarded and answered
+  // 200 — the two facades disagreed. A probed cache entry that had already
+  // proven reasoning support was ignored at this very decision point.
+  //
+  // A family we genuinely KNOW lacks reasoning is still refused locally: that
+  // is knowledge, not a guess, and refusing costs no upstream round-trip.
   if (body && body.thinking) {
-    const reasoningCap = getReasoningCapability(openaiBody.model || body.model);
+    const modelId = openaiBody.model || body.model;
+    const staticCap = getReasoningCapability(modelId);
+    const probedCap = readProbedReasoning(modelId);
+    const familyKnown = isFamilyKnown(modelId);
+
+    // Only real knowledge (probe first, then a populated family entry) may
+    // drive the "disabled" path; with nothing known we invent no fields.
+    let reasoningCap = probedCap ?? staticCap;
+    if (body.thinking.type === 'enabled' && !reasoningCap.supported && !familyKnown) {
+      reasoningCap = OPTIMISTIC_REASONING;
+      warnings.push('thinking was translated optimistically: this model family is unknown to the capability registry, so upstream decides whether reasoning is supported');
+    }
+
     if (body.thinking.type === 'enabled') {
       if (!reasoningCap.supported) {
         errors.push('This model does not support thinking');

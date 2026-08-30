@@ -324,6 +324,22 @@ export function registerFamilyPatterns(overrides) {
 }
 
 /**
+ * True when this model's family has a real entry in the registry, i.e. the
+ * capability answer is KNOWLEDGE rather than the DEFAULT_FAMILY fallback.
+ *
+ * Callers need this to tell "we know this model cannot do X" apart from "we
+ * have never heard of this model", because those two justify very different
+ * behaviour: the former may refuse locally, the latter must not.
+ *
+ * @param {unknown} modelId
+ * @returns {boolean}
+ */
+export function isFamilyKnown(modelId) {
+    const family = resolveFamily(modelId);
+    return family !== null && Object.prototype.hasOwnProperty.call(FAMILY_PATTERNS, family);
+}
+
+/**
  * List all currently known families (built-in + registered overrides).
  * Sorted for deterministic output.
  * @returns {string[]}
