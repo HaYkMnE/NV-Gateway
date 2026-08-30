@@ -15,6 +15,7 @@ import { app, shell } from "electron";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { exportDiagnostic } from "./diagnostic-export";
+import { REPO_ISSUES_URL } from "./external-open";
 import { sanitizeReportText } from "./report-sanitizer";
 
 export interface FeedbackData {
@@ -35,8 +36,6 @@ export interface FeedbackResult {
 export interface FeedbackOptions {
   userDataPath?: string;
 }
-
-const REPO_ISSUES_URL = "https://github.com/susmnavorasem/nv-gateway/issues/new";
 
 function feedbackDir(options?: FeedbackOptions): string {
   const base = options?.userDataPath ?? app.getPath("userData");

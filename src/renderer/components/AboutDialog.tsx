@@ -44,7 +44,11 @@ export function AboutDialog({ isOpen, onClose }: AboutDialogProps) {
   if (!isOpen) return null;
 
   const openRepo = () => {
-    if (info?.repoUrl) window.open(info.repoUrl, '_blank');
+    if (!info?.repoUrl) return;
+    // NOT window.open: electron-security.ts installs a deny-all
+    // setWindowOpenHandler on this window, so window.open was a silent no-op.
+    // The main process validates the URL against its allowlist before opening.
+    window.electronAPI?.openExternal(info.repoUrl).catch(() => undefined);
   };
 
   return (

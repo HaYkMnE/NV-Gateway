@@ -33,7 +33,7 @@ import { createTrayIconCache } from "./tray-icons";
 import { createWindowCloseGuard } from "./window-close-guard";
 import { buildApplicationMenu, buildContextMenu, getMenuStrings } from "./app-menu";
 import { saveFeedback, openGitHubIssue, type FeedbackData } from "./feedback-service";
-import { openExternalUrl } from "./external-open";
+import { openExternalUrl, REPO_URL } from "./external-open";
 import { exportDiagnostic } from "./diagnostic-export";
 import { init as initErrorReporter, logError, getErrorCount, previewErrors, sendErrors, type ErrorEntry } from "./error-reporter";
 
@@ -83,7 +83,7 @@ function getAboutInfo(): {
     nodeVersion: process.versions.node,
     proxyPort,
     adminPort: proxyPort + 1,
-    repoUrl: "https://github.com/susmnavorasem/nv-gateway"
+    repoUrl: REPO_URL
   };
 }
 function migrationPhaseAuditPath(): string {
