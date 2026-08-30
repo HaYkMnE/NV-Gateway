@@ -20,7 +20,7 @@ import { wrapIpcHandler as wrapIpcHandlerWithLogError } from "./ipc-handler";
 import { createSafeStorageAdapter, SecureStore } from "./secure-state";
 import { createRuntimeAclProtector } from "./windows-acl";
 import { installElectronSecurity } from "./electron-security";
-import { setRuntimeSecrets } from "./redaction";
+import { redact, setRuntimeSecrets } from "./redaction";
 import { mergeChildKeyProjection } from "./state-ownership";
 import { runExplicitLegacyNvidiaMigration } from "./final-migration-workflow";
 import { startMainProcess } from "./main-process-startup";
@@ -546,8 +546,13 @@ void startMainProcess({
       });
     },
     log: (_level, event, data) => {
-      // The app logger is intentionally unavailable before source validation.
-      console.error(JSON.stringify({ event, ...data }));
+      // The app logger is intentionally unavailable before source validation, so
+      // this writes straight to stderr. It must still pass through redact() like
+      // every other path that leaves the app: the local gatewayToken/adminToken
+      // are unprefixed base64url, so nothing in their VALUE marks them secret --
+      // they are caught only by field name or via setRuntimeSecrets. A raw
+      // JSON.stringify here defeated both and leaked them verbatim.
+      console.error(JSON.stringify(redact({ event, ...data })));
     },
     audit: migrationPhaseAudit,
   }),
@@ -567,7 +572,10 @@ function wrapIpcHandler<T extends (...args: unknown[]) => unknown>(
   handler: T
 ): T {
   return wrapIpcHandlerWithLogError(name, handler, (entry) => {
-    logAppEvent("error", "ipc_handler_error", { ...entry });
+    // Named explicitly rather than spread: a spread hides which field names reach
+    // the log, keeping them out of the project's logged-field-name census and so
+    // unprotected-by-inspection. These three are the whole IpcErrorLog shape.
+    logAppEvent("error", "ipc_handler_error", { handler: entry.handler, message: entry.message, stack: entry.stack });
   });
 }
 
