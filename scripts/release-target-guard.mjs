@@ -114,48 +114,181 @@ export function resolveReleaseTarget(env = process.env) {
 }
 
 /**
- * The guard is only worth anything if the workflow actually sends the artifacts
- * where this script says. Asserted on the workflow text so removing the
- * cross-repo destination, or dropping an updater artifact, breaks the release
- * loudly rather than quietly reverting to the old broken behaviour.
- *
- * @param {string} root Repository root.
- */
-/**
- * Remove YAML comments before any wiring check reads the file.
+ * Strip YAML comments, leaving executable YAML only.
  *
  * This is load-bearing, not cosmetic. A plain substring test over the RAW text
  * accepts a workflow whose upload step has been commented out or replaced by a
  * hardcoded literal that merely MENTIONS the expected fragment in a trailing
- * comment — measured, both of those passed the earlier text-only check while the
+ * comment — measured, both of those passed the earliest text-only check while the
  * release was actually broken. Only executable YAML can publish an artifact, so
  * only executable YAML is examined.
  *
- * Full-line comments are dropped entirely; a trailing ` # ...` is trimmed. The
- * workflow carries no '#' inside a quoted scalar, so the conservative trailing
- * trim cannot corrupt a real value here.
+ * Quote-aware on purpose: a '#' inside a quoted scalar is DATA, not a comment,
+ * and a blind trailing trim would silently truncate a real value. A comment
+ * starts only at a '#' that sits outside quotes at line start or after
+ * whitespace.
  *
- * @param {string} text
+ * @param {string} line
  * @returns {string}
  */
-function stripYamlComments(text) {
-  return text
-    .split('\n')
-    .map((line) => (/^\s*#/.test(line) ? '' : line.replace(/\s+#.*$/, '')))
-    .join('\n');
+function stripComment(line) {
+  let out = '';
+  let quote = null;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    if (quote) {
+      out += char;
+      if (char === quote) quote = null;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      out += char;
+      continue;
+    }
+    if (char === '#' && (index === 0 || /\s/.test(line[index - 1]))) {
+      return out.replace(/\s+$/, '');
+    }
+    out += char;
+  }
+  return out;
+}
+
+/** Indentation width of a line, or -1 when the line carries nothing. */
+function indentOf(line) {
+  return line.trim() === '' ? -1 : line.length - line.trimStart().length;
+}
+
+/**
+ * Indent of the first child line under a parent, or -1 when it has no children.
+ *
+ * Measured rather than assumed: a workflow may nest with two spaces or four, and
+ * hardcoding one of them turns a real check into dead code that always passes.
+ */
+function childIndent(lines, start, end, parentIndent) {
+  for (let index = start; index < end; index += 1) {
+    const width = indentOf(lines[index]);
+    if (width < 0) continue;
+    return width > parentIndent ? width : -1;
+  }
+  return -1;
+}
+
+/** Drop one layer of matching surrounding quotes: `'x'` and `"x"` both mean x. */
+function unquote(value) {
+  const trimmed = value.trim();
+  const quoted = (trimmed.startsWith("'") && trimmed.endsWith("'"))
+    || (trimmed.startsWith('"') && trimmed.endsWith('"'));
+  return quoted && trimmed.length >= 2 ? trimmed.slice(1, -1).trim() : trimmed;
+}
+
+/** `${{ x }}` -> `x`, so a quoted expression and a bare one compare equal. */
+function unwrapExpression(value) {
+  const bare = unquote(value);
+  const match = bare.match(/^\$\{\{\s*(.*?)\s*\}\}$/);
+  return match ? match[1] : bare;
+}
+
+/**
+ * Mapping keys declared DIRECTLY at `indent` within [start, end).
+ *
+ * Each entry carries the line it was found on and the exclusive end of its own
+ * nested block, so a nested mapping (`with:`) can be read by recursing with a
+ * deeper indent instead of scanning the whole file and hoping.
+ *
+ * @returns {{key: string, value: string, at: number, blockEnd: number}[]}
+ */
+function mappingAt(lines, start, end, indent) {
+  const found = [];
+  for (let index = start; index < end; index += 1) {
+    const width = indentOf(lines[index]);
+    if (width < 0) continue;
+    if (width < indent) break;
+    if (width !== indent) continue;
+    const match = lines[index].trim().match(/^([A-Za-z0-9_.-]+):\s*(.*)$/);
+    if (!match) continue;
+    let blockEnd = index + 1;
+    while (blockEnd < end && (indentOf(lines[blockEnd]) < 0 || indentOf(lines[blockEnd]) > indent)) blockEnd += 1;
+    found.push({ key: match[1], value: match[2], at: index, blockEnd });
+  }
+  return found;
+}
+
+/**
+ * Every step of every job, each tagged with the job that owns it.
+ *
+ * Written as a real (if small) indentation-aware reader rather than a set of
+ * line regexes, because the questions that decide the release destination are
+ * structural: WHICH step declares the guard id, WHICH step's `repository:` input
+ * carries the expression, and whether those two live in the SAME job. A regex
+ * that merely finds `repository:` somewhere cannot answer any of them — measured,
+ * a `repository:` line relocated into an `env:` block satisfied the previous
+ * check while the upload step had no destination input at all.
+ *
+ * Deliberately without js-yaml: this guard runs BEFORE `npm ci`, so node_modules
+ * does not exist yet and a devDependency cannot be imported.
+ *
+ * @returns {{job: string, keys: ReturnType<typeof mappingAt>, lines: string[]}[]}
+ */
+function stepsOfWorkflow(lines) {
+  const jobsAt = lines.findIndex((line) => indentOf(line) === 0 && line.trim() === 'jobs:');
+  if (jobsAt < 0) return [];
+
+  // Measured, never assumed: a workflow may nest with two spaces or four, and
+  // hardcoding one turns every check below into dead code on the other.
+  const jobIndent = childIndent(lines, jobsAt + 1, lines.length, 0);
+  if (jobIndent < 0) return [];
+
+  const steps = [];
+  for (const job of mappingAt(lines, jobsAt + 1, lines.length, jobIndent)) {
+    const jobKeyIndent = childIndent(lines, job.at + 1, job.blockEnd, jobIndent);
+    if (jobKeyIndent < 0) continue;
+    const [stepsKey] = mappingAt(lines, job.at + 1, job.blockEnd, jobKeyIndent)
+      .filter((entry) => entry.key === 'steps');
+    if (!stepsKey) continue;
+
+    // List items sit at whatever indent the first `- ` uses.
+    let itemIndent = -1;
+    for (let index = stepsKey.at + 1; index < stepsKey.blockEnd; index += 1) {
+      if (/^\s*-\s/.test(lines[index])) { itemIndent = indentOf(lines[index]); break; }
+    }
+    if (itemIndent < 0) continue;
+
+    const starts = [];
+    for (let index = stepsKey.at + 1; index < stepsKey.blockEnd; index += 1) {
+      if (indentOf(lines[index]) === itemIndent && /^\s*-\s/.test(lines[index])) starts.push(index);
+    }
+    starts.forEach((start, order) => {
+      const end = order + 1 < starts.length ? starts[order + 1] : stepsKey.blockEnd;
+      // Rewrite the `- ` marker into plain indentation so the key riding on the
+      // item line reads at the same depth as the keys beneath it.
+      const body = lines.slice(start, end)
+        .map((line, offset) => (offset === 0 ? line.replace(/^(\s*)-(\s)/, '$1 $2') : line));
+      steps.push({
+        job: job.key,
+        jobAt: job.at,
+        jobBlockEnd: job.blockEnd,
+        jobKeyIndent,
+        lines: body,
+        keys: mappingAt(body, 0, body.length, itemIndent + 2)
+      });
+    });
+  }
+  return steps;
 }
 
 /**
  * The guard is only worth anything if the workflow actually sends the artifacts
  * where this script says.
  *
- * Checked STRUCTURALLY rather than by substring presence, and deliberately
- * without js-yaml: this step runs BEFORE `npm ci`, so node_modules does not yet
- * exist and a YAML library cannot be imported. The checks below therefore work
- * on comment-stripped lines and on the relationship BETWEEN them (which step id
- * is declared, which id is referenced, which job each lives in), because that
- * relationship — not the mere presence of a string — is what decides where the
- * upload lands.
+ * Every check below is a RELATIONSHIP between parsed steps, because
+ * action-gh-release v2.6.2 resolves its destination as
+ *   github_repository: env.INPUT_REPOSITORY || env.GITHUB_REPOSITORY || ''
+ *   -- src/util.ts @ v2.6.2
+ * so EVERY route to an empty `repository:` input — a dangling step id, an upload
+ * in a job the guard's outputs cannot reach, a guard that never ran, a
+ * `repository:` line that is not an input to the upload at all — publishes to the
+ * repository the workflow runs in, silently, behind a green build.
  *
  * @param {string} root Repository root.
  */
@@ -173,83 +306,136 @@ function validateWorkflowWiring(root) {
     error: `${RELEASE_WORKFLOW_FILE} no longer wires the release to the baked update feed: ${reason}. Restore the cross-repo upload so the installer, its blockmap and latest.yml reach the repository the app polls.`
   });
 
-  const text = stripYamlComments(raw);
-  const lines = text.split('\n');
+  // A BOM or CRLF is what an editor leaves behind, not a wiring change.
+  const normalised = raw.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
 
-  // ── The guard step must still exist, and its id is what the upload references.
-  const guardRunAt = lines.findIndex((line) => line.includes('scripts/release-target-guard.mjs'));
-  if (guardRunAt < 0) {
+  // GitHub Actions cannot parse a tab in indentation, so a file containing one
+  // never runs at all. Failing here — rather than misreading it as a passing
+  // structure — keeps the guard fail-closed on input it cannot understand.
+  const tabLine = normalised.split('\n').findIndex((line) => /^[ ]*\t/.test(line));
+  if (tabLine >= 0) {
+    return fail(`line ${tabLine + 1} indents with a tab character, which YAML forbids, so GitHub Actions would reject this workflow outright`);
+  }
+
+  const lines = normalised.split('\n').map(stripComment);
+  const steps = stepsOfWorkflow(lines);
+  const keyOf = (step, name) => step.keys.find((entry) => entry.key === name);
+
+  // ── The guard step itself: present, identified, and actually running.
+  const guardSteps = steps.filter((step) => {
+    const run = keyOf(step, 'run');
+    return Boolean(run) && /scripts[/\\]release-target-guard\.mjs/.test(
+      [run.value, ...step.lines.slice(run.at + 1)].join('\n')
+    );
+  });
+  if (guardSteps.length === 0) {
     return fail('it no longer runs scripts/release-target-guard.mjs');
   }
+  const guard = guardSteps[0];
 
-  // Bound the guard's own step block: from its `- ` marker to the next one.
-  let blockStart = guardRunAt;
-  while (blockStart > 0 && !/^\s*-\s/.test(lines[blockStart])) blockStart -= 1;
-  let blockEnd = guardRunAt + 1;
-  while (blockEnd < lines.length && !/^\s*-\s/.test(lines[blockEnd])) blockEnd += 1;
-
-  const guardBlock = lines.slice(blockStart, blockEnd);
-  const idLine = guardBlock.find((line) => /^\s*id:\s*\S+/.test(line));
-  if (!idLine) {
+  const guardIdKey = keyOf(guard, 'id');
+  if (!guardIdKey || unquote(guardIdKey.value) === '') {
     return fail('the destination-guard step has no `id:`, so no upload step can reference its resolved destination');
   }
-  const guardId = idLine.match(/^\s*id:\s*(\S+)/)[1];
-  const guardIdAt = blockStart + guardBlock.indexOf(idLine);
+  const guardId = unquote(guardIdKey.value);
 
-  // ── Every reference to the resolved destination must name THIS step's id.
-  //
-  // A dangling reference is the dangerous case: action-gh-release v2.6.2 resolves
-  // `repository` as `env.INPUT_REPOSITORY || env.GITHUB_REPOSITORY` (src/util.ts),
-  // so an expression pointing at a step id that does not exist expands to EMPTY
-  // and the upload SILENTLY falls back to the repository the workflow runs in —
-  // exactly the drift this guard exists to prevent, with a green build.
-  const referenced = [...text.matchAll(/steps\.([A-Za-z0-9_-]+)\.outputs\.feed_repository/g)].map((m) => m[1]);
-  if (referenced.length === 0) {
-    return fail('no upload step takes its `repository:` from this guard\'s feed_repository output');
+  // A guard that is skipped produces no outputs, so every reference to them
+  // expands to empty and the upload takes the fallback. It must be unconditional.
+  const guardIf = keyOf(guard, 'if');
+  if (guardIf) {
+    return fail(`the destination-guard step carries \`if: ${guardIf.value.trim()}\`; on any run where that is false the guard is skipped, its outputs are unset, and the upload's \`repository:\` expands to EMPTY and silently falls back to this repository`);
   }
+  const guardSoft = keyOf(guard, 'continue-on-error');
+  if (guardSoft && unwrapExpression(guardSoft.value).toLowerCase() !== 'false') {
+    return fail(`the destination-guard step sets continue-on-error: ${guardSoft.value.trim()}, which restores the silent-success mode this guard removes`);
+  }
+
+  // ── The feed upload: the step whose `repository:` input is the guard's output.
+  const uploads = steps
+    .map((step) => ({ step, with: keyOf(step, 'with') }))
+    .filter((entry) => entry.with)
+    .map((entry) => ({
+      step: entry.step,
+      inputs: mappingAt(entry.step.lines, entry.with.at + 1, entry.with.blockEnd,
+        indentOf(entry.step.lines[entry.with.at]) + 2)
+    }));
+
+  const referenced = uploads
+    .map((entry) => entry.inputs.find((input) => input.key === 'repository'))
+    .filter(Boolean)
+    .map((input) => unwrapExpression(input.value).match(/^steps\.([A-Za-z0-9_-]+)\.outputs\.feed_repository$/))
+    .filter(Boolean)
+    .map((match) => match[1]);
+
   const dangling = referenced.filter((id) => id !== guardId);
   if (dangling.length > 0) {
     return fail(`an upload step references steps.${dangling[0]}.outputs.feed_repository, but the guard step's id is "${guardId}" — that expression expands to EMPTY and the upload would silently fall back to this repository`);
   }
 
-  // ── The `repository:` input must BE that expression, not a literal.
-  const repoExpression = new RegExp(`^\\s*repository:\\s*\\$\\{\\{\\s*steps\\.${guardId}\\.outputs\\.feed_repository\\s*\\}\\}\\s*$`);
-  const repoAt = lines.findIndex((line) => repoExpression.test(line));
-  if (repoAt < 0) {
-    return fail('no upload step sets `repository:` to the guard\'s resolved feed_repository output; a hardcoded literal can drift from the baked feed');
+  const feedEntries = uploads.filter((entry) => entry.inputs.some((input) =>
+    input.key === 'repository'
+    && unwrapExpression(input.value) === `steps.${guardId}.outputs.feed_repository`));
+  if (feedEntries.length === 0) {
+    return fail('no upload step takes its `repository:` input from this guard\'s feed_repository output; a hardcoded literal, or the expression written anywhere other than that input, can drift from the baked feed');
+  }
+  const feed = feedEntries[0];
+
+  // ── Same job, or the guard's outputs are not even in scope (`steps.` is per-job).
+  if (feed.step.job !== guard.job) {
+    return fail(`the feed upload sits in job "${feed.step.job}" while the destination guard runs in "${guard.job}", where \`steps.<id>.outputs\` is out of scope and expands to empty`);
   }
 
-  // ── The cross-repo upload must carry the PAT; GITHUB_TOKEN cannot write there.
-  if (!lines.some((line) => new RegExp(`^\\s*token:\\s*\\$\\{\\{\\s*secrets\\.${RELEASES_TOKEN_SECRET}\\s*\\}\\}\\s*$`).test(line))) {
+  // ── An upload that never runs publishes nothing.
+  const feedIf = keyOf(feed.step, 'if');
+  if (feedIf && unwrapExpression(feedIf.value).toLowerCase() === 'false') {
+    return fail(`the feed upload is disabled with \`if: ${feedIf.value.trim()}\`, so it never runs and the update feed never gains a release`);
+  }
+  const feedSoft = keyOf(feed.step, 'continue-on-error');
+  if (feedSoft && unwrapExpression(feedSoft.value).toLowerCase() !== 'false') {
+    return fail(`the feed upload sets continue-on-error: ${feedSoft.value.trim()}, which lets a failed publish report success`);
+  }
+
+  const input = (name) => feed.inputs.find((entry) => entry.key === name);
+
+  // ── The cross-repo PAT must be an input of THIS step; GITHUB_TOKEN cannot
+  //    create a release in another repository, and a PAT on a different step
+  //    does nothing for this one.
+  const token = input('token');
+  if (!token || unwrapExpression(token.value) !== `secrets.${RELEASES_TOKEN_SECRET}`) {
     return fail(`the cross-repo upload no longer passes token: \${{ secrets.${RELEASES_TOKEN_SECRET} }}, and the default GITHUB_TOKEN cannot create a release in another repository`);
   }
 
-  // ── The upload must live in the SAME job as the guard, or the guard's output
-  //    is not even in scope for it (`steps.` context is per-job).
-  const jobHeader = /^  [A-Za-z0-9_-]+:\s*$/;
-  if (repoAt < guardIdAt || lines.slice(guardIdAt, repoAt).some((line) => jobHeader.test(line))) {
-    return fail('the feed upload sits in a different job from the destination guard, where `steps.<id>.outputs` is out of scope and expands to empty');
+  // ── The artifacts electron-updater needs must be entries of THIS step's list.
+  //    A literal block scalar is the only form whose entries can be read back:
+  //    a folded scalar joins them into one glob that matches nothing, and quotes
+  //    inside a block scalar are data, so they would ship as part of the pattern.
+  const files = input('files');
+  if (!files || files.value.trim() !== '|') {
+    return fail('the feed upload\'s `files:` is not a literal block scalar (`|`), so its list entries cannot be verified as reaching the feed');
   }
-
-  // ── Artifacts electron-updater needs, as executable list entries.
+  const filesIndent = indentOf(feed.step.lines[files.at]);
+  const entries = feed.step.lines
+    .slice(files.at + 1, files.blockEnd)
+    .filter((line) => indentOf(line) > filesIndent)
+    .map((line) => line.trim());
   for (const fragment of ['dist/latest.yml', 'dist/NV-Gateway-Setup-*.exe.blockmap']) {
-    if (!lines.some((line) => line.trim() === fragment)) {
-      return fail(`"${fragment}" is no longer an uploaded artifact`);
+    if (!entries.includes(fragment)) {
+      return fail(`"${fragment}" is no longer an uploaded artifact of the feed upload (it uploads ${JSON.stringify(entries)})`);
     }
   }
 
-  // ── Nothing may make a matched-nothing glob, or the guard itself, non-fatal.
-  if (!lines.some((line) => /^\s*fail_on_unmatched_files:\s*true\s*$/.test(line))) {
-    return fail('fail_on_unmatched_files: true is gone, so a renamed artifact would publish a release that looks complete and updates nobody');
+  // ── A glob that matches nothing must fail the release, on THIS step.
+  const strict = input('fail_on_unmatched_files');
+  if (!strict || unwrapExpression(strict.value).toLowerCase() !== 'true') {
+    return fail('the feed upload no longer sets fail_on_unmatched_files: true, so a renamed or missing artifact would publish a release that looks complete and updates nobody');
   }
-  if (lines.some((line) => /^\s*fail_on_unmatched_files:\s*false\s*$/.test(line))) {
-    return fail('an upload step sets fail_on_unmatched_files: false, which lets a missing artifact publish silently');
-  }
-  if (lines.some((line) => /^\s*continue-on-error:\s*true\s*$/.test(line))) {
-    return fail('a step sets continue-on-error: true, which restores the silent-success mode this guard removes');
-  }
-  if (lines.some((line) => /^\s*if:\s*false\s*$/.test(line))) {
-    return fail('a step is disabled with `if: false`');
+
+  // ── A job-level continue-on-error would let the guard fail and the release
+  //    carry on regardless. Read from the job's own measured bounds.
+  const jobSoft = mappingAt(lines, guard.jobAt + 1, guard.jobBlockEnd, guard.jobKeyIndent)
+    .find((entry) => entry.key === 'continue-on-error');
+  if (jobSoft && unwrapExpression(jobSoft.value).toLowerCase() !== 'false') {
+    return fail(`job "${guard.job}" sets continue-on-error: ${jobSoft.value.trim()}, which lets this guard fail while the release carries on`);
   }
 
   return { ok: true };
