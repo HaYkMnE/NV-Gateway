@@ -41,6 +41,8 @@ import { init as initErrorReporter, logError, getErrorCount, previewErrors, send
 // app.getPath("userData") resolves to %APPDATA%/NV-Gateway, not the
 // package.json "name" field.  Must be called before app.whenReady().
 let mainWindow: BrowserWindow | null;
+/** True once startNormal() has built the first window, so ensureMainWindow only ever REBUILDS. */
+let windowWasCreated = false;
 let tray: Tray | null = null;
 let gatewayLifecycle: GatewayLifecycle | null = null;
 let gatewayRuntime: GatewayRuntimePaths | null = null;
@@ -257,6 +259,38 @@ function createTrayIcon(state?: string): Electron.NativeImage {
   return trayIcons(state) as Electron.NativeImage;
 }
 
+// Returns a window that is safe to call, rebuilding it if it was destroyed.
+//
+// `mainWindow?.show()` guards NULL but NOT a DESTROYED native object. MEASURED in
+// a real launched app (tray alive, window destroyed): a tray click threw
+// "TypeError: Object has been destroyed". That throw happens inside an Electron
+// event callback, so it reaches process.on("uncaughtException") ->
+// fatalShutdownAndExit -> process.exit(1) — the raw exit that skips before-quit ->
+// cleanupAndQuit -> gatewayLifecycle.stop(), i.e. the ipc shutdown that flushes
+// keys.json and the model-key affinity cache. window-all-closed deliberately
+// early-returns while a tray exists, so this state is a LIVE trayed process with
+// no window: the same "invisible app" failure class the tray fix addresses.
+function ensureMainWindow(): BrowserWindow | null {
+  const usable = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+  if (usable) return usable;
+  // Only ever REBUILD a window that existed and died. Never create the FIRST
+  // window here: startNormal() owns initial creation, and a second-instance
+  // arriving in that gap would otherwise leave two windows. And never resurrect
+  // one during teardown, which would only have to be closed again.
+  if (!windowWasCreated || isQuiting) return null;
+  createWindow();
+  return mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+}
+
+/** The one way to bring the app back into view, from the tray, menu or a second instance. */
+function revealMainWindow(): void {
+  const window = ensureMainWindow();
+  if (!window) return;
+  if (window.isMinimized()) window.restore();
+  window.show();
+  window.focus();
+}
+
 // UI language for main-process surfaces (tray menu, update dialogs) comes from
 // the persisted config.json "language" field; the renderer toggles the same
 // field through set-app-config, so both stay in sync.
@@ -290,7 +324,7 @@ function updateAppMenu(): void {
       if (updaterService) void updaterService.checkForUpdates({ manual: true });
     },
     onOpenSettings: () => {
-      mainWindow?.show();
+      revealMainWindow();
     }
   });
   Menu.setApplicationMenu(menu);
@@ -311,7 +345,7 @@ function updateTray(status: GatewayStatus = gatewayLifecycle?.getStatus() ?? { s
     { type: "separator" },
     {
       label: menuStr.show_app,
-      click: () => mainWindow?.show()
+      click: () => revealMainWindow()
     },
     {
       label: menuStr.retry_gateway,
@@ -339,7 +373,7 @@ function createTray(): void {
     tray = new Tray(createTrayIcon(gatewayLifecycle?.getStatus().state));
     logAppEvent("info", "tray_created", {});
     updateTray();
-    tray.on("click", () => mainWindow?.show());
+    tray.on("click", () => revealMainWindow());
   } catch (error) {
     tray = null;
     logAppEvent("error", "tray_create_failed", {
@@ -365,6 +399,7 @@ function notifyHiddenToTray(): void {
 }
 
 function createWindow(): void {
+  windowWasCreated = true;
   const windowIcon = appIconPath();
   mainWindow = new BrowserWindow({
     width: 1024,
@@ -406,6 +441,15 @@ function createWindow(): void {
       onFirstHide: notifyHiddenToTray,
       log: logAppEvent
     });
+  });
+
+  // Drop the pointer as soon as the native object dies. Without this the
+  // destroyed window stays truthy, and `mainWindow?.show()` (optional chaining
+  // guards null, NOT destroyed) throws "Object has been destroyed" from a tray
+  // click — measured in a real launched app — which escalates through
+  // uncaughtException to a raw process.exit(1) that skips the keys.json flush.
+  mainWindow.on("closed", () => {
+    mainWindow = null;
   });
 }
 
@@ -487,7 +531,9 @@ migrationPhaseAudit.setFilePath(migrationPhaseAuditPath());
 void startMainProcess({
   argv: process.argv,
   app,
-  configureSingleInstance: () => configureSingleInstance(app, () => mainWindow),
+  // ensureMainWindow(), not the raw pointer: single-instance.ts calls
+  // isMinimized()/show()/focus() unguarded, which throws on a destroyed window.
+  configureSingleInstance: () => configureSingleInstance(app, () => ensureMainWindow()),
   acquireLegacyMigrationLock: () => acquireLegacyMigrationExclusionLock(app.getPath("userData")),
   createApplicationStartupOptions: () => ({
     validateLegacySource: validateFixedLegacyNvidiaSource,
