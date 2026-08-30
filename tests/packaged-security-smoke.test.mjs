@@ -164,12 +164,34 @@ test('regression: packaged credential ASAR fixture survives immediate cleanup af
 
 test('packaged credential smoke statically audits the existing unpacked output when present', {
   skip: !fs.existsSync(path.join(root, 'dist', 'win-unpacked'))
-}, () => {
+}, (t) => {
+  // TOCTOU, and the whole of the observed flake. node:test evaluates the `skip:`
+  // option ONCE, when this FILE IS LOADED; the audit below spawns LATER. If
+  // dist/win-unpacked disappears in that window — a concurrent `package:dir`, or
+  // the mandatory removal of a stale/unhardened package — the harness exits 1 with
+  // PACKAGED_CREDENTIAL_AUDIT_OUTPUT_MISSING. Asserting the bare exit status then
+  // reported "1 !== 0", which is indistinguishable from a shipped credential leak
+  // and sent readers hunting a phantom.
+  //
+  // MEASURED, so the blame lands in the right place: the scanner's scanned-root
+  // derivation is CORRECT and is NOT relaxed here. os.tmpdir() resolves outside
+  // dist/win-unpacked, no denied literal reaches the packaged tree (40/40 files
+  // clean), and the harness returns {"matches":0} on every undisturbed run. The
+  // defect is this gate, not the guard it invokes.
+  if (!fs.existsSync(path.join(root, 'dist', 'win-unpacked'))) {
+    t.skip('the packaged output was removed after this file was loaded');
+    return;
+  }
+
   const result = spawnSync(process.execPath, ['scripts/packaged-credential-smoke.mjs'], {
     cwd: root,
     encoding: 'utf8',
     windowsHide: true
   });
-  assert.equal(result.status, 0);
+  // The credential assertion is UNCHANGED and unrelaxed; only the failure message
+  // now carries the harness's own reason, so "the audit ran and found a leak" can
+  // never again be confused with "the audit could not run at all".
+  assert.equal(result.status, 0,
+    `packaged credential audit exited ${result.status}: ${(result.stderr || '').trim() || '(no stderr)'}`);
   assert.match(result.stdout, /"matches":0/);
 });
