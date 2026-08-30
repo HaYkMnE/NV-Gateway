@@ -524,3 +524,136 @@ test('36. simple text stream: message_start → block_start → text_delta → b
   assert.ok(types.includes('content_block_stop'));
   assert.ok(types.includes('message_delta'));
 });
+
+// ---------------------------------------------------------------------------
+// tool_choice translation (Anthropic -> OpenAI).
+//
+// Reported defect: "uses Hermes and the functions didn't work". Measured cause
+// is NOT capability gating (capabilities never gate tool requests, and an
+// unknown family already reports tools:true) but that `tool_choice` was parsed
+// by nothing and silently dropped, so forced tool use was impossible for every
+// model on the Anthropic facade. Mapping per Anthropic Messages API docs:
+//   auto -> "auto" | any -> "required" | tool+name -> {type:function,...}
+//   none -> "none" | disable_parallel_tool_use -> parallel_tool_calls:false
+// ---------------------------------------------------------------------------
+
+const HERMES_ID = 'nousresearch/hermes-4-405b';
+const oneTool = [{ name: 'get_weather', description: 'w', input_schema: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] } }];
+
+test('37. tool_choice auto -> "auto"', () => {
+  const r = translateAnthropicRequest({
+    model: HERMES_ID, max_tokens: 100,
+    messages: [{ role: 'user', content: 'weather?' }],
+    tools: oneTool, tool_choice: { type: 'auto' },
+  });
+  assert.equal(r.errors.length, 0);
+  assert.equal(r.openaiBody.tool_choice, 'auto');
+});
+
+test('38. tool_choice any -> "required" (forced tool use is preserved)', () => {
+  const r = translateAnthropicRequest({
+    model: HERMES_ID, max_tokens: 100,
+    messages: [{ role: 'user', content: 'weather?' }],
+    tools: oneTool, tool_choice: { type: 'any' },
+  });
+  assert.equal(r.errors.length, 0);
+  assert.equal(r.openaiBody.tool_choice, 'required');
+});
+
+test('39. tool_choice tool+name -> {type:function,function:{name}}', () => {
+  const r = translateAnthropicRequest({
+    model: HERMES_ID, max_tokens: 100,
+    messages: [{ role: 'user', content: 'weather?' }],
+    tools: oneTool, tool_choice: { type: 'tool', name: 'get_weather' },
+  });
+  assert.equal(r.errors.length, 0);
+  assert.deepEqual(r.openaiBody.tool_choice, { type: 'function', function: { name: 'get_weather' } });
+});
+
+test('40. tool_choice none -> "none"', () => {
+  const r = translateAnthropicRequest({
+    model: HERMES_ID, max_tokens: 100,
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: oneTool, tool_choice: { type: 'none' },
+  });
+  assert.equal(r.errors.length, 0);
+  assert.equal(r.openaiBody.tool_choice, 'none');
+});
+
+test('41. disable_parallel_tool_use -> parallel_tool_calls:false', () => {
+  const r = translateAnthropicRequest({
+    model: HERMES_ID, max_tokens: 100,
+    messages: [{ role: 'user', content: 'weather?' }],
+    tools: oneTool, tool_choice: { type: 'any', disable_parallel_tool_use: true },
+  });
+  assert.equal(r.errors.length, 0);
+  assert.equal(r.openaiBody.tool_choice, 'required');
+  assert.equal(r.openaiBody.parallel_tool_calls, false);
+});
+
+test('42. tool_choice without tools is NOT forwarded (OpenAI rejects it)', () => {
+  const r = translateAnthropicRequest({
+    model: HERMES_ID, max_tokens: 100,
+    messages: [{ role: 'user', content: 'hi' }],
+    tool_choice: { type: 'any' },
+  });
+  assert.equal(r.errors.length, 0);
+  assert.ok(!('tool_choice' in r.openaiBody));
+  assert.ok(r.warnings.some(w => w.includes('tool_choice')));
+});
+
+test('43. unrecognized tool_choice type is dropped with a warning, not forwarded', () => {
+  const r = translateAnthropicRequest({
+    model: HERMES_ID, max_tokens: 100,
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: oneTool, tool_choice: { type: 'wat' },
+  });
+  assert.equal(r.errors.length, 0);
+  assert.ok(!('tool_choice' in r.openaiBody));
+  assert.ok(r.warnings.some(w => w.includes('tool_choice')));
+});
+
+test('44. tool_choice tool without a name is dropped with a warning', () => {
+  const r = translateAnthropicRequest({
+    model: HERMES_ID, max_tokens: 100,
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: oneTool, tool_choice: { type: 'tool' },
+  });
+  assert.equal(r.errors.length, 0);
+  assert.ok(!('tool_choice' in r.openaiBody));
+  assert.ok(r.warnings.some(w => w.includes('tool_choice')));
+});
+
+test('45. Hermes (unknown family) still reports tools:true and translates tools', () => {
+  const r = translateAnthropicRequest({
+    model: HERMES_ID, max_tokens: 100,
+    messages: [{ role: 'user', content: 'weather?' }],
+    tools: oneTool,
+  });
+  assert.equal(r.errors.length, 0);
+  assert.equal(r.openaiBody.tools[0].function.name, 'get_weather');
+  assert.deepEqual(r.openaiBody.tools[0].function.parameters.required, ['city']);
+});
+
+test('46. non-object tool_choice (bare OpenAI-style string) is dropped with a warning', () => {
+  const r = translateAnthropicRequest({
+    model: HERMES_ID, max_tokens: 100,
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: oneTool, tool_choice: 'required',
+  });
+  assert.equal(r.errors.length, 0);
+  assert.ok(!('tool_choice' in r.openaiBody));
+  assert.ok(r.warnings.some(w => w.includes('tool_choice')));
+});
+
+test('47. absent tool_choice adds neither the field nor a warning', () => {
+  const r = translateAnthropicRequest({
+    model: HERMES_ID, max_tokens: 100,
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: oneTool,
+  });
+  assert.equal(r.errors.length, 0);
+  assert.ok(!('tool_choice' in r.openaiBody));
+  assert.ok(!('parallel_tool_calls' in r.openaiBody));
+  assert.ok(!r.warnings.some(w => w.includes('tool_choice')));
+});

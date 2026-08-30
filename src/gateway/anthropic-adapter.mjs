@@ -198,6 +198,55 @@ export function translateAnthropicRequest(body) {
     }));
   }
 
+  // tool_choice translation (Anthropic → OpenAI)
+  //
+  // Anthropic: { type: 'auto' | 'any' | 'tool' | 'none', name?, disable_parallel_tool_use? }
+  // OpenAI:    'auto' | 'required' | 'none' | { type: 'function', function: { name } }
+  //
+  // Without this mapping the field was parsed by nothing and silently dropped,
+  // which downgrades "you MUST call a tool" (any / a named tool) into "you may
+  // call a tool" — an agent loop that depends on forced tool use then never
+  // sees a tool call. OpenAI rejects tool_choice when no tools are declared, so
+  // it is only forwarded alongside a non-empty tools array.
+  if (body.tool_choice !== undefined && body.tool_choice !== null) {
+    const isObjectChoice = typeof body.tool_choice === 'object' && !Array.isArray(body.tool_choice);
+    const hasTools = Array.isArray(openaiBody.tools) && openaiBody.tools.length > 0;
+    if (!isObjectChoice) {
+      // A non-object tool_choice (e.g. an OpenAI-style bare string) is not valid
+      // Anthropic input. It is still warned about rather than dropped in
+      // silence, so a mis-shaped client request is diagnosable from the log.
+      warnings.push('tool_choice was dropped because it is not an object');
+    } else if (!hasTools) {
+      warnings.push('tool_choice was dropped because the request declares no tools');
+    } else {
+      const kind = body.tool_choice.type;
+      let mapped;
+      if (kind === 'auto') {
+        mapped = 'auto';
+      } else if (kind === 'any') {
+        mapped = 'required';
+      } else if (kind === 'none') {
+        mapped = 'none';
+      } else if (kind === 'tool') {
+        if (typeof body.tool_choice.name === 'string' && body.tool_choice.name.length > 0) {
+          mapped = { type: 'function', function: { name: body.tool_choice.name } };
+        } else {
+          warnings.push('tool_choice type "tool" was dropped because it names no tool');
+        }
+      } else {
+        warnings.push('unsupported tool_choice type was dropped: ' + JSON.stringify(kind ?? null));
+      }
+      if (mapped !== undefined) {
+        openaiBody.tool_choice = mapped;
+        // Anthropic expresses "at most/exactly one tool call" as a flag on
+        // tool_choice; OpenAI expresses it as a sibling boolean.
+        if (body.tool_choice.disable_parallel_tool_use === true) {
+          openaiBody.parallel_tool_calls = false;
+        }
+      }
+    }
+  }
+
   // metadata → user
   if (body.metadata && typeof body.metadata.user_id === 'string') {
     openaiBody.user = body.metadata.user_id;
