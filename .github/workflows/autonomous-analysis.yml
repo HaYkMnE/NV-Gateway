@@ -180,8 +180,15 @@ jobs:
               echo "Session $SESSION_NAME created. Incremented sessions_today -> $COUNT / $DAILY_TARGET."
               # Persist the incremented counter after every successful session, so a
               # killed/cancelled run still leaves an honest persisted count.
-              jq -n --arg d "null" --argjson s "$COUNT" \
-                '{exhausted_date: $d, sessions_today: $s}' > "$STATE_FILE"
+              # exhausted_date is a real JSON null here, written as a literal in the
+              # filter rather than through --arg. jq's --arg always passes its value
+              # as a STRING, so `--arg d "null"` would persist the four-character
+              # string "null" instead of null, silently changing the type of a file
+              # that is committed back into git. Same spelling the watchdog uses in
+              # autonomous-quota-reset.yml. Only sessions_today needs binding, and
+              # --argjson keeps it a number.
+              jq -n --argjson s "$COUNT" \
+                '{exhausted_date: null, sessions_today: $s}' > "$STATE_FILE"
               commit_state "null" "$COUNT"
 
               TITLE="[Analyst Task] $(date -u +'%Y-%m-%d %H:%M') #${COUNT} Log & Codebase Audit"
