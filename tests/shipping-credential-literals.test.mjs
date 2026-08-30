@@ -226,6 +226,112 @@ test('the packaging guard rejects every rule that could place the engine outside
   );
 });
 
+test('the packaging guard rejects any config source that would bypass electron-builder.yml', async () => {
+  // LATENT HOLE this pins, read out of the dependency rather than assumed:
+  //
+  //   read-config-file/out/main.js:71-72
+  //     const data = packageMetadata == null ? null : packageMetadata[request.packageKey];
+  //     return data == null ? findAndReadConfig(request) : { result: data, configFile: null };
+  //   app-builder-lib/out/util/config.js:35
+  //     { packageKey: "build", configFilename: "electron-builder", ... }
+  //
+  // A top-level `build` field in package.json therefore short-circuits the whole
+  // lookup: findAndReadConfig never runs and electron-builder.yml is never opened.
+  // That does not bypass one rule — it makes EVERY assertion in this file (the
+  // files/extraResources rules and the asar guard included) audit an inert file
+  // while still passing. read-config-file:42 also probes sibling extensions and
+  // returns the FIRST hit, so a competing config is the same class of defect.
+  //
+  // Not dist-gated, so the guard is verified on the path that runs in ordinary CI.
+  const { assertConfigSourceIsAuthoritative } = await import('../scripts/shipping-credential-scan.mjs');
+
+  // POSITIVE CONTROL FIRST: the real repository must pass, so this can never
+  // degenerate into a permanently red assertion.
+  assert.doesNotThrow(() => assertConfigSourceIsAuthoritative(root));
+
+  const realYml = fs.readFileSync(path.join(root, 'electron-builder.yml'), 'utf8');
+  const realManifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+  const scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), `nvgw-cfgsource-${process.pid}-`));
+
+  // Stages a project that PASSES, so each case below changes exactly one thing.
+  // The real repository is never modified; every hijack lives in the scratch root.
+  const stage = ({ manifestExtras = {}, extraFiles = {}, dropYml = false } = {}) => {
+    fs.rmSync(scratchRoot, { recursive: true, force: true });
+    fs.mkdirSync(scratchRoot, { recursive: true });
+    if (!dropYml) fs.writeFileSync(path.join(scratchRoot, 'electron-builder.yml'), realYml, 'utf8');
+    // scripts.build is carried over on purpose: it must NOT be mistaken for the
+    // top-level `build` field that does the hijacking.
+    fs.writeFileSync(path.join(scratchRoot, 'package.json'), JSON.stringify({
+      name: 'fixture', version: '0.0.0', scripts: realManifest.scripts, ...manifestExtras
+    }, null, 2), 'utf8');
+    for (const [name, contents] of Object.entries(extraFiles)) {
+      fs.writeFileSync(path.join(scratchRoot, name), contents, 'utf8');
+    }
+    return scratchRoot;
+  };
+
+  try {
+    // A staged-but-untouched project passes, which is what makes every rejection
+    // below attributable to the single change it introduces.
+    assert.doesNotThrow(() => assertConfigSourceIsAuthoritative(stage()),
+      'a clean fixture carrying scripts.build must pass');
+
+    // 1. package.json#build — PRESENCE is the defect, whatever the value: an empty
+    //    object or a string path hijacks the lookup exactly like a populated one.
+    for (const [label, value] of [
+      ['populated object', { asarUnpack: ['build/gateway/**/*'] }],
+      ['empty object', {}],
+      ['string path', './other-builder.yml'],
+      ['null', null],
+      ['false', false]
+    ]) {
+      assert.throws(
+        () => assertConfigSourceIsAuthoritative(stage({ manifestExtras: { build: value } })),
+        /PACKAGING_CONFIG_SOURCE_HIJACKED:package\.json#build/,
+        `package.json#build must be refused when it is ${label}`
+      );
+    }
+
+    // 2. Every sibling extension read-config-file probes. The list is copied from
+    //    that loop verbatim — note .mjs is NOT among them.
+    for (const extension of ['yaml', 'json', 'json5', 'toml', 'js', 'cjs', 'ts']) {
+      const name = `electron-builder.${extension}`;
+      assert.throws(
+        () => assertConfigSourceIsAuthoritative(stage({ extraFiles: { [name]: '{}\n' } })),
+        /PACKAGING_CONFIG_SOURCE_HIJACKED:electron-builder\./,
+        `a competing ${name} must be refused`
+      );
+    }
+
+    // 3. Files that merely LOOK adjacent are not config sources and must not trip
+    //    the guard — otherwise a stray note or backup turns CI permanently red.
+    assert.doesNotThrow(() => assertConfigSourceIsAuthoritative(stage({
+      extraFiles: { 'electron-builder.md': '# notes\n', 'electron-builder.yml.bak': 'old\n' }
+    })), 'unrelated siblings must not be treated as config sources');
+
+    // 4. The audited file disappearing is the same failure in a different shape:
+    //    the lookup would fall through to whatever sibling exists next.
+    assert.throws(
+      () => assertConfigSourceIsAuthoritative(stage({ dropYml: true })),
+      /PACKAGING_CONFIG_SOURCE_MISSING:electron-builder\.yml/,
+      'the authoritative config going missing must be refused'
+    );
+
+    // 5. The message must say WHAT broke and WHERE to go, not just name the code.
+    assert.throws(
+      () => assertConfigSourceIsAuthoritative(stage({ manifestExtras: { build: {} } })),
+      (error) => /package\.json#build/.test(error.message)
+        && /inert/i.test(error.message)
+        && /scripts\/shipping-credential-scan\.mjs/.test(error.message)
+        && /assertConfigSourceIsAuthoritative/.test(error.message)
+        && /targeted test/i.test(error.message),
+      'the failure must explain the hijack and point at the guard to update'
+    );
+  } finally {
+    fs.rmSync(scratchRoot, { recursive: true, force: true });
+  }
+});
+
 test('lifecycle requires initial state before spawn, listener setup, or state persistence', async () => {
   const { GatewayLifecycle } = await import(built('gateway-lifecycle.js'));
   const runtimePaths = {

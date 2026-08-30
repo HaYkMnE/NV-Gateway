@@ -69,6 +69,9 @@ export function runShippingCredentialScan({
 }
 
 export function deriveScannedRoots(root) {
+  // FIRST: prove electron-builder will actually READ the file we are about to
+  // audit. Everything below is worthless if the config arrives from elsewhere.
+  assertConfigSourceIsAuthoritative(root);
   const builder = fs.readFileSync(path.join(root, 'electron-builder.yml'), 'utf8');
   assertArchiveEnvelopeIsSealed(builder);
   assert.deepEqual(extractListSection(builder, 'files'), EXPECTED_FILES_RULES, 'PACKAGING_FILES_RULES_CHANGED');
@@ -79,6 +82,88 @@ export function deriveScannedRoots(root) {
   ];
   for (const relative of roots) assert.equal(fs.existsSync(path.join(root, relative)), true, `PACKAGING_PAYLOAD_MISSING:${relative}`);
   return roots;
+}
+
+// Every packaging assertion in this file reads electron-builder.yml. That is only
+// meaningful while electron-builder ITSELF reads that same file — and two edits can
+// silently redirect it, leaving the audit green while auditing an inert document.
+//
+// READ FROM THE DEPENDENCY, not assumed:
+//
+//   read-config-file/out/main.js:71-72
+//     const data = packageMetadata == null ? null : packageMetadata[request.packageKey];
+//     return data == null ? findAndReadConfig(request) : { result: data, configFile: null };
+//
+//   app-builder-lib/out/util/config.js:35
+//     { packageKey: "build", configFilename: "electron-builder", ... }
+//
+// So a TOP-LEVEL `build` field in package.json short-circuits the whole lookup:
+// findAndReadConfig is never called and electron-builder.yml is never opened. This
+// does not bypass one rule — it disables the entire first layer at once.
+//
+//   read-config-file/out/main.js:42
+//     for (const configFile of [`${prefix}.yml`, `${prefix}.yaml`, `${prefix}.json`,
+//       `${prefix}.json5`, `${prefix}.toml`, `${prefix}.js`, `${prefix}.cjs`, `${prefix}.ts`])
+//
+// The loop returns the FIRST file that exists. `.yml` happens to be first, so a
+// competing sibling is latent rather than active today — it takes over the moment
+// the .yml is renamed or removed. Same class of defect, so it is refused too.
+// (Note: `.mjs` is NOT in that list; the extensions below are copied from it
+// verbatim rather than guessed, so this guard cannot drift from the real lookup.)
+const CONFIG_BASENAME = 'electron-builder';
+const AUTHORITATIVE_CONFIG_FILE = `${CONFIG_BASENAME}.yml`;
+/** Extensions read-config-file probes, in its own precedence order. */
+const CONFIG_LOOKUP_EXTENSIONS = Object.freeze(['yml', 'yaml', 'json', 'json5', 'toml', 'js', 'cjs', 'ts']);
+/** The package.json field that, when present, replaces the file lookup entirely. */
+const CONFIG_PACKAGE_KEY = 'build';
+
+const CONFIG_SOURCE_REMEDY = `electron-builder resolves its config as: package.json#${CONFIG_PACKAGE_KEY} FIRST, and only if that is absent does it search ${CONFIG_LOOKUP_EXTENSIONS.map((extension) => `${CONFIG_BASENAME}.${extension}`).join(', ')} and take the first hit. Either edit therefore makes ${AUTHORITATIVE_CONFIG_FILE} — and every packaging assertion in this file, including the files/extraResources rules and the asar guard — silently inert while still passing. If the config source is being changed deliberately, that is a decision to make explicitly: update assertConfigSourceIsAuthoritative in scripts/shipping-credential-scan.mjs to audit the NEW source, and add a targeted test proving the engine still ships as a single entry inside app.asar.`;
+
+/**
+ * Refuse any arrangement in which electron-builder would not read
+ * {@link AUTHORITATIVE_CONFIG_FILE}.
+ *
+ * @param {string} root Project root.
+ * @returns {void}
+ */
+export function assertConfigSourceIsAuthoritative(root) {
+  // The audited file must itself exist — otherwise the lookup falls through to a
+  // sibling extension and the assertions below would read nothing at all.
+  assert.equal(
+    fs.existsSync(path.join(root, AUTHORITATIVE_CONFIG_FILE)),
+    true,
+    `PACKAGING_CONFIG_SOURCE_MISSING:${AUTHORITATIVE_CONFIG_FILE}. ${CONFIG_SOURCE_REMEDY}`
+  );
+
+  // 1. package.json#build wins over every file, so its mere PRESENCE is the
+  //    defect — an empty object or a string path hijacks the lookup just as a
+  //    populated object does. Only the top level counts: `scripts.build` is a
+  //    normal npm script and must not trip this.
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8').replace(/^\uFEFF/, ''));
+  } catch (error) {
+    assert.fail(`PACKAGING_MANIFEST_UNPARSEABLE:${error instanceof Error ? error.message.split('\n')[0] : 'unknown'}`);
+  }
+  assert.ok(
+    manifest !== null && typeof manifest === 'object' && !Array.isArray(manifest),
+    'PACKAGING_MANIFEST_NOT_A_MAPPING'
+  );
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(manifest, CONFIG_PACKAGE_KEY),
+    false,
+    `PACKAGING_CONFIG_SOURCE_HIJACKED:package.json#${CONFIG_PACKAGE_KEY}. ${CONFIG_SOURCE_REMEDY}`
+  );
+
+  // 2. No competing sibling config may sit next to the authoritative one.
+  const competing = CONFIG_LOOKUP_EXTENSIONS
+    .map((extension) => `${CONFIG_BASENAME}.${extension}`)
+    .filter((name) => name !== AUTHORITATIVE_CONFIG_FILE && fs.existsSync(path.join(root, name)));
+  assert.deepEqual(
+    competing,
+    [],
+    `PACKAGING_CONFIG_SOURCE_HIJACKED:${competing.join(',')}. ${CONFIG_SOURCE_REMEDY}`
+  );
 }
 
 // The engine bundle ships INSIDE app.asar so ASAR integrity validation covers it.
