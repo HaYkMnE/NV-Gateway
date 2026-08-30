@@ -141,32 +141,87 @@ test('the guard refuses to guess the feed when NVGW_GH_OWNER is absent', () => {
 
 test('release.yml runs the baked-feed guard after packaging and before every upload', () => {
   const workflow = yaml.load(fs.readFileSync(path.join(root, '.github/workflows/release.yml'), 'utf8'));
-  const steps = Object.values(workflow.jobs).flatMap((job) => job.steps ?? []);
 
-  const guardAt = steps.findIndex((step) =>
-    typeof step.run === 'string' && step.run.includes('scripts/verify-baked-update-feed.mjs'));
-  assert.ok(guardAt >= 0, 'release.yml must run scripts/verify-baked-update-feed.mjs');
+  const GUARD_SCRIPT = 'scripts/verify-baked-update-feed.mjs';
+  const isGuardStep = (step) => typeof step.run === 'string' && step.run.includes(GUARD_SCRIPT);
+  // An upload is anything that PUBLISHES release artifacts: the audited action,
+  // or a run: command driving `gh release upload/create`. (Mere mentions —
+  // `gh release view/list` — publish nothing and are not uploads.)
+  const isUploadStep = (step) =>
+    (typeof step.uses === 'string' && step.uses.includes('action-gh-release')) ||
+    (typeof step.run === 'string' && /\bgh\s+release\s+(?:upload|create)\b/.test(step.run));
+  // Status-check functions that let a step or job run even though something
+  // FAILED re-open the silent-success mode. success() is the default and safe.
+  const hasBypassCondition = (value) =>
+    typeof value === 'string' && /\b(?:always|failure|cancelled)\s*\(/i.test(value);
 
-  const buildAt = steps.findIndex((step) =>
+  // Locate the guard and ITS JOB. Ordering is only meaningful within one job:
+  // YAML job order is not execution order — jobs run in parallel absent needs:.
+  const guardJobEntry = Object.entries(workflow.jobs)
+    .find(([, job]) => (job.steps ?? []).some(isGuardStep));
+  assert.ok(guardJobEntry, 'release.yml must run scripts/verify-baked-update-feed.mjs');
+  const [guardJobName, guardJob] = guardJobEntry;
+  const guardSteps = guardJob.steps ?? [];
+  const guardAt = guardSteps.findIndex(isGuardStep);
+  const guard = guardSteps[guardAt];
+
+  // The guard's run must be the invocation and NOTHING else. Any shell chaining
+  // (`|| true`, `;`, `&&`, a second line ending in `exit 0`) can swallow the
+  // guard's exit code while a name search still finds the script. Compared
+  // against the PARSED scalar, so quoting/re-indentation of keys stays fine.
+  assert.equal(guard.run.trim(), `node ${GUARD_SCRIPT}`,
+    'the baked-feed guard must be invoked exactly as `node scripts/verify-baked-update-feed.mjs` — shell chaining can swallow its exit code');
+
+  // Packaging must precede the guard IN THE SAME JOB: app-update.yml exists on
+  // that runner's disk only after build:release ran there.
+  const buildAt = guardSteps.findIndex((step) =>
     typeof step.run === 'string' && step.run.includes('build:release'));
-  assert.ok(buildAt >= 0, 'release.yml must still build the release');
+  assert.ok(buildAt >= 0, `release.yml must still build the release in the guard's job ("${guardJobName}")`);
   assert.ok(guardAt > buildAt,
     'the baked-feed guard must run AFTER packaging — app-update.yml does not exist before it');
 
-  // Every artifact upload must sit after the guard, or a feed-less build could
-  // still be published before anyone notices.
-  const uploadIndexes = steps
-    .map((step, index) => ({ step, index }))
-    .filter(({ step }) => typeof step.uses === 'string' && step.uses.includes('action-gh-release'))
-    .map(({ index }) => index);
-  assert.ok(uploadIndexes.length >= 1, 'release.yml must upload release artifacts');
-  for (const uploadAt of uploadIndexes) {
-    assert.ok(guardAt < uploadAt,
-      'the baked-feed guard must run BEFORE any upload so a feed-less build is never published');
+  // Every artifact upload must be gated by the guard, or a feed-less build
+  // could still be published before anyone notices.
+  const uploadJobs = Object.entries(workflow.jobs)
+    .map(([name, job]) => ({
+      name,
+      job,
+      uploads: (job.steps ?? [])
+        .map((step, index) => ({ step, index }))
+        .filter(({ step }) => isUploadStep(step))
+    }))
+    .filter(({ uploads }) => uploads.length > 0);
+  assert.ok(uploadJobs.length >= 1, 'release.yml must upload release artifacts');
+  for (const { name, job, uploads } of uploadJobs) {
+    for (const { step, index } of uploads) {
+      assert.ok(!hasBypassCondition(step.if),
+        `upload step "${step.name ?? `#${index}`}" carries always()/failure()/cancelled() — it would publish even after the guard failed`);
+      assert.ok(typeof step.uses === 'string' && step.uses.startsWith('softprops/action-gh-release@'),
+        `upload step "${step.name ?? `#${index}`}" must publish through the pinned, audited softprops/action-gh-release — ` +
+        'an ad-hoc upload path (a fork, a run: command) is not reviewed for fail-closed artifact semantics (fail_on_unmatched_files, repository routing)');
+      if (name === guardJobName) {
+        assert.ok(guardAt < index,
+          'the baked-feed guard must run BEFORE any upload so a feed-less build is never published');
+      }
+    }
+    if (name !== guardJobName) {
+      // An upload in ANOTHER job runs in parallel with the guard unless it
+      // explicitly needs the guard's job — YAML job order is not execution order.
+      const needs = Array.isArray(job.needs) ? job.needs : (job.needs ? [job.needs] : []);
+      assert.ok(needs.includes(guardJobName),
+        `upload job "${name}" must declare needs: ["${guardJobName}"] — jobs run in parallel, so without it the upload can publish before the guard finishes`);
+      assert.ok(!hasBypassCondition(job.if),
+        `upload job "${name}" carries always()/failure()/cancelled() at job level — it would publish even after the guard's job failed`);
+    }
   }
 
-  // Not optional: an `if:` or continue-on-error restores the silent-success mode.
-  const guard = steps[guardAt];
+  // Job-level continue-on-error converts the guard's failure into a green check
+  // (and lets needs:-dependent jobs run) exactly as step-level would.
+  assert.equal(guardJob['continue-on-error'] ?? false, false,
+    `job "${guardJobName}" runs the baked-feed guard, so it must not continue-on-error`);
+
+  // Not optional on the step either: an `if:` or continue-on-error restores the
+  // silent-success mode.
   assert.equal('if' in guard, false, 'the baked-feed guard must not be conditional');
   assert.equal('continue-on-error' in guard, false, 'the baked-feed guard must not fail softly');
 
