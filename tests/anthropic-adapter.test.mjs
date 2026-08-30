@@ -786,6 +786,74 @@ test('56. unknown family + thinking DISABLED stays a no-op (no reasoning fields 
   assert.ok(!('chat_template_kwargs' in r.openaiBody));
 });
 
+// The probe measures ONE thing: which `reasoning_effort` values a model accepts.
+// It never writes alternateControl / enableValue / disableValue. So a probed entry
+// must be merged ONTO static knowledge, never substituted for it — otherwise the
+// arrival of a routine background probe silently strips a statically-known second
+// control (z-ai/glm-4.5 needs chat_template_kwargs.enable_thinking as well as
+// reasoning_effort) and `thinking:{type:'disabled'}` stops being honoured upstream.
+test('58. a probed entry must not erase a statically-known alternate reasoning control', () => {
+  const ZAI = 'z-ai/glm-4.5';
+  const realisticProbeOutput = {
+    modes: ['none', 'low', 'medium', 'high'],
+    controlKey: 'reasoning_effort',
+    supported: true,
+  };
+
+  withProbedCache(ZAI, realisticProbeOutput);
+  const enabled = translateAnthropicRequest(thinkingBody(ZAI));
+  assert.deepEqual(enabled.errors, []);
+  assert.equal(enabled.openaiBody.reasoning_effort, 'high');
+  assert.equal(enabled.openaiBody.chat_template_kwargs?.enable_thinking, true,
+    'the statically-known alternate control must survive a probed entry');
+
+  withProbedCache(ZAI, realisticProbeOutput);
+  const disabled = translateAnthropicRequest(thinkingBody(ZAI, { type: 'disabled' }));
+  assert.deepEqual(disabled.errors, []);
+  assert.equal(disabled.openaiBody.reasoning_effort, 'none');
+  assert.equal(disabled.openaiBody.chat_template_kwargs?.enable_thinking, false,
+    'thinking:disabled must still switch the alternate control off');
+});
+
+// `source:'fallback'` is a STATIC GUESS that happens to live in the cache file;
+// only `source:'probed'` comes from a real live run. Treating a guess as evidence
+// lets it outrank the family table it was guessed from.
+test('59. a cached entry with source "fallback" is not probed evidence', () => {
+  withProbedCache('meta/llama-4-maverick-17b-128e-instruct', {
+    modes: ['low', 'high'],
+    controlKey: 'reasoning_effort',
+    supported: true,
+    source: 'fallback',
+  });
+  const r = translateAnthropicRequest(thinkingBody('meta/llama-4-maverick-17b-128e-instruct'));
+  assert.ok(r.errors.some(e => e.includes('does not support thinking')),
+    'a static guess wearing a cache entry\'s clothes must not unlock thinking');
+  assert.equal(r.openaiBody, null);
+});
+
+// capability-probe.mjs writes `{ modes: [], supported: true, controlKey: null }`
+// for a model that emits reasoning_content while REJECTING every reasoning_effort
+// candidate. Sending reasoning_effort to such a model is sending the exact value
+// the probe measured as rejected.
+test('60. a probed implicit reasoner (supported, no control key) gets no reasoning_effort', () => {
+  withProbedCache(HERMES_ID, { modes: [], controlKey: null, supported: true });
+  const r = translateAnthropicRequest(thinkingBody(HERMES_ID));
+  assert.deepEqual(r.errors, []);
+  assert.ok(r.openaiBody);
+  assert.ok(!('reasoning_effort' in r.openaiBody),
+    'the probe measured every reasoning_effort value as rejected; do not send one');
+  assert.ok(!('chat_template_kwargs' in r.openaiBody), 'no control may be invented either');
+});
+
+// An incomplete entry (modes present, controlKey absent) is repaired to the
+// probe's own default rather than silently dropping the reasoning request.
+test('61. a probed entry with modes but no controlKey still drives reasoning_effort', () => {
+  withProbedCache(HERMES_ID, { modes: ['low', 'high'], supported: true });
+  const r = translateAnthropicRequest(thinkingBody(HERMES_ID));
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.openaiBody.reasoning_effort, 'high');
+});
+
 test('57. unknown family + thinking enabled keeps the tool_choice translation working', () => {
   withoutProbedCache();
   const r = translateAnthropicRequest({

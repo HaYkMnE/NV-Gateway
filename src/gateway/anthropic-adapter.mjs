@@ -28,8 +28,12 @@ const OPTIMISTIC_REASONING = Object.freeze({
  * reasoning_effort", NOT "cannot think at all" — treating it as the latter
  * would invent a new local veto out of an inconclusive measurement.
  *
+ * `controlKey` is null when the probe measured reasoning WITHOUT a usable
+ * `reasoning_effort` control, so callers must treat it as "no control key",
+ * not as "field missing".
+ *
  * @param {unknown} modelId
- * @returns {{ supported: true, modes: string[], controlKey: string, defaultMode?: string } | null}
+ * @returns {{ supported: true, modes: string[], controlKey: string | null, defaultMode?: string } | null}
  */
 function readProbedReasoning(modelId) {
   let entry;
@@ -39,11 +43,26 @@ function readProbedReasoning(modelId) {
     return null; // a broken cache must never fail a client request
   }
   if (!entry || entry.supported !== true) return null;
+  // Only a REAL live run is evidence. `source:'fallback'` is a static guess that
+  // merely happens to live in the cache file, so it must never outrank the
+  // family table it was guessed from.
+  if (entry.source !== 'probed') return null;
   const modes = Array.isArray(entry.modes) ? entry.modes.filter(m => typeof m === 'string') : [];
+  // `controlKey: null` TOGETHER WITH an empty mode list is a MEASURED answer,
+  // not missing data: the probe writes exactly that shape for a model that emits
+  // reasoning_content while rejecting every reasoning_effort candidate. Coercing
+  // it to 'reasoning_effort' would send upstream the very value the probe just
+  // measured as rejected, so the "no control" answer is carried through and the
+  // statically-known alternate control (if any) does the work instead.
+  // With modes present the probe always names reasoning_effort, so a missing key
+  // there is just an incomplete entry and is repaired to the probe's own default.
+  const controlKey = typeof entry.controlKey === 'string' && entry.controlKey
+    ? entry.controlKey
+    : (modes.length > 0 ? 'reasoning_effort' : null);
   return {
     supported: true,
     modes,
-    controlKey: typeof entry.controlKey === 'string' && entry.controlKey ? entry.controlKey : 'reasoning_effort',
+    controlKey,
     ...(typeof entry.defaultMode === 'string' && entry.defaultMode ? { defaultMode: entry.defaultMode } : {}),
   };
 }
@@ -326,7 +345,15 @@ export function translateAnthropicRequest(body) {
 
     // Only real knowledge (probe first, then a populated family entry) may
     // drive the "disabled" path; with nothing known we invent no fields.
-    let reasoningCap = probedCap ?? staticCap;
+    //
+    // The probe MEASURES one thing: which `reasoning_effort` values a model
+    // accepts. It never writes alternateControl / enableValue / disableValue, so
+    // a probed entry must be layered ONTO the static family knowledge rather
+    // than substituted for it — otherwise a routine background probe silently
+    // strips a statically-known second control (z-ai/glm-4.5 needs
+    // chat_template_kwargs.enable_thinking as well as reasoning_effort) and
+    // `thinking:{type:'disabled'}` stops being honoured upstream.
+    let reasoningCap = probedCap ? { ...staticCap, ...probedCap } : staticCap;
     if (body.thinking.type === 'enabled' && !reasoningCap.supported && !familyKnown) {
       reasoningCap = OPTIMISTIC_REASONING;
       warnings.push('thinking was translated optimistically: this model family is unknown to the capability registry, so upstream decides whether reasoning is supported');
