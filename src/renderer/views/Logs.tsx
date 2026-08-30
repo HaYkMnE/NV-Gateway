@@ -3,7 +3,7 @@ import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { AlertTriangle, Lightbulb, Send, X } from 'lucide-react';
 import { api, queryKeys } from '../lib/api';
-import { classifyDataState, safeError } from '../lib/frontend-state';
+import { CLIPBOARD_TEXT_MAX, classifyDataState, isOversizedForClipboard, safeError } from '../lib/frontend-state';
 import { classifyScrollEvent, createLogsQueryPolicy, isNearBottom, shouldCancelAutoScroll } from '../lib/frontend-behavior';
 import { useGatewayLifecycle } from '../lib/gateway-lifecycle';
 import { useModal } from '../lib/modal-context';
@@ -15,6 +15,7 @@ export function Logs() {
   const [paused, setPaused] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
   const [feedback, setFeedback] = useState('');
+  const [copyError, setCopyError] = useState<string | null>(null);
   const terminal = useRef<HTMLOListElement>(null);
   const programmaticScroll = useRef(false);
   const prevScrollTop = useRef(0);
@@ -123,12 +124,25 @@ export function Logs() {
   };
   // Copy goes through the main process: navigator.clipboard rejects with
   // NotAllowedError whenever this tray-resident window is not focused.
+  //
+  // A failure keeps its detail. Main refuses an oversized payload with the
+  // deliberately generic "Invalid clipboard text." -- generic because the text can
+  // be an API key or the local gateway token and must never be echoed -- so that
+  // message alone cannot tell the user WHY. The renderer knows both the payload
+  // length and the cap main enforces, so it names the size itself; any other
+  // failure carries the real error detail, like Dashboard, Endpoint and Models.
   const copy = async () => {
+    const text = lines.join('\n');
     try {
-      await window.electronAPI.clipboard.writeText(lines.join('\n'));
+      await window.electronAPI.clipboard.writeText(text);
+      setCopyError(null);
       announce(t('copied'));
-    } catch {
+    } catch (error) {
       announce(t('copy_failed'));
+      const detail = isOversizedForClipboard(text.length)
+        ? t('feedback_charCount', { count: text.length, max: CLIPBOARD_TEXT_MAX })
+        : safeError(error, t('unknown_error'));
+      setCopyError(`${t('clipboard_failed')} ${detail}`);
     }
   };
 
@@ -221,6 +235,7 @@ export function Logs() {
         {feedback || (query.dataUpdatedAt ? `${t('last_refresh')} ${new Date(query.dataUpdatedAt).toLocaleTimeString()}` : '')}
       </div>
       <p className="sr-only" aria-live="polite">{feedback}</p>
+      {copyError && <div role="alert" className="border border-error bg-error/10 text-error p-3 mb-2 break-words">{copyError}</div>}
 
       {state === 'loading' && <div role="status">{t('loading')}</div>}
       {state === 'error' && (

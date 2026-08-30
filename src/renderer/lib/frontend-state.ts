@@ -32,6 +32,24 @@ export function safeError(error: unknown, unknownLabel: string): string {
   return error instanceof Error && error.message ? error.message : unknownLabel;
 }
 
+/**
+ * Upper bound the main process enforces on a clipboard write. Mirrors
+ * CLIPBOARD_TEXT_MAX in src/main/index.ts, which rejects `length > MAX` with the
+ * deliberately generic "Invalid clipboard text." (generic on purpose: the payload
+ * can be an NVIDIA API key or the local gateway token, so it is never echoed).
+ * Because that message cannot name the cause, the renderer needs the same bound
+ * to explain a size refusal itself.
+ */
+export const CLIPBOARD_TEXT_MAX = 1_000_000;
+
+/**
+ * Whether a payload of this length is one main will refuse for SIZE. Inclusive at
+ * the cap, exactly like main: `length > MAX` rejects, so the cap itself is valid.
+ */
+export function isOversizedForClipboard(length: number): boolean {
+  return length > CLIPBOARD_TEXT_MAX;
+}
+
 export function isGatewayUnavailable(error: unknown): boolean {
   if (!error) return false;
   if (error instanceof Error) {
