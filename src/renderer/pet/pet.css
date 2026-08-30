@@ -1255,3 +1255,20 @@
   box-shadow: 0 0 6px #FFD028 !important;
 }
 
+/* ==========================================================
+   ANIMATION VISIBILITY GATE (idle-CPU fix)
+   PetWidget's gate state adds .nv-pet-paused to the widget root while the
+   page cannot be seen (hidden to tray / minimised). Every pet animation
+   freezes in place via animation-play-state: paused — NOT animation: none,
+   which would reset every animation's phase and cause a visible jump when
+   the window comes back. The canvas rAF loop is cancelled separately by
+   the gate effect (start()/destroy() on PixelHackerRenderer).
+   Specificity: activity rules reach (0,3,0) with !important on the
+   `animation` shorthand (and the shorthand resets play-state to running),
+   so this selector is written at (0,4,0) to override all of them.
+   ========================================================== */
+.nv-pet-wrap.nv-pet-paused.nv-pet-paused.nv-pet-paused,
+.nv-pet-wrap.nv-pet-paused.nv-pet-paused.nv-pet-paused * {
+  animation-play-state: paused !important;
+}
+

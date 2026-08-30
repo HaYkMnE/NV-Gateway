@@ -125,6 +125,72 @@ export function windowAudible(win: AudibilityWindow): boolean {
 }
 
 // ==========================================
+// WINDOW ANIMATABILITY (idle-CPU fix — stop drawing what nobody can see)
+// ==========================================
+
+/** The minimal document surface this predicate needs (keeps it unit-testable). */
+export interface AnimatabilityDocument {
+  visibilityState?: string;
+}
+
+/**
+ * Whether the pet's animation drivers (canvas rAF loop + CSS animations) may
+ * run. This is the gate of PIXELS — sibling of, and deliberately DIFFERENT
+ * from, windowAudible above (the gate of SOUND):
+ *
+ *   - SOUND interrupts: an unfocused window must stay silent, so the audio
+ *     gate keys on hasFocus().
+ *   - PIXELS do not interrupt: a VISIBLE-but-unfocused window can still be
+ *     looked at (side window, second monitor, glance-over). Freezing the pet
+ *     there reads as "the app crashed", so focus is NOT part of this gate.
+ *
+ * Only genuine invisibility stops the drawing: hidden-to-tray and minimised
+ * both report visibilityState "hidden" (measured in real Electron 31), and a
+ * fully occluded window is already rAF-throttled by Chromium itself. Those
+ * are the states where every drawn frame is guaranteed waste.
+ *
+ * WHY NOT RELY ON CHROMIUM'S OWN THROTTLING. Measured in the assembled app
+ * (Electron 31.7.7, this machine): with the window minimised or hidden to
+ * the tray, visibilityState flips to "hidden" yet the renderer keeps burning
+ * ~80% of one CPU core on this loop — the browser's hidden-page throttling
+ * does NOT reliably engage for this app's windows. So the loop is cancelled
+ * and the CSS layer paused EXPLICITLY, converting an incidental heuristic
+ * into a tested guarantee, independent of backgroundThrottling or
+ * occlusion-detection support.
+ *
+ * Degrades open: an environment without visibilityState keeps animating
+ * rather than risk a frozen-but-watched pet.
+ */
+export function windowAnimatable(doc?: AnimatabilityDocument | null): boolean {
+  try {
+    return !doc || doc.visibilityState === undefined || doc.visibilityState === 'visible';
+  } catch {
+    return true;
+  }
+}
+
+/** The canvas driver the visibility gate suspends/resumes. */
+export interface PetAnimationDriver {
+  /** (Re)arm the rAF loop — must be idempotent. */
+  start(): void;
+  /** Cancel the rAF loop, preserving all animation state — must be idempotent. */
+  stop(): void;
+}
+
+/**
+ * Single transition point for the animation gate. Suspension preserves state
+ * (the cancelled renderer keeps its particles/mode/clock anchor), so a resume
+ * continues exactly where the pet stopped — no replay burst, no visual jump.
+ */
+export function applyPetAnimationGate(animatable: boolean, driver: PetAnimationDriver): void {
+  if (animatable) {
+    driver.start();
+  } else {
+    driver.stop();
+  }
+}
+
+// ==========================================
 // THOUGHT CLOUD CONTENT (per activity)
 // Texts live in the i18n pet_* namespace (pet_thought_<slug>_<variant>,
 // see src/renderer/i18n/resources.ts); only the emoji glyphs stay in-code.
@@ -254,6 +320,10 @@ export function PetWidget({ onOpenDonation }: PetWidgetProps): React.JSX.Element
   const [cueShown, setCueShown] = useState<boolean>(false);
   const [crossfading, setCrossfading] = useState<boolean>(false);
   const [thought, setThought] = useState<ThoughtVariant | null>(null);
+  // Animation visibility gate state: drives the nv-pet-paused class on the
+  // widget root (CSS layer). The canvas rAF loop is driven directly through
+  // hackerRendererRef in the gate effect below (no re-render needed there).
+  const [pageAnimatable, setPageAnimatable] = useState<boolean>(() => windowAnimatable(document));
 
   const vipRef = useRef<boolean>(isVip);
   const soundRef = useRef<boolean>(soundOn);
@@ -463,10 +533,42 @@ export function PetWidget({ onOpenDonation }: PetWidgetProps): React.JSX.Element
     const renderer = PixelHackerRenderer.create(canvas);
     if (!renderer) return;
     hackerRendererRef.current = renderer;
-    renderer.start(); // begin the rAF loop (destroy() below cancels it)
+    // The rAF loop is started/stopped ONLY by the visibility-gate effect
+    // below — never here: a page (re)loaded while hidden to the tray must
+    // not spin up drawing that nobody can see (destroy() below cancels it).
     return () => {
       renderer.destroy();
       hackerRendererRef.current = null;
+    };
+  }, [character]);
+
+  // ANIMATION VISIBILITY GATE (idle-CPU fix) — suspend EVERY pet animation
+  // driver while the page cannot be seen; resume it, same state and same
+  // phase, when it can.
+  //
+  // Keys on the Page Visibility API ALONE — never on window blur/focus.
+  // `visibilitychange` fires for both hide-to-tray and minimise (measured in
+  // real Electron 31: both flip visibilityState to "hidden") and it does NOT
+  // fire for a merely unfocused window, which is exactly the case that must
+  // keep animating (a visible pet is a pet being looked at; freezing it
+  // reads as a crash). See windowAnimatable for the full rationale.
+  //
+  // One listener per renderer-host lifetime, removed in the cleanup, so no
+  // stacking across hide/show cycles or character switches. start()/destroy()
+  // are idempotent, so repeated same-state events cannot double-arm the loop.
+  useEffect(() => {
+    const applyVisibility = (): void => {
+      const animatable = windowAnimatable(document);
+      setPageAnimatable(animatable); // React owns nv-pet-paused on the root
+      applyPetAnimationGate(animatable, {
+        start: () => hackerRendererRef.current?.start(),
+        stop: () => hackerRendererRef.current?.destroy(),
+      });
+    };
+    applyVisibility();
+    document.addEventListener('visibilitychange', applyVisibility);
+    return () => {
+      document.removeEventListener('visibilitychange', applyVisibility);
     };
   }, [character]);
 
@@ -494,7 +596,7 @@ export function PetWidget({ onOpenDonation }: PetWidgetProps): React.JSX.Element
 
   return (
     <div
-      className={`nv-pet-wrap${isVip ? ' vip-mode' : ''} act-${activity}${crossfading ? ' activity-crossfade' : ''}`}
+      className={`nv-pet-wrap${isVip ? ' vip-mode' : ''} act-${activity}${crossfading ? ' activity-crossfade' : ''}${pageAnimatable ? '' : ' nv-pet-paused'}`}
     >
 
 
@@ -1081,7 +1183,7 @@ interface VipEmber {
   alpha: number;
 }
 
-class PixelHackerRenderer {
+export class PixelHackerRenderer {
   private readonly ctx: CanvasRenderingContext2D;
   private readonly width = 160;
   private readonly height = 152;
