@@ -23,7 +23,7 @@
 // caller passed an extra property. Sending less is always preferable to sending a
 // credential once.
 
-import { redact } from "./redaction";
+import { maskUserPaths, redact } from "./redaction";
 
 /** Fields allowed to leave the machine in an error-report entry. */
 const ALLOWED_ENTRY_FIELDS = ["timestamp", "type", "message", "stack", "source"] as const;
@@ -307,8 +307,12 @@ function safeRead(container: unknown, key: string): { ok: true; value: unknown }
  * they are applied here where reports and bundles are produced.
  */
 function stripUserPaths(value: string): string {
-  return value
-    .replace(/C:\\Users\\[^\\]+\\/gi, "C:\\Users\\***\\")
+  // The user-path shapes live in redaction.ts (maskUserPaths). MEASURED: the
+  // single-shape rule this replaces matched only `C:\Users\<name>\`, so a
+  // relocated profile (`D:\Users\…`), a UNC/roaming profile, a forward-slash
+  // spelling from a stack frame and a path with no trailing separator all
+  // transmitted the local account name.
+  return maskUserPaths(value)
     .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, "***@***.***");
 }
 

@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import * as path from "node:path";
 import * as os from "node:os";
+import { maskUserPaths } from "./redaction";
 
 export function resolveWindowsSid(): string {
   if (process.platform !== "win32") return os.userInfo().username;
@@ -44,7 +45,10 @@ export function createWindowsAclProtector(options: { sid?: string; platform?: No
     // writeProtected, app-logger rotation); ACL is additional hardening. Crashing
     // the Electron main here is strictly worse (5x recurring production crashes,
     // 2026-08-04/07/12x2/15) than a single unprotected-against-inheritance write.
-    console.warn(`[nv-gateway] ACL protectFile degraded after ${ACL_MAX_ATTEMPTS} attempt(s): ${filePath}`);
+    // The account-name segment is masked: this line reaches stderr, and stderr is
+    // captured into shareable diagnostic bundles. The rest of the path is kept —
+    // WHICH file failed to be protected is the whole diagnostic value here.
+    console.warn(`[nv-gateway] ACL protectFile degraded after ${ACL_MAX_ATTEMPTS} attempt(s): ${maskUserPaths(filePath)}`);
   };
 }
 

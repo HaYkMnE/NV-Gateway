@@ -49,6 +49,34 @@ function splitTrailingProsePunctuation(candidate: string): { url: string; traili
   return { url: candidate.slice(0, -match[0].length), trailing: match[0] };
 }
 
+/**
+ * Windows user path, every spelling this app can produce: any drive letter or a
+ * UNC host, `Users` at the profile root, then the ACCOUNT NAME segment.
+ *
+ * MEASURED: the previous single-shape rule in report-sanitizer.ts matched only
+ * `C:\Users\<name>\`, so `D:\Users\<name>\` (relocated profile), a UNC/roaming
+ * profile, a forward-slash spelling (ordinary in stack frames and file:// URLs)
+ * and a trailing-segment path with no final separator all carried the account
+ * name through. The prefix and separators are CAPTURED rather than rewritten so
+ * the original drive letter, host and slash style survive for diagnosis — only
+ * the name is masked.
+ */
+const WINDOWS_USER_PATH = /([A-Za-z]:[\\/]|\\\\[^\\/\r\n]+[\\/])(Users[\\/])([^\\/\r\n]+)/gi;
+
+/**
+ * Mask the local account name in Windows user paths.
+ *
+ * Privacy rather than secrecy, so it is applied where text LEAVES the machine or
+ * reaches stderr — NOT inside redact(), because the user's own local log should
+ * keep the real path it is reporting about.
+ *
+ * @param value Arbitrary text that may embed a user path.
+ * @returns The text with each account-name segment replaced by `***`.
+ */
+export function maskUserPaths(value: string): string {
+  return value.replace(WINDOWS_USER_PATH, (_match, prefix, usersSegment) => `${prefix}${usersSegment}***`);
+}
+
 export function redact(value: unknown, seen = new WeakSet<object>()): any {
   if (typeof value === "string") {
     const generic = redactEmbeddedUrls(redactEncodedEmbeddedUrls(value.replace(SECRET_TEXT, (_match, prefix) => prefix ? `${prefix}[REDACTED]` : "[REDACTED]")));
