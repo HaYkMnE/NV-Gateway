@@ -32,7 +32,8 @@ import { createMigrationPhaseAudit } from "./migration-phase-audit";
 import { createTrayIconCache } from "./tray-icons";
 import { createWindowCloseGuard } from "./window-close-guard";
 import { buildApplicationMenu, buildContextMenu, getMenuStrings } from "./app-menu";
-import { saveFeedback, openGitHubIssue, type FeedbackData } from "./feedback-service";
+import { saveFeedback, openGitHubIssue } from "./feedback-service";
+import { assertFeedbackData } from "./feedback-validation";
 import { openExternalUrl, REPO_URL } from "./external-open";
 import { exportDiagnostic } from "./diagnostic-export";
 import { init as initErrorReporter, logError, getErrorCount, previewErrors, sendErrors, type ErrorEntry } from "./error-reporter";
@@ -815,8 +816,13 @@ ipcMain.handle("error-report:log", wrapIpcHandler("error-report:log", secure((_e
 ipcMain.handle("error-report:get-count", wrapIpcHandler("error-report:get-count", secure(() => getErrorCount())));
 ipcMain.handle("error-report:preview", wrapIpcHandler("error-report:preview", secure(() => previewErrors())));
 ipcMain.handle("error-report:send", wrapIpcHandler("error-report:send", secure(async () => sendErrors())));
-ipcMain.handle("feedback:save", wrapIpcHandler("feedback:save", secure((_event, data: FeedbackData) => saveFeedback(data))));
-ipcMain.handle("feedback:open-github-issue", wrapIpcHandler("feedback:open-github-issue", secure((_event, data: FeedbackData) => openGitHubIssue(data))));
+// `data: unknown` then assert, exactly as clipboard:write-text and
+// shell:open-external do. secure() is validateIpcSender ONLY — it proves WHO is
+// speaking, never WHAT they said — so without assertFeedbackData these two
+// channels trusted the renderer's payload, and the DOM maxLength attributes in
+// FeedbackModal are a typing affordance rather than a boundary.
+ipcMain.handle("feedback:save", wrapIpcHandler("feedback:save", secure((_event, data: unknown) => { assertFeedbackData(data); return saveFeedback(data); })));
+ipcMain.handle("feedback:open-github-issue", wrapIpcHandler("feedback:open-github-issue", secure((_event, data: unknown) => { assertFeedbackData(data); return openGitHubIssue(data); })));
 ipcMain.handle("shell:open-external", wrapIpcHandler("shell:open-external", secure((_event, url: unknown) => openExternalUrl(url))));
 ipcMain.handle("diagnostic:export", wrapIpcHandler("diagnostic:export", secure(() => exportDiagnostic())));
 ipcMain.handle("about:get-info", wrapIpcHandler("about:get-info", secure(() => getAboutInfo())));
