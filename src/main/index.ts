@@ -721,6 +721,53 @@ function secure<T extends (event: Electron.IpcMainInvokeEvent, ...args: any[]) =
   return ((event: Electron.IpcMainInvokeEvent, ...args: unknown[]) => { if (!mainWindow) throw new Error("Window unavailable."); validateIpcSender(event, mainWindow.webContents, allowedRendererUrls()); return handler(event, ...args); }) as T;
 }
 
+// ---------------------------------------------------------------------------
+// Auto-launch is CACHED in main, and deliberately NOT read on the hot path.
+//
+// MEASURED (Electron 31.7.7, Windows, headless probe): every
+// app.getLoginItemSettings() call leaks exactly ONE kernel `Key` handle that is
+// never returned -- but only when the HKCU\Software\Microsoft\Windows\
+// CurrentVersion\Run value for this app exists, i.e. openAtLogin === true.
+//   openAtLogin=true   5000 calls -> handle delta +5000, still held after idle
+//   openAtLogin=false  5000 calls -> handle delta 0
+// The growth is linear, not one-time initialisation (three consecutive batches
+// of 5000 each added 5000).
+//
+// get-runtime-state is invoked on EVERY renderer refresh, so reading the setting
+// there converted an ordinary per-request call into unbounded paged-pool growth
+// (~16.2 bytes of paged pool per handle). One live process on the reporter's
+// machine had accumulated 7,201,605 handles, 7,200,846 of them of type `Key`.
+//
+// So the setting is read only when it can actually have changed: when WE change
+// it (toggle-auto-launch) or when the renderer explicitly asks (get-auto-launch).
+// That bounds native reads to user actions instead of render cycles.
+//
+// TRADEOFF, stated plainly rather than hidden: if the Run value is edited
+// EXTERNALLY while the app is running -- regedit, msconfig, Task Manager's
+// Startup tab, another installer -- get-runtime-state keeps serving the value we
+// last observed. Settings reads autoLaunch from get-runtime-state, so its toggle
+// can display a stale value for the rest of the session (until the next toggle,
+// an explicit get-auto-launch, or a restart). That is the accepted cost of not
+// leaking a handle per render.
+let autoLaunchCache: boolean | null = null;
+
+/**
+ * Native read. Costs one leaked `Key` handle whenever the Run value exists, so
+ * call this only on user-driven paths, never per request.
+ */
+function refreshAutoLaunch(): boolean {
+  autoLaunchCache = app.getLoginItemSettings().openAtLogin;
+  return autoLaunchCache;
+}
+
+/**
+ * Cached read for the hot path. Touches the registry at most once per process,
+ * to seed the cache if no user action has already done so.
+ */
+function getAutoLaunchCached(): boolean {
+  return autoLaunchCache ?? refreshAutoLaunch();
+}
+
 ipcMain.handle("get-app-version", wrapIpcHandler("get-app-version", secure(() => app.getVersion())));
 ipcMain.handle("check-ports", wrapIpcHandler("check-ports", secure(async (_event, ports: number[]) => { validators.ports(ports); return checkPorts(ports); })));
 ipcMain.handle("find-free-port", wrapIpcHandler("find-free-port", secure(async () => findFreePort())));
@@ -731,7 +778,10 @@ ipcMain.handle("get-gateway-port", wrapIpcHandler("get-gateway-port", secure(() 
 ipcMain.handle("get-gateway-status", wrapIpcHandler("get-gateway-status", secure(() => gatewayLifecycle?.getStatus() ?? { state: "stopped" })));
 ipcMain.handle("get-runtime-state", wrapIpcHandler("get-runtime-state", secure(() => {
   if (!gatewayRuntime) throw new Error("Gateway runtime is not initialized.");
-  return { ...readAppConfig(gatewayRuntime.configPath), status: gatewayLifecycle?.getStatus() ?? { state: "stopped" }, version: app.getVersion(), autoLaunch: app.getLoginItemSettings().openAtLogin };
+  // autoLaunch comes from the cache: this handler runs on every renderer refresh
+  // and app.getLoginItemSettings() leaks a kernel `Key` handle per call whenever
+  // the Run value exists. See the note above getAutoLaunchCached().
+  return { ...readAppConfig(gatewayRuntime.configPath), status: gatewayLifecycle?.getStatus() ?? { state: "stopped" }, version: app.getVersion(), autoLaunch: getAutoLaunchCached() };
 })));
 ipcMain.handle("set-app-config", wrapIpcHandler("set-app-config", secure((_event, update: { language?: string; setupComplete?: boolean; performanceMode?: string; autoStartGateway?: boolean }) => {
   const result = updateAppConfig(update as AppConfigUpdate);
@@ -754,10 +804,16 @@ ipcMain.handle("set-gateway-port", wrapIpcHandler("set-gateway-port", secure(asy
 ipcMain.handle("toggle-auto-launch", wrapIpcHandler("toggle-auto-launch", secure((_event, enable: boolean) => {
   validators.boolean(enable);
   app.setLoginItemSettings({ openAtLogin: enable, path: app.getPath("exe") });
+  // We just changed it, so re-read the OS state to keep the cache truthful
+  // rather than assuming the write landed. One native read per user toggle is
+  // bounded by user actions; the return value stays `enable` so the renderer
+  // contract is unchanged.
+  refreshAutoLaunch();
   logAppEvent("info", "auto_launch_toggle", { enabled: enable });
   return enable;
 })));
-ipcMain.handle("get-auto-launch", wrapIpcHandler("get-auto-launch", secure(() => app.getLoginItemSettings().openAtLogin)));
+// An explicit request: read the OS state for real and refresh the cache with it.
+ipcMain.handle("get-auto-launch", wrapIpcHandler("get-auto-launch", secure(() => refreshAutoLaunch())));
 const UPDATE_STATUS_FALLBACK: UpdaterStatus = { state: "none", version: null, percent: null };
 ipcMain.handle("get-update-status", wrapIpcHandler("get-update-status", secure(() => updaterService?.getStatus() ?? { ...UPDATE_STATUS_FALLBACK })));
 ipcMain.handle("check-for-updates", wrapIpcHandler("check-for-updates", secure(() => {
