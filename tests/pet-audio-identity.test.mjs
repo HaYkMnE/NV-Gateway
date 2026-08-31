@@ -442,3 +442,95 @@ test('persona resolution: stored hacker session ALWAYS resolves to hacker, never
   assert.equal(fallbackHacker['getActivePersona'](), 'hacker', 'null storage with hacker activity must fall back to hacker');
 });
 
+test('Defect 1: shuffle deck boundary repeat prevention ensures minimum non-recurrence floor', () => {
+  const { petAudio } = loadPetAudioWithContext();
+  petAudio.setEnabled(true);
+
+  const mascotCuesDrawn = [];
+  for (let i = 0; i < 500; i++) {
+    petAudio.drawMascotIdleCue();
+    mascotCuesDrawn.push(petAudio.lastMascotIdleCue);
+  }
+
+  for (let i = 1; i < mascotCuesDrawn.length; i++) {
+    assert.notEqual(
+      mascotCuesDrawn[i],
+      mascotCuesDrawn[i - 1],
+      `Mascot idle deck repeated cue '${mascotCuesDrawn[i]}' consecutively at index ${i}`
+    );
+  }
+
+  const hackerCuesDrawn = [];
+  for (let i = 0; i < 500; i++) {
+    petAudio.drawHackerIdleCue();
+    hackerCuesDrawn.push(petAudio.lastHackerIdleCue);
+  }
+
+  for (let i = 1; i < hackerCuesDrawn.length; i++) {
+    assert.notEqual(
+      hackerCuesDrawn[i],
+      hackerCuesDrawn[i - 1],
+      `Hacker idle deck repeated cue '${hackerCuesDrawn[i]}' consecutively at index ${i}`
+    );
+  }
+});
+
+test('Defect 2: transient voice gain staging protects master compressor headroom on target cues', () => {
+  // 1. playMugTableTap v2: glide gain <= 0.68, noise gain <= 1.50
+  const { petAudio: audio1, mockCtx: ctx1 } = loadPetAudioWithContext();
+  audio1.setEnabled(true);
+  const baselineCount1 = ctx1.createdNodes.length;
+  audio1.playMugTableTap(2);
+  // Slice after voiceGain node (baseline + 1)
+  const cueGainNodes1 = ctx1.createdNodes.slice(baselineCount1 + 1).filter(n => n instanceof MockGainNode);
+  const scheduledGains1 = cueGainNodes1.map(g => Math.max(...g.gain.events.map(e => e.v)));
+  const maxGain1 = Math.max(...scheduledGains1);
+  assert.ok(maxGain1 <= 1.55, `playMugTableTap v2 peak gain stage (${maxGain1}) must be <= 1.55`);
+
+  // 2. playHackerCursorTick v0: switch click noise <= 0.75, thock <= 0.85
+  const { petAudio: audio2, mockCtx: ctx2 } = loadPetAudioWithContext();
+  audio2.setEnabled(true);
+  const baselineCount2 = ctx2.createdNodes.length;
+  audio2.playHackerCursorTick(0);
+  const cueGainNodes2 = ctx2.createdNodes.slice(baselineCount2 + 1).filter(n => n instanceof MockGainNode);
+  const scheduledGains2 = cueGainNodes2.map(g => Math.max(...g.gain.events.map(e => e.v)));
+  const maxGain2 = Math.max(...scheduledGains2);
+  assert.ok(maxGain2 <= 0.85, `playHackerCursorTick v0 peak gain stage (${maxGain2}) must be <= 0.85`);
+
+  // 3. playHackerDiskSeek v0: head seek <= 0.80, friction <= 0.86
+  const { petAudio: audio3, mockCtx: ctx3 } = loadPetAudioWithContext();
+  audio3.setEnabled(true);
+  const baselineCount3 = ctx3.createdNodes.length;
+  audio3.playHackerDiskSeek(0);
+  const cueGainNodes3 = ctx3.createdNodes.slice(baselineCount3 + 1).filter(n => n instanceof MockGainNode);
+  const scheduledGains3 = cueGainNodes3.map(g => Math.max(...g.gain.events.map(e => e.v)));
+  const maxGain3 = Math.max(...scheduledGains3);
+  assert.ok(maxGain3 <= 0.88, `playHackerDiskSeek v0 peak gain stage (${maxGain3}) must be <= 0.88`);
+});
+
+test('Defect 3: synthesis stability and deterministic layering on calibrated cues', () => {
+  // playAscensionRitual v2 harmonic gain staging
+  const { petAudio: audioAsc, mockCtx: ctxAsc } = loadPetAudioWithContext();
+  audioAsc.setEnabled(true);
+  audioAsc.playAscensionRitual(2);
+  const oscsAsc = ctxAsc.createdNodes.filter(n => n instanceof MockOscillatorNode);
+  assert.ok(oscsAsc.length >= 4, 'playAscensionRitual v2 must render 4 ascending harmonic sine layers');
+
+  // playMascotSensorPolish v1 deterministic sine anchor
+  const { petAudio: audioPol, mockCtx: ctxPol } = loadPetAudioWithContext();
+  audioPol.setEnabled(true);
+  audioPol.playMascotSensorPolish(1);
+  const oscsPol = ctxPol.createdNodes.filter(n => n instanceof MockOscillatorNode);
+  const hasLensTone = oscsPol.some(o => Math.abs(o.frequency.value - 2200) < 50);
+  assert.ok(hasLensTone, 'playMascotSensorPolish v1 must include 2200 Hz deterministic lens tone');
+
+  // playSadTiredSigh v0 deterministic sigh tone
+  const { petAudio: audioSigh, mockCtx: ctxSigh } = loadPetAudioWithContext();
+  audioSigh.setEnabled(true);
+  audioSigh.playSadTiredSigh(0);
+  const oscsSigh = ctxSigh.createdNodes.filter(n => n instanceof MockOscillatorNode);
+  const hasSighTone = oscsSigh.some(o => Math.abs(o.frequency.value - 480) < 20);
+  assert.ok(hasSighTone, 'playSadTiredSigh v0 must include 480 Hz deterministic sigh anchor');
+});
+
+

@@ -502,7 +502,7 @@ class PetAudioEngine {
           const j = Math.floor(Math.random() * (i + 1));
           [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
         }
-      } while (pool.length > 1 && shuffled[0][0] === this.lastMascotIdleCue);
+      } while (pool.length > 1 && shuffled[shuffled.length - 1][0] === this.lastMascotIdleCue);
       this.mascotIdleDeck = shuffled.map(([name, fn]) => () => {
         this.lastMascotIdleCue = name;
         fn();
@@ -528,7 +528,7 @@ class PetAudioEngine {
           const j = Math.floor(Math.random() * (i + 1));
           [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
         }
-      } while (pool.length > 1 && shuffled[0][0] === this.lastHackerIdleCue);
+      } while (pool.length > 1 && shuffled[shuffled.length - 1][0] === this.lastHackerIdleCue);
       this.hackerIdleDeck = shuffled.map(([name, fn]) => () => {
         this.lastHackerIdleCue = name;
         fn();
@@ -666,7 +666,7 @@ class PetAudioEngine {
         vf.type = 'lowpass';
         vf.frequency.setValueAtTime(180 * pMod, t);
         vg.gain.setValueAtTime(0.0001, t);
-        vg.gain.linearRampToValueAtTime(0.40, t + 0.35);
+        vg.gain.linearRampToValueAtTime(0.20, t + 0.35);
         vg.gain.exponentialRampToValueAtTime(0.0001, t + 1.2);
         vent.connect(vf); vf.connect(vg); vg.connect(out);
         vent.start(t); vent.stop(t + 1.25);
@@ -684,7 +684,7 @@ class PetAudioEngine {
     const v = this.createVoice({ duration: 1.4, volume: 0.60 });
     if (!v) return -1;
     const { out, t, voice } = v;
-    const pMod = this.jitter(0.02);
+    const pMod = this.jitter(0.005);
 
     if (vIdx === 0) {
       // CRT Flyback Coil & Transformer Hum: 60 Hz + 120 Hz soft pulse
@@ -717,26 +717,37 @@ class PetAudioEngine {
         voice.nodes.push(tick);
       });
     } else {
-      // Quiet Computer Fan & Motor Hum: pink noise + 60 Hz motor triangle through 220 Hz lowpass
+      // Quiet Computer Fan & Motor Hum: 60 Hz + 120 Hz motor sines + calibrated filtered pink noise
       const motor = this.ctx!.createOscillator();
       const mg = this.ctx!.createGain();
       motor.type = 'triangle';
-      motor.frequency.setValueAtTime(60 * pMod, t);
+      motor.frequency.setValueAtTime(60, t);
       mg.gain.setValueAtTime(0.0001, t);
-      mg.gain.linearRampToValueAtTime(0.24, t + 0.2);
+      mg.gain.linearRampToValueAtTime(0.26, t + 0.2);
       mg.gain.exponentialRampToValueAtTime(0.0001, t + 1.0);
       motor.connect(mg); mg.connect(out);
       motor.start(t); motor.stop(t + 1.05);
       voice.nodes.push(motor);
+
+      const fanTone = this.ctx!.createOscillator();
+      const ftg = this.ctx!.createGain();
+      fanTone.type = 'sine';
+      fanTone.frequency.setValueAtTime(120, t);
+      ftg.gain.setValueAtTime(0.0001, t);
+      ftg.gain.linearRampToValueAtTime(0.20, t + 0.25);
+      ftg.gain.exponentialRampToValueAtTime(0.0001, t + 0.95);
+      fanTone.connect(ftg); ftg.connect(out);
+      fanTone.start(t); fanTone.stop(t + 1.0);
+      voice.nodes.push(fanTone);
 
       const fan = this.getPink();
       if (fan) {
         const ff = this.ctx!.createBiquadFilter();
         const fg = this.ctx!.createGain();
         ff.type = 'lowpass';
-        ff.frequency.setValueAtTime(220 * pMod, t);
+        ff.frequency.setValueAtTime(220, t);
         fg.gain.setValueAtTime(0.0001, t);
-        fg.gain.linearRampToValueAtTime(0.95, t + 0.3);
+        fg.gain.linearRampToValueAtTime(0.40, t + 0.3);
         fg.gain.exponentialRampToValueAtTime(0.0001, t + 1.0);
         fan.connect(ff); ff.connect(fg); fg.connect(out);
         fan.start(t); fan.stop(t + 1.05);
@@ -896,7 +907,7 @@ class PetAudioEngine {
     const v = this.createVoice({ duration: 1.0, volume: 0.65 });
     if (!v) return -1;
     const { out, t, voice } = v;
-    const pMod = this.jitter(0.03);
+    const pMod = this.jitter(0.005);
 
     if (vIdx === 0) {
       // Gentle Pneumatic Release: soft pink noise bandpassed at 480 Hz + gentle sub release
@@ -906,7 +917,7 @@ class PetAudioEngine {
       sub.frequency.setValueAtTime(120 * pMod, t);
       sub.frequency.exponentialRampToValueAtTime(60 * pMod, t + 0.5);
       sg.gain.setValueAtTime(0.0001, t);
-      sg.gain.linearRampToValueAtTime(0.16, t + 0.08);
+      sg.gain.linearRampToValueAtTime(0.18, t + 0.08);
       sg.gain.exponentialRampToValueAtTime(0.0001, t + 0.6);
       sub.connect(sg); sg.connect(out);
       sub.start(t); sub.stop(t + 0.65);
@@ -916,11 +927,22 @@ class PetAudioEngine {
       if (noise) {
         const f = this.ctx!.createBiquadFilter();
         const g = this.ctx!.createGain();
+        const sighTone = this.ctx!.createOscillator();
+        const stg = this.ctx!.createGain();
+        sighTone.type = 'sine';
+        sighTone.frequency.setValueAtTime(480, t);
+        stg.gain.setValueAtTime(0.0001, t);
+        stg.gain.linearRampToValueAtTime(0.18, t + 0.1);
+        stg.gain.exponentialRampToValueAtTime(0.0001, t + 0.65);
+        sighTone.connect(stg); stg.connect(out);
+        sighTone.start(t); sighTone.stop(t + 0.7);
+        voice.nodes.push(sighTone);
+
         f.type = 'bandpass';
-        f.frequency.setValueAtTime(480 * pMod, t);
-        f.Q.value = 1.0;
+        f.frequency.setValueAtTime(480, t);
+        f.Q.value = 0.75;
         g.gain.setValueAtTime(0.0001, t);
-        g.gain.linearRampToValueAtTime(1.40, t + 0.12);
+        g.gain.linearRampToValueAtTime(0.45, t + 0.12);
         g.gain.exponentialRampToValueAtTime(0.0001, t + 0.75);
         noise.connect(f); f.connect(g); g.connect(out);
         noise.start(t); noise.stop(t + 0.8);
@@ -985,7 +1007,7 @@ class PetAudioEngine {
         sf.frequency.setValueAtTime(2400 * kJit, tk);
         sf.Q.value = 3.0;
         sg.gain.setValueAtTime(0.0001, tk);
-        sg.gain.linearRampToValueAtTime(isSpace ? 0.5 : 0.42, tk + 0.002);
+        sg.gain.linearRampToValueAtTime(isSpace ? 0.74 : 0.68, tk + 0.002);
         sg.gain.exponentialRampToValueAtTime(0.0001, tk + (isSpace ? 0.015 : 0.008));
         noise.connect(sf); sf.connect(sg); sg.connect(out);
         noise.start(tk); noise.stop(tk + 0.02);
@@ -1273,7 +1295,7 @@ class PetAudioEngine {
       glide.frequency.setValueAtTime(1100 * pMod, t);
       glide.frequency.exponentialRampToValueAtTime(1450 * pMod, t + 0.08);
       gg.gain.setValueAtTime(0.0001, t);
-      gg.gain.linearRampToValueAtTime(0.70, t + 0.01);
+      gg.gain.linearRampToValueAtTime(0.68, t + 0.01);
       gg.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
       glide.connect(gg); gg.connect(out);
       glide.start(t); glide.stop(t + 0.14);
@@ -1287,7 +1309,7 @@ class PetAudioEngine {
         f.frequency.setValueAtTime(1600 * pMod, t);
         f.Q.value = 1.5;
         g.gain.setValueAtTime(0.0001, t);
-        g.gain.linearRampToValueAtTime(1.8, t + 0.02);
+        g.gain.linearRampToValueAtTime(1.50, t + 0.02);
         g.gain.exponentialRampToValueAtTime(0.0001, t + 0.1);
         noise.connect(f); f.connect(g); g.connect(out);
         noise.start(t); noise.stop(t + 0.12);
@@ -1351,7 +1373,7 @@ class PetAudioEngine {
       thud.frequency.setValueAtTime(110 * pMod, t);
       thud.frequency.exponentialRampToValueAtTime(50 * pMod, t + 0.05);
       tg.gain.setValueAtTime(0.0001, t);
-      tg.gain.linearRampToValueAtTime(0.85, t + 0.003);
+      tg.gain.linearRampToValueAtTime(0.98, t + 0.003);
       tg.gain.exponentialRampToValueAtTime(0.0001, t + 0.07);
       thud.connect(tg); tg.connect(out);
       thud.start(t); thud.stop(t + 0.08);
@@ -1373,7 +1395,7 @@ class PetAudioEngine {
       hum.type = 'triangle';
       hum.frequency.setValueAtTime(60 * pMod, t);
       hg.gain.setValueAtTime(0.0001, t);
-      hg.gain.linearRampToValueAtTime(0.40, t + 0.01);
+      hg.gain.linearRampToValueAtTime(0.48, t + 0.01);
       hg.gain.exponentialRampToValueAtTime(0.0001, t + 0.09);
       hum.connect(hg); hg.connect(out);
       hum.start(t); hum.stop(t + 0.1);
@@ -1696,7 +1718,7 @@ class PetAudioEngine {
     const v = this.createVoice({ duration: 0.6, volume: 0.60 });
     if (!v) return -1;
     const { out, t, voice } = v;
-    const pMod = this.jitter(0.03);
+    const pMod = this.jitter(0.005);
 
     if (vIdx === 0) {
       // Micro-Servo Calibration & Lens Ding: 300 Hz -> 500 Hz servo + 2.2 kHz crystal chime
@@ -1727,18 +1749,29 @@ class PetAudioEngine {
       // Microfiber Friction Wipe: 2 soft filtered pink noise sweeps
       [0, 0.12].forEach((dw) => {
         const tw = t + dw;
+        const tone = this.ctx!.createOscillator();
+        const tg = this.ctx!.createGain();
+        tone.type = 'sine';
+        tone.frequency.setValueAtTime(2200, tw);
+        tg.gain.setValueAtTime(0.0001, tw);
+        tg.gain.linearRampToValueAtTime(0.28, tw + 0.02);
+        tg.gain.exponentialRampToValueAtTime(0.0001, tw + 0.20);
+        tone.connect(tg); tg.connect(out);
+        tone.start(tw); tone.stop(tw + 0.22);
+        voice.nodes.push(tone);
+
         const noise = this.getPink();
         if (noise) {
           const f = this.ctx!.createBiquadFilter();
           const g = this.ctx!.createGain();
           f.type = 'bandpass';
-          f.frequency.setValueAtTime(2200 * pMod, tw);
-          f.Q.value = 1.2;
+          f.frequency.setValueAtTime(2200, tw);
+          f.Q.value = 0.8;
           g.gain.setValueAtTime(0.0001, tw);
-          g.gain.linearRampToValueAtTime(2.45, tw + 0.02);
-          g.gain.exponentialRampToValueAtTime(0.0001, tw + 0.26);
+          g.gain.linearRampToValueAtTime(0.95, tw + 0.02);
+          g.gain.exponentialRampToValueAtTime(0.0001, tw + 0.28);
           noise.connect(f); f.connect(g); g.connect(out);
-          noise.start(tw); noise.stop(tw + 0.27);
+          noise.start(tw); noise.stop(tw + 0.29);
           voice.nodes.push(noise);
         }
       });
@@ -1750,7 +1783,7 @@ class PetAudioEngine {
       pulse.frequency.setValueAtTime(440 * pMod, t);
       pulse.frequency.exponentialRampToValueAtTime(880 * pMod, t + 0.08);
       g.gain.setValueAtTime(0.0001, t);
-      g.gain.linearRampToValueAtTime(0.95, t + 0.005);
+      g.gain.linearRampToValueAtTime(0.68, t + 0.005);
       g.gain.exponentialRampToValueAtTime(0.0001, t + 0.48);
       pulse.connect(g); g.connect(out);
       pulse.start(t); pulse.stop(t + 0.50);
@@ -1805,7 +1838,7 @@ class PetAudioEngine {
       clink.type = 'triangle';
       clink.frequency.setValueAtTime(1450 * pMod, t);
       cg.gain.setValueAtTime(0.0001, t);
-      cg.gain.linearRampToValueAtTime(0.48, t + 0.003);
+      cg.gain.linearRampToValueAtTime(0.40, t + 0.003);
       cg.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
       clink.connect(cg); cg.connect(out);
       clink.start(t); clink.stop(t + 0.15);
@@ -1816,7 +1849,7 @@ class PetAudioEngine {
       chime.type = 'sine';
       chime.frequency.setValueAtTime(880 * pMod, t + 0.05);
       chg.gain.setValueAtTime(0.0001, t + 0.05);
-      chg.gain.linearRampToValueAtTime(0.48, t + 0.06);
+      chg.gain.linearRampToValueAtTime(0.40, t + 0.06);
       chg.gain.exponentialRampToValueAtTime(0.0001, t + 0.4);
       chime.connect(chg); chg.connect(out);
       chime.start(t + 0.05); chime.stop(t + 0.42);
@@ -2035,7 +2068,7 @@ class PetAudioEngine {
         f.type = 'lowpass';
         f.frequency.setValueAtTime(1400, tn);
         g.gain.setValueAtTime(0.0001, tn);
-        g.gain.linearRampToValueAtTime(0.92 / freqs.length, tn + 0.08);
+        g.gain.linearRampToValueAtTime(0.865 / freqs.length, tn + 0.08);
         g.gain.exponentialRampToValueAtTime(0.0001, tn + 1.28);
         osc.connect(f); f.connect(g); g.connect(out);
         osc.start(tn); osc.stop(tn + 1.31);
@@ -2066,7 +2099,7 @@ class PetAudioEngine {
         sf.frequency.setValueAtTime(2400 * pMod, t);
         sf.Q.value = 3.0;
         sg.gain.setValueAtTime(0.0001, t);
-        sg.gain.linearRampToValueAtTime(0.85, t + 0.002);
+        sg.gain.linearRampToValueAtTime(0.75, t + 0.002);
         sg.gain.exponentialRampToValueAtTime(0.0001, t + 0.015);
         noise.connect(sf); sf.connect(sg); sg.connect(out);
         noise.start(t); noise.stop(t + 0.02);
@@ -2079,7 +2112,7 @@ class PetAudioEngine {
       thud.frequency.setValueAtTime(140 * pMod, t);
       thud.frequency.exponentialRampToValueAtTime(50 * pMod, t + 0.045);
       tg.gain.setValueAtTime(0.0001, t);
-      tg.gain.linearRampToValueAtTime(0.95, t + 0.008);
+      tg.gain.linearRampToValueAtTime(0.84, t + 0.008);
       tg.gain.exponentialRampToValueAtTime(0.0001, t + 0.09);
       thud.connect(tg); tg.connect(out);
       thud.start(t); thud.stop(t + 0.095);
@@ -2146,7 +2179,7 @@ class PetAudioEngine {
       sf.type = 'lowpass';
       sf.frequency.setValueAtTime(380, t);
       sg.gain.setValueAtTime(0.0001, t);
-      sg.gain.linearRampToValueAtTime(0.85, t + 0.01);
+      sg.gain.linearRampToValueAtTime(0.80, t + 0.01);
       sg.gain.exponentialRampToValueAtTime(0.0001, t + 0.14);
       seek.connect(sf); sf.connect(sg); sg.connect(out);
       seek.start(t); seek.stop(t + 0.15);
@@ -2160,7 +2193,7 @@ class PetAudioEngine {
         ff.frequency.setValueAtTime(1400 * pMod, t);
         ff.Q.value = 2.0;
         fg.gain.setValueAtTime(0.0001, t);
-        fg.gain.linearRampToValueAtTime(0.95, t + 0.015);
+        fg.gain.linearRampToValueAtTime(0.86, t + 0.015);
         fg.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
         friction.connect(ff); ff.connect(fg); fg.connect(out);
         friction.start(t); friction.stop(t + 0.13);
