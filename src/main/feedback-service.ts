@@ -11,11 +11,11 @@
 //   * openGitHubIssue(), which opens a PREFILLED browser page — the user still
 //     has to review it and press GitHub's own submit button, and the app itself
 //     transmits nothing.
-import { app, shell } from "electron";
+import { app } from "electron";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { exportDiagnostic } from "./diagnostic-export";
-import { REPO_ISSUES_URL } from "./external-open";
+import { REPO_ISSUES_URL, openRepoUrl } from "./external-open";
 import { sanitizeReportText } from "./report-sanitizer";
 
 export interface FeedbackData {
@@ -132,6 +132,14 @@ export async function openGitHubIssue(data: FeedbackData): Promise<void> {
     lines.push(`**Contact:** ${email}`);
   }
 
+  // Routed through the allowlist in external-open.ts rather than reaching for
+  // Electron's shell here. This call used to hand the OS a URL that had passed
+  // no validation at all, which made the invariant stated in external-open.ts
+  // false for this route even though that file owns the allowlist. It is benign
+  // today — the URL is built from the compiled REPO_ISSUES_URL constant plus
+  // encodeURIComponent'd user text — but if that constant is ever edited to
+  // point elsewhere, openRepoUrl rejects it instead of opening it. openRepoUrl is
+  // scoped to this repository, so routing through it adds no reachable surface.
   const url = `${REPO_ISSUES_URL}?title=${encodeURIComponent(title)}&body=${encodeURIComponent(lines.join("\n"))}`;
-  await shell.openExternal(url);
+  await openRepoUrl(url);
 }

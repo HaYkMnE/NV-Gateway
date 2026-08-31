@@ -1,12 +1,31 @@
 import { shell } from "electron";
 
 /**
- * Safe external-link opening for the renderer.
+ * Safe external-link opening.
  *
- * Mirrors the feedback-service pattern: the renderer never navigates and
- * never gets `window.open` (both are denied by electron-security.ts) — it
- * asks the main process over IPC, and the main process validates the URL
- * against a strict allowlist BEFORE handing it to `shell.openExternal`.
+ * The renderer never navigates and never gets `window.open` (both are denied by
+ * electron-security.ts) — it asks the main process over IPC, and the main
+ * process validates the URL against a strict allowlist BEFORE handing it to
+ * `shell.openExternal`.
+ *
+ * WHAT IS ACTUALLY GUARANTEED, AND BY WHICH DOOR. This file owns the allowlist,
+ * so a claim made here reads as a whole-app invariant. It previously described
+ * only the `shell:open-external` route, while `feedback-service.ts` called
+ * `shell.openExternal` directly and never passed through this allowlist — so the
+ * claim was not true of the whole app. Both outbound doors now live here:
+ *
+ *   openExternalUrl — the renderer-facing door behind `shell:open-external`.
+ *                     Full allowlist (donation hosts plus the one repository
+ *                     path) AND the length cap, because its input is arbitrary
+ *                     and renderer-supplied.
+ *   openRepoUrl     — the narrower door used by `feedback-service.ts` for the
+ *                     prefilled issue page. Repository path ONLY; the donation
+ *                     hosts are unreachable through it.
+ *
+ * Every allowed destination is https, carries no explicit port, and is either an
+ * allowlisted host or a path below the one repository. What is validated is also
+ * what is opened: callers receive the parsed, normalised `url.href` rather than
+ * the raw input string, so the two can never disagree.
  */
 
 /** Hostnames that may ever be opened externally (support / donation platforms). */
@@ -87,9 +106,19 @@ const MAX_EXTERNAL_URL_LENGTH = 2048;
  * payload): `new URL(link).href === link` for every one. So this is a no-op for
  * legitimate input and cannot re-encode a query or add a trailing slash to a
  * live link.
+ *
+ * `hostRuleMatches` selects how wide the door is, so both doors share one
+ * implementation of the scheme and port checks instead of duplicating them.
+ * `maxLength` is optional because the two doors have genuinely different input
+ * provenance; see `openRepoUrl`.
  */
-function parseAllowedExternalUrl(value: unknown): URL | null {
-  if (typeof value !== "string" || value.length > MAX_EXTERNAL_URL_LENGTH) return null;
+function parseAllowedUrl(
+  value: unknown,
+  hostRuleMatches: (url: URL) => boolean,
+  maxLength?: number
+): URL | null {
+  if (typeof value !== "string") return null;
+  if (maxLength !== undefined && value.length > maxLength) return null;
   try {
     const url = new URL(value);
     // THE PORT IS PART OF THE DESTINATION. `url.port` is the empty string when
@@ -109,8 +138,7 @@ function parseAllowedExternalUrl(value: unknown): URL | null {
     // practice the connection simply fails — but a control whose entire job is
     // constraining the destination was leaving part of it unconstrained.
     if (url.protocol === "https:" && url.port === "") {
-      const allowed = ALLOWED_EXTERNAL_HOSTS.has(url.hostname) || isAllowedRepoUrl(url);
-      return allowed ? url : null;
+      return hostRuleMatches(url) ? url : null;
     }
     return null;
   } catch {
@@ -118,15 +146,55 @@ function parseAllowedExternalUrl(value: unknown): URL | null {
   }
 }
 
-export function isAllowedExternalUrl(value: unknown): value is string {
-  return parseAllowedExternalUrl(value) !== null;
+/** The renderer-facing surface: the donation hosts, or the one repository path. */
+function matchesExternalHostRule(url: URL): boolean {
+  return ALLOWED_EXTERNAL_HOSTS.has(url.hostname) || isAllowedRepoUrl(url);
 }
 
+export function isAllowedExternalUrl(value: unknown): value is string {
+  return parseAllowedUrl(value, matchesExternalHostRule, MAX_EXTERNAL_URL_LENGTH) !== null;
+}
+
+/**
+ * The renderer-facing door, behind the `shell:open-external` IPC channel. Full
+ * allowlist and the length cap, because the input is arbitrary and comes from
+ * the renderer.
+ */
 export async function openExternalUrl(value: unknown): Promise<void> {
-  const url = parseAllowedExternalUrl(value);
+  const url = parseAllowedUrl(value, matchesExternalHostRule, MAX_EXTERNAL_URL_LENGTH);
   if (!url) {
     throw new Error("External URL is not on the allowlist.");
   }
   // `url.href`, NOT `value`: the OS gets the representation that was validated.
+  await shell.openExternal(url.href);
+}
+
+/**
+ * The narrow door for main-process links into THIS repository — currently the
+ * prefilled issue page built by `feedback-service.ts`, which used to call
+ * `shell.openExternal` directly and so never passed through this allowlist at
+ * all. Strictly narrower than `openExternalUrl`: the donation hosts are not
+ * reachable through it, so this adds no surface, it only removes an unvalidated
+ * one.
+ *
+ * NOT length-capped, deliberately. Measured at the renderer's own field limits
+ * (FeedbackModal caps the title at 100 and the description at 2000 characters)
+ * the prefilled issue URL is about 3.3 KB of ASCII and about 12.5 KB with
+ * Cyrillic text, so applying the 2048-character cap here would reject legitimate
+ * feedback and break "Open GitHub issue". Length is not what constrains this path
+ * anyway: the URL is rooted in the compiled `REPO_ISSUES_URL` and every user byte
+ * goes through `encodeURIComponent`, which percent-encodes "/", ":", "?", "#" and
+ * "@" — so no amount of user text can move the authority or the path. The cap
+ * exists to bound arbitrary renderer-supplied input, which this is not.
+ *
+ * The destination is validated in full regardless, which is what makes the header's
+ * claim true for this route too: if `REPO_URL` is ever edited to point somewhere
+ * else, this rejects it instead of opening it.
+ */
+export async function openRepoUrl(value: unknown): Promise<void> {
+  const url = parseAllowedUrl(value, isAllowedRepoUrl);
+  if (!url) {
+    throw new Error("External URL is not on the allowlist.");
+  }
   await shell.openExternal(url.href);
 }
