@@ -26,6 +26,59 @@ export interface FeedbackData {
   attachDiagnostic: boolean;
 }
 
+/**
+ * Every LONE UTF-16 surrogate: a high surrogate not followed by a low, or a low
+ * surrogate not preceded by a high. A well-formed pair never matches.
+ */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+/**
+ * Percent-encode one field for the issue URL, repairing lone surrogates first.
+ *
+ * WHY. MEASURED against the built modules, feedback text containing a lone
+ * surrogate made `encodeURIComponent` throw `URIError: URI malformed` right here,
+ * BEFORE the allowlist in external-open.ts was ever reached:
+ *
+ *   description "before\uD800after" -> URIError: URI malformed, openedCount 0
+ *   description "before\uDC00after" -> URIError: URI malformed, openedCount 0
+ *   description "before\u{1F389}after" -> opened normally
+ *
+ * `wrapIpcHandler` logged it and FeedbackModal's `.catch` turned it into the
+ * generic `feedback_failed` toast, so it was never a crash — but the user lost the
+ * WHOLE report to a meaningless error, and the type thrown was a `URIError` from
+ * the URL builder rather than the allowlist's own rejection. Lone surrogates
+ * genuinely arrive from pastes whose source cut an astral character in half, so
+ * this is a real path and not a synthetic one.
+ *
+ * WHAT THE USER LOSES, stated exactly: one U+FFFD per lone surrogate, substituted
+ * in place, with the surrounding text and the string length untouched. A lone
+ * surrogate is not a character — it is half of one, it has no rendering, and it is
+ * already broken on arrival. U+FFFD is not an invention of this fix either: it is
+ * what UTF-8 encoding itself substitutes, MEASURED as
+ * `Buffer.from("ab\uD800cd", "utf8") === 6162 efbfbd 6364`, which is what the local
+ * SAVE path above already effectively writes to disk. So the two feedback paths now
+ * agree rather than one of them inventing a behaviour, and the trade is one
+ * unrenderable half character against the entire report.
+ *
+ * The alternative — surfacing an error instead — was rejected because it cannot be
+ * done honestly. There is no existing localised string meaning "your text contains
+ * a character that cannot go in a URL", and adding one is forbidden:
+ * `src/renderer/i18n/resources.ts` holds 7 locales at exactly 301 keys and two test
+ * files assert that number. Reusing an existing string would land on the same
+ * generic `feedback_failed` toast the defect already produces — identical to the
+ * user, while still discarding their report.
+ *
+ * APPLIED AT THE ENCODE SITE, not per field, on purpose. `sanitizeReportText` ends
+ * in `redact()`, which ends `.slice(0, 16_384)` — a truncation that can CUT A VALID
+ * SURROGATE PAIR IN HALF and so MANUFACTURE a lone surrogate that was not in the
+ * user's input. Repairing here, after sanitisation and immediately before
+ * encoding, covers that case too and makes the invariant simply "nothing
+ * unrepaired ever reaches encodeURIComponent".
+ */
+function encodeFieldForUrl(value: string): string {
+  return encodeURIComponent(value.replace(LONE_SURROGATE, "\uFFFD"));
+}
+
 export interface FeedbackResult {
   success: boolean;
   path?: string;
@@ -140,6 +193,10 @@ export async function openGitHubIssue(data: FeedbackData): Promise<void> {
   // encodeURIComponent'd user text — but if that constant is ever edited to
   // point elsewhere, openRepoUrl rejects it instead of opening it. openRepoUrl is
   // scoped to this repository, so routing through it adds no reachable surface.
-  const url = `${REPO_ISSUES_URL}?title=${encodeURIComponent(title)}&body=${encodeURIComponent(lines.join("\n"))}`;
+  // encodeFieldForUrl, NOT encodeURIComponent: a lone surrogate anywhere in the
+  // title or description used to throw `URIError: URI malformed` on these two calls
+  // and lose the report. See encodeFieldForUrl above for what is substituted and
+  // what that costs the user.
+  const url = `${REPO_ISSUES_URL}?title=${encodeFieldForUrl(title)}&body=${encodeFieldForUrl(lines.join("\n"))}`;
   await openRepoUrl(url);
 }
