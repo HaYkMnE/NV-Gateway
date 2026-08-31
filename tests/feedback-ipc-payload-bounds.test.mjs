@@ -676,6 +676,65 @@ test('F2/F4: those stale-claim regexes are NOT vacuous — they match the text t
   assert.match(staleExternalOpen, /leaves roughly 4\.8x headroom/, 'the 4.8x pattern must match the text it replaced');
 });
 
+test('F2b: the PROVENANCE of the old 20,147 figure is stated correctly, not just its size', async () => {
+  // GATE F2 corrected the maximum to 23,014 and then explained the OLD figure wrongly.
+  // It stated that 20,147 is "the same CJK payload with an ASCII e-mail rather than a
+  // CJK one" and that "320 units of ASCII e-mail add 201 URL characters where 320 units
+  // of CJK add 2,868". MEASURED, all three numbers are wrong:
+  //
+  //   CJK + a 320-unit ASCII e-mail + diagnostic  20,454   (not 20,147)
+  //   a 320-unit ASCII run adds                      340   (not 201)
+  //   320 units of CJK add                         2,900   (not 2,868)
+  //
+  // 20,147 belongs to the repo's OWN pre-existing ceiling shape, whose e-mail is a real
+  // ADDRESS ('e'.repeat(312) + '@bb.test'). sanitizeReportText masks an address to
+  // ***@***.***, so it contributes 33 characters and attachDiagnostic the other 168 on
+  // top of the 19,946 CJK bare case. The 201 the comment claimed was those two summed.
+  const cjk = {
+    title: '\u65E5'.repeat(FEEDBACK_TITLE_MAX),
+    description: '\u672C'.repeat(FEEDBACK_DESCRIPTION_MAX)
+  };
+  const at = async (email, attachDiagnostic) => {
+    openedUrls.length = 0;
+    await openGitHubIssue({ type: 'bug', ...cjk, email, attachDiagnostic });
+    return openedUrls[0].length;
+  };
+  const bare = await at(undefined, false);
+  const bareDiag = await at(undefined, true);
+  const asciiRun = await at('e'.repeat(FEEDBACK_EMAIL_MAX), true);
+  const maskedAddress = await at(`${'e'.repeat(FEEDBACK_EMAIL_MAX - 8)}@bb.test`, true);
+  const cjkMail = await at('\u65E5'.repeat(FEEDBACK_EMAIL_MAX), true);
+
+  assert.equal(bare, 19_946, `the CJK bare case moved (got ${bare})`);
+  assert.equal(cjkMail, MEASURED_MAX_URL, `the true maximum moved (got ${cjkMail})`);
+  assert.equal(asciiRun, 20_454, `CJK + a 320-unit ASCII e-mail + diagnostic is 20,454, NOT 20,147 (got ${asciiRun})`);
+  assert.equal(maskedAddress, 20_147, `20,147 belongs to the masked-ADDRESS ceiling shape (got ${maskedAddress})`);
+
+  // The component deltas, so the attribution itself is pinned and not just the totals.
+  assert.equal(bareDiag - bare, 168, 'the diagnostic block adds 168');
+  assert.equal(maskedAddress - bareDiag, 33, 'a MASKED e-mail address adds 33');
+  assert.equal(asciiRun - bareDiag, 340, 'a genuine 320-unit ASCII run adds 340, not 201');
+  assert.equal(cjkMail - bareDiag, 2900, '320 units of CJK add 2,900, not 2,868');
+
+  // The wrong attribution must not survive in the source.
+  assert.doesNotMatch(
+    validationSource,
+    /320 units of ASCII e-mail add 201 URL/,
+    'a 320-unit ASCII e-mail adds 340; the 201 figure summed the diagnostic block into it'
+  );
+  // NON-VACUITY: the pattern matches the text it replaces, from 9d7e087.
+  const staleProvenance = [
+    ' * an ASCII e-mail rather than a CJK one — 320 units of ASCII e-mail add 201 URL',
+    ' * characters where 320 units of CJK add 2,868. Both sit under the derived bound and'
+  ].join('\n');
+  assert.match(
+    staleProvenance,
+    /320 units of ASCII e-mail add 201 URL/,
+    'the 201 pattern must match the text it replaced'
+  );
+  console.log(`\n  20,147 provenance: CJK bare ${bare} + diagnostic 168 + masked address 33 = ${maskedAddress}; genuine 320 ASCII run = ${asciiRun}`);
+});
+
 test('R1: a validated payload can never exceed the repository door cap', () => {
   // The bound must be DERIVED, not hoped for. encodeURIComponent expands at most 9
   // URL characters per UTF-16 code unit (a 3-byte BMP character such as U+65E5 ->

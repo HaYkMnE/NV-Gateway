@@ -217,11 +217,20 @@ export async function openExternalUrl(value: unknown): Promise<void> {
  * one.
  *
  * Bounded by `MAX_REPO_URL_LENGTH`, NOT by the 2048-character cap the
- * renderer-facing door uses. Measured at the renderer's own field limits
- * (FeedbackModal caps the title at 100 and the description at 2000 characters) the
- * prefilled issue URL runs to about 2.5 KB of ASCII and about 13.5 KB with
- * Cyrillic or emoji text, so applying 2048 here would reject legitimate feedback
- * and break "Open GitHub issue".
+ * renderer-facing door uses. MEASURED at the renderer's own field limits
+ * (FeedbackModal caps the title at 100 units and the description at 2000, and the
+ * validator caps the e-mail at 320) the prefilled issue URL runs to 2,346 characters
+ * of ASCII, 15,454 with Cyrillic or emoji, and 23,014 with CJK — so applying 2048
+ * here would reject legitimate feedback and break "Open GitHub issue".
+ *
+ * This paragraph is where the stale 13,514 figure corrected in `MAX_REPO_URL_LENGTH`
+ * above SURVIVED, quoted in kilobytes as 13.5 KB and again naming Cyrillic or emoji
+ * as the worst text — 96 lines below the block that corrected it, in the same file,
+ * and unpinned. Cyrillic and emoji do cost the same per UTF-16 code unit (2 UTF-8
+ * bytes in one unit and 4 bytes across two units are both 6 URL characters per unit),
+ * so pairing them is fair; the figure and the worst case were not. CJK is the worst
+ * case, at 9 per unit. `tests/external-open-second-door-bounds.test.mjs` now pins all
+ * three of these measurements.
  *
  * Redirection is not the risk on this path: the URL is rooted in the compiled
  * `REPO_ISSUES_URL` and every user byte goes through `encodeURIComponent`, which

@@ -118,12 +118,25 @@ function assertText(value: unknown, field: string, max: number, required: boolea
  * UTF-16 unit and expands to 9 URL characters, while a 4-byte astral character
  * occupies TWO units and expands to 12, i.e. only 6 per unit.
  *
- * The figure previously stated here was 20,147, which is the same CJK payload with
- * an ASCII e-mail rather than a CJK one — 320 units of ASCII e-mail add 201 URL
- * characters where 320 units of CJK add 2,868. Both sit under the derived bound and
- * far under the door's 65,536 cap, so the conclusion never changed, but the number
- * was wrong and is now the measured maximum. `tests/feedback-ipc-payload-bounds.test.mjs`
- * pins BOTH the arithmetic above and this measured figure, so neither can rot again.
+ * The figure previously stated here was 20,147. That belongs to the repository's own
+ * pre-existing ceiling test, whose e-mail is a real ADDRESS — `'e'.repeat(312) +
+ * "@bb.test"` — and `sanitizeReportText` masks an address to `***@***.***`, so it
+ * contributes only 33 characters. MEASURED, the decomposition is
+ *
+ *   CJK bare, no e-mail and no diagnostic          19,946
+ *   + the diagnostic body block                    +  168  -> 20,114
+ *   + a MASKED e-mail address                      +   33  -> 20,147
+ *
+ * A genuine 320-unit ASCII run that is not an address is not masked and reaches
+ * 20,454; 320 units of CJK reach 23,014. So what 20,147 omitted was CJK in the
+ * e-mail, but the earlier account of it here was also wrong: it described a 320-unit
+ * ASCII e-mail as adding 201 characters and CJK as adding 2,868, when measured they
+ * add 340 and 2,900 — 201 was the diagnostic block and the masked address summed
+ * together, not an e-mail cost at all. Every one of these sits under the derived
+ * bound and far under the door's 65,536 cap, so the conclusion never changed, but the
+ * numbers were wrong. `tests/feedback-ipc-payload-bounds.test.mjs` pins the
+ * arithmetic above, this measured maximum, AND each component delta, so neither the
+ * total nor its attribution can rot again.
  *
  * That 9x spread between units and URL characters is exactly why the URL bound must
  * be DERIVED from the unit count rather than assumed equal to it.

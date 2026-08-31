@@ -201,6 +201,46 @@ test('F4: the measured maxima are pinned, and CJK is the worst script — not em
   console.log(`\n  measured: CJK ${cjkLength}, emoji ${emojiLength}, door cap ${REPO_DOOR_CAP}, headroom ${(REPO_DOOR_CAP / cjkLength).toFixed(2)}x`);
 });
 
+test('F4b: openRepoUrl states the REAL sizes, not the stale 13.5 KB / emoji-is-worst claim', async () => {
+  // GATE F4 corrected the MAX_REPO_URL_LENGTH block. The SAME stale figure survived
+  // 96 lines below it, in openRepoUrl's own doc comment, spelled as "about 13.5 KB
+  // with Cyrillic or emoji text" — the stale 13,514 in KB form, and the wrong
+  // worst-case script again, in the very file that sizes the cap. It was unchanged
+  // from b1a9dfd, and nothing pinned it. Measured here so the prose cannot restate it.
+  const at = async (title, description, email, attachDiagnostic) => {
+    openedUrls.length = 0;
+    await openGitHubIssue({ type: 'bug', title, description, email, attachDiagnostic });
+    return openedUrls[0].length;
+  };
+  const asciiBare = await at('T'.repeat(100), 'w'.repeat(2000), undefined, false);
+  const cyrillicFull = await at('\u0417'.repeat(100), '\u041E'.repeat(2000), '\u0417'.repeat(320), true);
+  const emojiFull = await at('\u{1F389}'.repeat(50), '\u{1F389}'.repeat(1000), '\u{1F389}'.repeat(160), true);
+
+  assert.equal(asciiBare, 2346, `the ASCII UI-max moved (got ${asciiBare})`);
+  // Cyrillic and emoji cost the SAME per UTF-16 unit — 2 UTF-8 bytes in one unit and
+  // 4 bytes across two units are both 6 URL characters per unit — so lumping them
+  // together is fair, but 13.5 KB is not the figure and neither is the worst case.
+  assert.equal(cyrillicFull, UI_MAX_URL_EMOJI_MEASURED, `the Cyrillic UI-max moved (got ${cyrillicFull})`);
+  assert.equal(emojiFull, UI_MAX_URL_EMOJI_MEASURED, `the emoji UI-max moved (got ${emojiFull})`);
+  assert.ok(cyrillicFull > 13.5 * 1024, `"about 13.5 KB" understates Cyrillic/emoji, measured ${cyrillicFull}`);
+  assert.ok(UI_MAX_URL_MEASURED > cyrillicFull, 'CJK must remain the worst case');
+
+  const source = readFileSync(join(root, 'src', 'main', 'external-open.ts'), 'utf8');
+  assert.doesNotMatch(
+    source,
+    /about 13\.5 KB with/,
+    'openRepoUrl must not restate the stale 13.5 KB figure that GATE F4 corrected above it'
+  );
+  // NON-VACUITY: the pattern really does match the text it replaces, taken from
+  // b1a9dfd, where the sentence wrapped after "13.5 KB with".
+  const stale = [
+    ' * prefilled issue URL runs to about 2.5 KB of ASCII and about 13.5 KB with',
+    ' * Cyrillic or emoji text, so applying 2048 here would reject legitimate feedback'
+  ].join('\n');
+  assert.match(stale, /about 13\.5 KB with/, 'the 13.5 KB pattern must match the text it replaced');
+  console.log(`\n  openRepoUrl sizes: ASCII ${asciiBare}, Cyrillic/emoji ${cyrillicFull}, CJK ${UI_MAX_URL_MEASURED}`);
+});
+
 test('F1: the door is bounded by an explicit constant, not by redaction.ts truncation', () => {
   // The bound must be stated where the door is, so it cannot be removed by an
   // edit to an unrelated module. redaction.ts:83 currently ends `.slice(0, 16_384)`
