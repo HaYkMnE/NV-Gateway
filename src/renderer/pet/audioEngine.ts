@@ -1235,7 +1235,7 @@ class PetAudioEngine {
    */
   playMugTableTap(variantIndex?: number): number {
     const vIdx = this.pickVariant('playMugTableTap', variantIndex);
-    const v = this.createVoice({ duration: 0.45, volume: 0.74 });
+    const v = this.createVoice({ duration: 0.45, volume: 0.32 });
     if (!v) return -1;
     const { out, t, voice } = v;
     const pMod = this.jitter(0.03);
@@ -1325,7 +1325,7 @@ class PetAudioEngine {
    */
   playHackerEmptyMug(variantIndex?: number): number {
     const vIdx = this.pickVariant('playHackerEmptyMug', variantIndex);
-    const v = this.createVoice({ duration: 0.45, volume: 0.84 });
+    const v = this.createVoice({ duration: 0.45, volume: 0.32 });
     if (!v) return -1;
     const { out, t, voice } = v;
     const pMod = this.jitter(0.04);
@@ -1373,7 +1373,7 @@ class PetAudioEngine {
       thud.frequency.setValueAtTime(110 * pMod, t);
       thud.frequency.exponentialRampToValueAtTime(50 * pMod, t + 0.05);
       tg.gain.setValueAtTime(0.0001, t);
-      tg.gain.linearRampToValueAtTime(0.98, t + 0.003);
+      tg.gain.linearRampToValueAtTime(0.70, t + 0.003);
       tg.gain.exponentialRampToValueAtTime(0.0001, t + 0.07);
       thud.connect(tg); tg.connect(out);
       thud.start(t); thud.stop(t + 0.08);
@@ -1384,7 +1384,7 @@ class PetAudioEngine {
       bounce.type = 'square';
       bounce.frequency.setValueAtTime(380 * pMod, t + 0.008);
       bg.gain.setValueAtTime(0.0001, t + 0.008);
-      bg.gain.linearRampToValueAtTime(0.42, t + 0.012);
+      bg.gain.linearRampToValueAtTime(0.32, t + 0.012);
       bg.gain.exponentialRampToValueAtTime(0.0001, t + 0.04);
       bounce.connect(bg); bg.connect(out);
       bounce.start(t + 0.008); bounce.stop(t + 0.045);
@@ -1395,7 +1395,7 @@ class PetAudioEngine {
       hum.type = 'triangle';
       hum.frequency.setValueAtTime(60 * pMod, t);
       hg.gain.setValueAtTime(0.0001, t);
-      hg.gain.linearRampToValueAtTime(0.48, t + 0.01);
+      hg.gain.linearRampToValueAtTime(0.32, t + 0.01);
       hg.gain.exponentialRampToValueAtTime(0.0001, t + 0.09);
       hum.connect(hg); hg.connect(out);
       hum.start(t); hum.stop(t + 0.1);
@@ -1408,7 +1408,7 @@ class PetAudioEngine {
       thump.frequency.setValueAtTime(95 * pMod, t);
       thump.frequency.exponentialRampToValueAtTime(45 * pMod, t + 0.06);
       tg.gain.setValueAtTime(0.0001, t);
-      tg.gain.linearRampToValueAtTime(0.80, t + 0.003);
+      tg.gain.linearRampToValueAtTime(0.72, t + 0.003);
       tg.gain.exponentialRampToValueAtTime(0.0001, t + 0.08);
       thump.connect(tg); tg.connect(out);
       thump.start(t); thump.stop(t + 0.09);
@@ -1421,7 +1421,7 @@ class PetAudioEngine {
         tap.type = 'square';
         tap.frequency.setValueAtTime(f0 * pMod, tt);
         g.gain.setValueAtTime(0.0001, tt);
-        g.gain.linearRampToValueAtTime(0.42, tt + 0.002);
+        g.gain.linearRampToValueAtTime(0.34, tt + 0.002);
         g.gain.exponentialRampToValueAtTime(0.0001, tt + 0.035);
         tap.connect(g); g.connect(out);
         tap.start(tt); tap.stop(tt + 0.04);
@@ -1636,7 +1636,7 @@ class PetAudioEngine {
       tone.type = 'sine';
       tone.frequency.setValueAtTime(180 * pMod, t);
       tg.gain.setValueAtTime(0.0001, t);
-      tg.gain.linearRampToValueAtTime(0.70, t + 0.01);
+      tg.gain.linearRampToValueAtTime(0.28, t + 0.01);
       tg.gain.exponentialRampToValueAtTime(0.0001, t + 0.16);
       tone.connect(tg); tg.connect(out);
       tone.start(t); tone.stop(t + 0.18);
@@ -1646,7 +1646,7 @@ class PetAudioEngine {
       const g = this.ctx!.createGain();
       click.type = 'square';
       click.frequency.setValueAtTime(320 * pMod, t);
-      g.gain.setValueAtTime(0.95, t);
+      g.gain.setValueAtTime(0.36, t);
       g.gain.exponentialRampToValueAtTime(0.0001, t + 0.04);
       click.connect(g); g.connect(out);
       click.start(t); click.stop(t + 0.045);
@@ -1995,7 +1995,7 @@ class PetAudioEngine {
       osc.frequency.setValueAtTime(440.0 * pMod, t);
       osc.frequency.setValueAtTime(880.0 * pMod, t + 0.035);
       g.gain.setValueAtTime(0.0001, t);
-      g.gain.linearRampToValueAtTime(1.25, t + 0.004);
+      g.gain.linearRampToValueAtTime(0.48, t + 0.004);
       g.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
       osc.connect(g); g.connect(out);
       osc.start(t); osc.stop(t + 0.2);
@@ -2084,7 +2084,7 @@ class PetAudioEngine {
    */
   playHackerCursorTick(variantIndex?: number): number {
     const vIdx = this.pickVariant('playHackerCursorTick', variantIndex);
-    const v = this.createVoice({ duration: 0.5, volume: 0.72 });
+    const v = this.createVoice({ duration: 0.5, volume: 0.30 });
     if (!v) return -1;
     const { out, t, voice } = v;
     const pMod = this.jitter(0.02);
