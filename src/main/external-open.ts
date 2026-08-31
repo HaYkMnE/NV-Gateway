@@ -62,8 +62,34 @@ function isAllowedRepoUrl(url: URL): boolean {
   return url.pathname === REPO_PATH || url.pathname.startsWith(`${REPO_PATH}/`);
 }
 
-export function isAllowedExternalUrl(value: unknown): value is string {
-  if (typeof value !== "string" || value.length > 2048) return false;
+/** Cap on renderer-supplied input. */
+const MAX_EXTERNAL_URL_LENGTH = 2048;
+
+/**
+ * Parse, validate, and hand back THE URL THAT WAS VALIDATED.
+ *
+ * Returning the parsed object is the whole point. This logic used to live inside
+ * `isAllowedExternalUrl`, which answered a boolean, so `openExternalUrl` decided
+ * on the parsed `URL` and then passed `shell.openExternal` the RAW input string
+ * — the representation that was checked and the one the OS received could
+ * differ.
+ *
+ * Measured: an input carrying a fullwidth `ｇ` validates as host `github.com`
+ * (UTS46 maps it) while the OS got the literal fullwidth bytes; likewise for
+ * tab, newline and NUL, which the parser strips out entirely. Browsers apply the
+ * same normalisation, so the destination did not actually differ — but
+ * validating one representation and using another is how this class of control
+ * eventually fails. Callers now open `url.href`, which is by construction the
+ * thing that passed validation.
+ *
+ * Confirmed byte-for-byte on all six links the product really opens (both repo
+ * URLs and the four donation links, including the long Telegram `?startapp=`
+ * payload): `new URL(link).href === link` for every one. So this is a no-op for
+ * legitimate input and cannot re-encode a query or add a trailing slash to a
+ * live link.
+ */
+function parseAllowedExternalUrl(value: unknown): URL | null {
+  if (typeof value !== "string" || value.length > MAX_EXTERNAL_URL_LENGTH) return null;
   try {
     const url = new URL(value);
     // THE PORT IS PART OF THE DESTINATION. `url.port` is the empty string when
@@ -83,17 +109,24 @@ export function isAllowedExternalUrl(value: unknown): value is string {
     // practice the connection simply fails — but a control whose entire job is
     // constraining the destination was leaving part of it unconstrained.
     if (url.protocol === "https:" && url.port === "") {
-      return ALLOWED_EXTERNAL_HOSTS.has(url.hostname) || isAllowedRepoUrl(url);
+      const allowed = ALLOWED_EXTERNAL_HOSTS.has(url.hostname) || isAllowedRepoUrl(url);
+      return allowed ? url : null;
     }
-    return false;
+    return null;
   } catch {
-    return false;
+    return null;
   }
 }
 
+export function isAllowedExternalUrl(value: unknown): value is string {
+  return parseAllowedExternalUrl(value) !== null;
+}
+
 export async function openExternalUrl(value: unknown): Promise<void> {
-  if (!isAllowedExternalUrl(value)) {
+  const url = parseAllowedExternalUrl(value);
+  if (!url) {
     throw new Error("External URL is not on the allowlist.");
   }
-  await shell.openExternal(value);
+  // `url.href`, NOT `value`: the OS gets the representation that was validated.
+  await shell.openExternal(url.href);
 }
