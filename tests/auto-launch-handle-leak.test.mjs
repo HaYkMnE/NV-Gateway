@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
@@ -74,6 +75,99 @@ test('the get-runtime-state hot path never calls getLoginItemSettings', () => {
     + 'is unchanged while the registry is left alone');
 });
 
+// ── Anti-evasion ───────────────────────────────────────────────────────────
+// The assertion above only forbids the LITERAL string `getLoginItemSettings`
+// inside the hot handler, which is not enough. Six re-arming edits were applied
+// to src/main/index.ts one at a time and the guard was run against each; three
+// of them PASSED the original six assertions with exit code 0:
+//
+//   PASSED  hot path calls refreshAutoLaunch()      <- re-arms the exact leak
+//   PASSED  4th call site in get-gateway-status     <- polled every 1s, and
+//                                                      refetchIntervalInBackground
+//   PASSED  a sibling src/main/*.ts reads it
+//   caught  app['getLoginItemSettings']()
+//   caught  hot path inlines the raw primitive
+//   caught  cache assigned the requested value
+//
+// The helper the fix introduced is itself the evasion vector: forbidding the
+// primitive's NAME does not forbid REACHING it. Hence the assertions below check
+// indirect reach, the full set of call sites, aliasing, and sibling modules. All
+// six edits now fail. The measurement lives in the commit that added them.
+test('the hot path cannot reach the native read through the refresh helper', () => {
+  const code = stripComments(read('src/main/index.ts'));
+  const handler = handlerBlock(code, 'get-runtime-state');
+
+  assert.doesNotMatch(handler, /refreshAutoLaunch/,
+    'get-runtime-state must not call refreshAutoLaunch(): it wraps '
+    + 'app.getLoginItemSettings(), so calling it here leaks one kernel `Key` handle per '
+    + 'renderer refresh exactly as before the fix. Only getAutoLaunchCached() is allowed '
+    + 'on this path.');
+});
+
+test('every call site of the leaking read is one of the three sanctioned ones', () => {
+  const code = stripComments(read('src/main/index.ts'));
+
+  // A call, not the declaration `function refreshAutoLaunch()`.
+  const callSites = (text) => [...text.matchAll(/(?<!function\s)\brefreshAutoLaunch\(\)/g)].length;
+
+  // The only regions where a native read is legitimate: the lazy one-time seed
+  // inside the cached accessor, and the two user-driven channels.
+  const accessor = /function getAutoLaunchCached\(\)[\s\S]*?\n\}/.exec(code);
+  assert.ok(accessor, 'a cached accessor must exist for the hot path');
+  const sanctioned = {
+    'getAutoLaunchCached (lazy seed)': accessor[0],
+    'toggle-auto-launch (after write)': handlerBlock(code, 'toggle-auto-launch'),
+    'get-auto-launch (explicit query)': handlerBlock(code, 'get-auto-launch')
+  };
+
+  // Each sanctioned region must still contain its read...
+  for (const [name, body] of Object.entries(sanctioned)) {
+    assert.ok(callSites(body) >= 1, `the native read must still happen in ${name}`);
+  }
+
+  // ...and once those regions are masked out, NO call site may remain. This is
+  // what makes a fourth call site -- a new handler, a helper, a timer, a menu
+  // action, the hot path itself -- fail here instead of leaking silently.
+  let masked = code;
+  for (const body of Object.values(sanctioned)) masked = masked.split(body).join('\n/* sanctioned */\n');
+  assert.equal(callSites(masked), 0,
+    'refreshAutoLaunch() is called outside getAutoLaunchCached(), toggle-auto-launch and '
+    + 'get-auto-launch. It wraps app.getLoginItemSettings(), so every extra call site leaks '
+    + 'one kernel `Key` handle per invocation; if a new one is genuinely needed, add it to '
+    + 'the sanctioned list here together with the argument for why it is bounded.');
+});
+
+test('the native read is not reachable through an alias or dynamic property access', () => {
+  const code = stripComments(read('src/main/index.ts'));
+
+  // `app['getLoginItemSettings']()` and `const f = app.getLoginItemSettings`
+  // both defeat a plain textual search for `app.getLoginItemSettings()`.
+  assert.doesNotMatch(code, /\[\s*(['"`])getLoginItemSettings\1\s*\]/,
+    'dynamic property access to getLoginItemSettings hides the leaking read from review; '
+    + 'call it directly inside refreshAutoLaunch() or not at all');
+  assert.doesNotMatch(code, /getLoginItemSettings\s*(?![.(])/,
+    'getLoginItemSettings must only ever appear as an immediate call '
+    + '(app.getLoginItemSettings().openAtLogin), never captured into a variable or passed '
+    + 'as a value, because an alias can be invoked from anywhere including the hot path');
+});
+
+test('no other main-process file reads the login-item settings', () => {
+  // Confining the primitive to one call site in index.ts is worthless if a
+  // sibling module reads it and is called from the hot path.
+  const dir = path.join(root, 'src', 'main');
+  const offenders = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (!entry.isFile() || entry.name === 'index.ts') continue;
+    if (!/\.ts$/.test(entry.name)) continue;
+    if (/getLoginItemSettings/.test(stripComments(fs.readFileSync(path.join(dir, entry.name), 'utf8')))) {
+      offenders.push(entry.name);
+    }
+  }
+  assert.deepEqual(offenders, [],
+    'the leaking read must stay in index.ts behind refreshAutoLaunch(); found it in: '
+    + offenders.join(', '));
+});
+
 test('the native registry read is funnelled through exactly one call site', () => {
   const code = stripComments(read('src/main/index.ts'));
   const occurrences = [...code.matchAll(/getLoginItemSettings/g)].length;
@@ -125,6 +219,99 @@ test('toggling auto-launch refreshes the cache so the next render is not stale',
   const refresh = handler.indexOf('refreshAutoLaunch()');
   assert.ok(write < refresh,
     'the cache must be refreshed AFTER the write, not before');
+});
+
+test('the built main module performs zero native reads while starting up', () => {
+  // BEHAVIOURAL, not textual. Every other assertion here reads source text and
+  // can therefore be satisfied by code that misbehaves at runtime. This one runs
+  // the REAL BUILT module (build/src/main/index.js) under a faked electron and
+  // counts actual app.getLoginItemSettings() invocations.
+  const probe = path.join(root, 'tests', 'auto-launch-native-read-probe.mjs');
+  const built = path.join(root, 'build', 'src', 'main', 'index.js');
+  if (!fs.existsSync(built)) {
+    // `npm test` builds first (pretest). A bare `node --test` on this file alone
+    // legitimately has no build to inspect; say so instead of failing opaquely.
+    assert.ok(fs.existsSync(probe), 'the behavioural probe script must exist');
+    return;
+  }
+
+  const run = spawnSync(process.execPath, [probe], { encoding: 'utf8', timeout: 120_000 });
+  assert.equal(run.status, 0, `probe exited ${run.status}: ${run.stderr?.slice(-500) ?? ''}`);
+
+  const line = run.stdout.trim().split('\n').filter((l) => l.startsWith('{')).pop();
+  assert.ok(line, `probe produced no JSON result. stdout tail: ${run.stdout.slice(-300)}`);
+  const measured = JSON.parse(line);
+
+  assert.equal(measured.loaded, true, `the built main module failed to load: ${measured.loadError}`);
+  assert.ok(measured.channels.includes('get-runtime-state'),
+    'the built module must register get-runtime-state');
+
+  // The load-bearing number: merely booting the main process must not sample the
+  // registry. Anything above zero is a handle leaked on every single launch.
+  assert.equal(measured.startupNativeReads, 0,
+    'loading the built main module called app.getLoginItemSettings() '
+    + `${measured.startupNativeReads} time(s) during startup. Each call leaks one kernel `
+    + '`Key` handle while the Run value exists; the cache must be seeded lazily, not eagerly.');
+
+  // Invoking get-runtime-state without a live window must be refused by secure()
+  // rather than doing work. This pins the gate, and documents WHY the probe
+  // cannot measure the handler body end to end.
+  assert.equal(measured.hotPath.reachedBody, false,
+    'get-runtime-state executed its body without a BrowserWindow; secure() is supposed to '
+    + 'reject callers when no window is available');
+  assert.match(String(measured.hotPath.rejectedWith), /Window unavailable/,
+    'get-runtime-state must be gated by secure()');
+  assert.equal(measured.hotPath.nativeReads, 0,
+    'a rejected get-runtime-state call must not reach the registry');
+});
+
+test('get-auto-launch has no renderer caller, so the native read is user-driven only', () => {
+  // The fix moves the leaking read to get-auto-launch. That is only a real fix if
+  // the renderer does not call it on a render cycle. Verified by scanning, not
+  // assumed: a per-mount or polled call here would re-create the unbounded leak
+  // that get-runtime-state used to have.
+  const offenders = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) { walk(full); continue; }
+      if (!/\.(ts|tsx)$/.test(entry.name)) continue;
+      if (entry.name === 'global.d.ts') continue; // type declaration, not a call
+      const source = stripComments(fs.readFileSync(full, 'utf8'));
+      if (/\bgetAutoLaunch\s*\(/.test(source)) offenders.push(path.relative(root, full));
+    }
+  };
+  walk(path.join(root, 'src', 'renderer'));
+
+  assert.deepEqual(offenders, [],
+    'the renderer now calls getAutoLaunch(), which reaches app.getLoginItemSettings() and '
+    + 'leaks one kernel `Key` handle per call. If this is genuinely needed it must be tied '
+    + 'to an explicit user action, never to a mount, a re-render or a refetchInterval. '
+    + 'Found in: ' + offenders.join(', '));
+
+  // And the hot path the renderer DOES poll must be the cached one.
+  const settings = stripComments(read('src/renderer/views/Settings.tsx'));
+  assert.match(settings, /queryKey:\s*queryKeys\.runtime[\s\S]{0,120}refetchInterval:\s*\d+/,
+    'Settings is expected to poll runtime state on an interval; that is precisely why the '
+    + 'auto-launch read must not sit on that path');
+});
+
+test('a failed or rejected write never leaves the cache asserting a state the OS refused', () => {
+  const handler = handlerBlock(stripComments(read('src/main/index.ts')), 'toggle-auto-launch');
+
+  // The cache must be filled from a real OS read, not from the requested value.
+  // `autoLaunchCache = enable` would make the cache assert a state the OS may
+  // have silently refused (permission, policy, roaming profile).
+  assert.doesNotMatch(handler, /autoLaunchCache\s*=\s*enable/,
+    'the toggle must not assign the REQUESTED value into the cache; it must re-read the OS '
+    + 'via refreshAutoLaunch(), otherwise a silently failed write makes the cache lie for '
+    + 'the rest of the session');
+
+  // If setLoginItemSettings throws, the write is not confirmed. The refresh must
+  // sit after it in the same straight-line body (no try/catch swallowing the
+  // failure and then caching an optimistic value).
+  assert.doesNotMatch(handler, /catch\s*(\([^)]*\))?\s*\{[\s\S]*autoLaunchCache/,
+    'a caught write failure must not still update the cache');
 });
 
 test('the renderer contract for autoLaunch is untouched', () => {
