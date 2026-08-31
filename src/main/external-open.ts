@@ -85,6 +85,28 @@ function isAllowedRepoUrl(url: URL): boolean {
 const MAX_EXTERNAL_URL_LENGTH = 2048;
 
 /**
+ * Cap on the repository door (see `openRepoUrl`), deliberately far above anything
+ * the product can generate.
+ *
+ * This door cannot redirect — every user byte goes through `encodeURIComponent`,
+ * so no amount of text moves the authority or the path — but "cannot redirect" is
+ * not "bounded". MEASURED before this constant existed, `openRepoUrl` accepted a
+ * 10,000,054-character URL and handed all 10 MB to `shell.openExternal` without
+ * complaint. The only thing actually limiting it was `redaction.ts`'s trailing
+ * `.slice(0, 16_384)` — a truncation that exists for redaction reasons, in a
+ * module with no stake in URL length, which a future edit could raise or remove
+ * without ever looking at this file.
+ *
+ * The number is chosen so the cap can never be what breaks legitimate feedback:
+ * the renderer caps the title at 100 and the description at 2000 characters, and
+ * the worst-case encoding of those limits (emoji, 12 characters per 2 UTF-16
+ * units) MEASURED at 13,514 characters. 65,536 leaves roughly 4.8x headroom over
+ * the largest URL the UI can produce, while a runaway payload is refused here
+ * instead of becoming a multi-megabyte argument to the OS.
+ */
+const MAX_REPO_URL_LENGTH = 65_536;
+
+/**
  * Parse, validate, and hand back THE URL THAT WAS VALIDATED.
  *
  * Returning the parsed object is the whole point. This logic used to live inside
@@ -177,22 +199,26 @@ export async function openExternalUrl(value: unknown): Promise<void> {
  * reachable through it, so this adds no surface, it only removes an unvalidated
  * one.
  *
- * NOT length-capped, deliberately. Measured at the renderer's own field limits
- * (FeedbackModal caps the title at 100 and the description at 2000 characters)
- * the prefilled issue URL is about 3.3 KB of ASCII and about 12.5 KB with
- * Cyrillic text, so applying the 2048-character cap here would reject legitimate
- * feedback and break "Open GitHub issue". Length is not what constrains this path
- * anyway: the URL is rooted in the compiled `REPO_ISSUES_URL` and every user byte
- * goes through `encodeURIComponent`, which percent-encodes "/", ":", "?", "#" and
- * "@" — so no amount of user text can move the authority or the path. The cap
- * exists to bound arbitrary renderer-supplied input, which this is not.
+ * Bounded by `MAX_REPO_URL_LENGTH`, NOT by the 2048-character cap the
+ * renderer-facing door uses. Measured at the renderer's own field limits
+ * (FeedbackModal caps the title at 100 and the description at 2000 characters) the
+ * prefilled issue URL runs to about 2.5 KB of ASCII and about 13.5 KB with
+ * Cyrillic or emoji text, so applying 2048 here would reject legitimate feedback
+ * and break "Open GitHub issue".
+ *
+ * Redirection is not the risk on this path: the URL is rooted in the compiled
+ * `REPO_ISSUES_URL` and every user byte goes through `encodeURIComponent`, which
+ * percent-encodes "/", ":", "?", "#" and "@" — so no amount of user text can move
+ * the authority or the path. But not being able to redirect is not the same as
+ * being bounded, and this door was previously bounded only by an incidental
+ * `.slice(0, 16_384)` in `redaction.ts`; see `MAX_REPO_URL_LENGTH`.
  *
  * The destination is validated in full regardless, which is what makes the header's
  * claim true for this route too: if `REPO_URL` is ever edited to point somewhere
  * else, this rejects it instead of opening it.
  */
 export async function openRepoUrl(value: unknown): Promise<void> {
-  const url = parseAllowedUrl(value, isAllowedRepoUrl);
+  const url = parseAllowedUrl(value, isAllowedRepoUrl, MAX_REPO_URL_LENGTH);
   if (!url) {
     throw new Error("External URL is not on the allowlist.");
   }
