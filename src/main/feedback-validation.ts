@@ -189,21 +189,68 @@ export function assertFeedbackData(value: unknown): asserts value is FeedbackDat
  * always rejected — but it must NOT be used at a boundary that hands the object
  * onward, because narrowing a type is not the same as controlling what the consumer
  * reads. That is the whole lesson of this defect.
+ *
+ * A READ IS ATTACKER CODE, SO EVERY READ IS GUARDED. Reading a property can RUN code
+ * — a getter, own or inherited, or a Proxy `get` trap — and that code can throw
+ * anything it likes. MEASURED against the built module before the guard below existed,
+ * five shapes carried an attacker-chosen string straight out of this function, which is
+ * precisely what this file's header and `assertText` both promise never happens:
+ *
+ *   Proxy `get` trap throwing            -> Error: nvapi-LEAKED-SECRET-…
+ *   own getter on `title` throwing       -> Error: nvapi-LEAKED-SECRET-…
+ *   PROTOTYPE getter on `title` throwing -> Error: nvapi-LEAKED-SECRET-…
+ *   getter on the OPTIONAL `email`       -> Error: nvapi-LEAKED-SECRET-…
+ *   getter on `attachDiagnostic`         -> Error: nvapi-LEAKED-SECRET-…
+ *
+ * and a sixth leaked a raw engine message rather than an attacker-chosen one:
+ *
+ *   a REVOKED Proxy -> TypeError: Cannot perform 'IsArray' on a proxy that has been
+ *                      revoked
+ *
+ * The last case is why the guard starts ABOVE the shape check instead of around the
+ * reads alone: `Array.isArray` is itself a trappable operation, so it throws before any
+ * field is touched. It is the same class as the `payload null -> raw TypeError reading
+ * "title"` case in this file's header — an unmediated engine error at the boundary.
+ *
+ * The catch is deliberately TOTAL over the shape check and the reads: every failure in
+ * that region becomes the one generic message, because no failure in that region has a
+ * cause worth reporting to a renderer that supplied the object. Validation stays
+ * OUTSIDE it, so the per-field messages below are unchanged — a guard that swallowed
+ * those too would collapse every refusal into one indistinguishable error.
+ *
+ * NOT REACHABLE FROM A RENDERER, on the same evidence as the getter above: MEASURED,
+ * `structuredClone` of a Proxy with a throwing `get` trap throws `DOMException:
+ * #<Object> could not be cloned`, so the hostile object never crosses the
+ * contextBridge. Defence-in-depth for a future main-process caller. It is fixed anyway
+ * because the module DOCUMENTED a guarantee it did not provide.
+ * `tests/feedback-validation-hostile-reads.test.mjs` pins every shape above.
  */
 export function snapshotFeedbackData(value: unknown): FeedbackData {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+  // ONE read per field, and EVERY read inside the guard. Nothing below this block
+  // touches `value` again, so a getter, a Proxy trap or a concurrent mutation cannot
+  // make the validated value and the consumed value disagree — and cannot speak
+  // through the error either.
+  let type: unknown;
+  let title: unknown;
+  let description: unknown;
+  let email: unknown;
+  let attachDiagnostic: unknown;
+  try {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("Invalid feedback data.");
+    }
+    const source = value as Record<string, unknown>;
+    type = source.type;
+    title = source.title;
+    description = source.description;
+    email = source.email;
+    attachDiagnostic = source.attachDiagnostic;
+  } catch {
+    // Never rethrow the caught value, and never inspect it: a hostile `message`, or a
+    // hostile `toString` on a non-Error throw, is exactly what must not reach a log
+    // line or a toast. Same discipline as `assertText` — name nothing, echo nothing.
     throw new Error("Invalid feedback data.");
   }
-  const source = value as Record<string, unknown>;
-
-  // ONE read per field. Nothing below this line touches `source` again, so a getter,
-  // a Proxy trap or a concurrent mutation cannot make the validated value and the
-  // consumed value disagree.
-  const type = source.type;
-  const title = source.title;
-  const description = source.description;
-  const email = source.email;
-  const attachDiagnostic = source.attachDiagnostic;
 
   if (typeof type !== "string" || !FEEDBACK_TYPES.has(type)) {
     throw new Error("Invalid feedback type.");
