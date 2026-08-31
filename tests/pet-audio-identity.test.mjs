@@ -276,33 +276,48 @@ test('disabled sound preference returns -1 immediately for all 24 cues', () => {
   }
 });
 
+function formatParamEvents(param, isGain = false) {
+  if (!param || !param.events || param.events.length === 0) return '';
+  return `[${param.events.map(e => {
+    const val = typeof e.v === 'number'
+      ? (isGain ? Math.round(e.v * 10) / 10 : Math.round(e.v / 100) * 100)
+      : e.v;
+    return `${e.type}:${val}@${Math.round(e.t * 10) * 100}ms`;
+  }).join(',')}]`;
+}
+
 function extractSynthesisSignature(nodes) {
   return nodes.map((node) => {
     if (node instanceof MockOscillatorNode) {
-      return `Osc(${node.type},f~${Math.round(node.frequency.value / 50) * 50})`;
+      const freqEvts = formatParamEvents(node.frequency, false);
+      return `Osc(${node.type},f~${Math.round(node.frequency.value / 100) * 100}${freqEvts ? `,pitch:${freqEvts}` : ''})`;
     }
     if (node instanceof MockBiquadFilterNode) {
-      return `Filter(${node.type},f~${Math.round(node.frequency.value / 100) * 100})`;
+      const freqEvts = formatParamEvents(node.frequency, false);
+      return `Filter(${node.type},f~${Math.round(node.frequency.value / 100) * 100},Q~${Math.round(node.Q.value)}${freqEvts ? `,sweep:${freqEvts}` : ''})`;
     }
     if (node instanceof MockBufferSourceNode) {
-      return 'NoiseBuffer';
+      return `NoiseBuffer(loop=${node.loop})`;
     }
     if (node instanceof MockWaveShaperNode) {
-      return 'WaveShaper';
+      return `WaveShaper(oversample=${node.oversample})`;
     }
     if (node instanceof MockGainNode) {
-      return 'Gain';
+      const gainEvts = formatParamEvents(node.gain, true);
+      return `Gain(v~${Math.round(node.gain.value * 10) / 10}${gainEvts ? `,env:${gainEvts}` : ''})`;
     }
     return node.constructor.name;
   }).join('->');
 }
 
-test('persona separation: paired cues (sleep, coins, mugs, combat) have distinct synthesis graph signatures across all variants', () => {
+test('persona separation: paired cues (sleep, coins, mugs, combat, focus, idle) have distinct synthesis graph signatures across all variants', () => {
   const PAIRS = [
     { mascot: 'playMascotPowerNap', hacker: 'playHackerTerminalNap', domain: 'sleep/standby' },
     { mascot: 'playRealisticCoinDrop', hacker: 'playHackerCoinDrop', domain: 'coins/rewards' },
     { mascot: 'playMugTableTap', hacker: 'playHackerEmptyMug', domain: 'mug/foley' },
     { mascot: 'playMascotBugHunter', hacker: 'playHackerBugSlayer', domain: 'bug combat' },
+    { mascot: 'playMascotModelJuggler', hacker: 'playHackerCodeFrenzy', domain: 'active focus / interaction' },
+    { mascot: 'playMascotSensorPolish', hacker: 'playHackerFlowchart', domain: 'idle inspection / calibration' },
   ];
 
   for (const { mascot, hacker, domain } of PAIRS) {
