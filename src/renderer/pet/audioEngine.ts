@@ -41,6 +41,8 @@ type SfxKey =
   | 'playHackerCoinDrop'
   | 'playHackerFlowchart'
   | 'playHackerTerminalNap'
+  | 'playHackerCursorTick'
+  | 'playHackerDiskSeek'
   | 'playAscensionRitual'
   | 'playActionCheer'
   | 'playEasterEggDisk'
@@ -70,8 +72,15 @@ interface VoiceOptions {
  *
  * 1. Interactive Melodic / Fanfare / Victory / Combat (Category A):
  *    Target Peak: -13.0 to -16.5 dBFS | Target RMS: -24.0 to -32.0 dBFS
- * 2. Interactive Tactile Foley / Mechanical / Sigh / Nap (Category B):
+ *    Cues: RealisticCoinDrop, HackerCoinDrop, MascotBugHunter, HackerBugSlayer,
+ *          HackerZeroErrors, ActionCheer, AscensionRitual, EasterEggDisk.
+ * 2. Interactive Tactile Foley / Mechanical / Sigh / Nap / Robotic / UI Chime (Category B):
  *    Target Peak: -16.0 to -20.5 dBFS | Target RMS: -28.0 to -38.0 dBFS
+ *    Cues: OrganicSnoring/MascotPowerNap, HackerTerminalNap, StomachRumbling,
+ *          OrganicYawn, SadTiredSigh, HackerCodeFrenzy, MascotModelJuggler,
+ *          MugTableTap, HackerEmptyMug, MascotLowBattery, MascotTurbine,
+ *          MascotSensorPolish, MascotNanoCoffee, HackerFlowchart, Chime,
+ *          HackerCursorTick, HackerDiskSeek.
  * 3. Autonomous Ambient Life Signs (Unprompted background cadence, fires every 45-90s):
  *    Target Peak: -22.0 to -28.5 dBFS | Target RMS: -33.0 to -45.0 dBFS
  *    Attenuation: AMBIENT_GAIN_SCALE = 0.38 (~ -8.4 dB relative to interactive).
@@ -106,6 +115,12 @@ class PetAudioEngine {
   // Autonomous ambient scheduler state
   private ambientTimer: ReturnType<typeof setTimeout> | null = null;
   private getActivityFn: (() => string) | null = null;
+
+  // Non-repeating ambient pool shuffle decks (guarantees every cue in the pool plays before any repeats)
+  private mascotIdleDeck: (() => void)[] = [];
+  private hackerIdleDeck: (() => void)[] = [];
+  private lastMascotIdleCue: string | null = null;
+  private lastHackerIdleCue: string | null = null;
 
   // ------------------------------------------------------------------
   // Lifecycle
@@ -450,13 +465,7 @@ class PetAudioEngine {
   }
 
   private getActivePersona(): 'mascot' | 'hacker' {
-    const act = (this.getActivityFn?.() ?? '').toLowerCase();
-    if (['code-frenzy', 'zero-errors', 'empty-mug', 'bug-slayer', 'coin-drop', 'flowchart', 'terminal-nap'].some((a) => act.includes(a))) {
-      return 'hacker';
-    }
-    if (['bug-hunter', 'low-battery', 'turbine-generator', 'sensor-polish', 'model-juggler', 'nano-coffee', 'power-nap'].some((a) => act.includes(a))) {
-      return 'mascot';
-    }
+    // 1. Authoritative: Persisted session character
     try {
       if (typeof sessionStorage !== 'undefined') {
         const stored = sessionStorage.getItem('nv_pet_character');
@@ -465,7 +474,68 @@ class PetAudioEngine {
     } catch {
       /* storage unavailable in tests/isolated environments */
     }
+
+    // 2. Fallback: Infer from current activity slug ONLY when storage is inaccessible
+    const act = (this.getActivityFn?.() ?? '').toLowerCase();
+    if (['code-frenzy', 'zero-errors', 'empty-mug', 'bug-slayer', 'coin-drop', 'flowchart', 'terminal-nap'].some((a) => act.includes(a))) {
+      return 'hacker';
+    }
+    if (['bug-hunter', 'low-battery', 'turbine-generator', 'sensor-polish', 'model-juggler', 'nano-coffee', 'power-nap'].some((a) => act.includes(a))) {
+      return 'mascot';
+    }
     return 'mascot';
+  }
+
+  private drawMascotIdleCue(): void {
+    if (this.mascotIdleDeck.length === 0) {
+      const pool: [string, () => void][] = [
+        ['playChime', () => this.playChime()],
+        ['playMascotSensorPolish', () => this.playMascotSensorPolish()],
+        ['playMascotModelJuggler', () => this.playMascotModelJuggler()],
+        ['playSadTiredSigh', () => this.playSadTiredSigh()],
+        ['playMugTableTap', () => this.playMugTableTap()],
+      ];
+      let shuffled: [string, () => void][];
+      do {
+        shuffled = [...pool];
+        for (let i = shuffled.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+        }
+      } while (pool.length > 1 && shuffled[0][0] === this.lastMascotIdleCue);
+      this.mascotIdleDeck = shuffled.map(([name, fn]) => () => {
+        this.lastMascotIdleCue = name;
+        fn();
+      });
+    }
+    const nextCue = this.mascotIdleDeck.pop();
+    nextCue?.();
+  }
+
+  private drawHackerIdleCue(): void {
+    if (this.hackerIdleDeck.length === 0) {
+      const pool: [string, () => void][] = [
+        ['playHackerTerminalNap', () => this.playHackerTerminalNap()],
+        ['playHackerFlowchart', () => this.playHackerFlowchart()],
+        ['playHackerEmptyMug', () => this.playHackerEmptyMug()],
+        ['playHackerCursorTick', () => this.playHackerCursorTick()],
+        ['playHackerDiskSeek', () => this.playHackerDiskSeek()],
+      ];
+      let shuffled: [string, () => void][];
+      do {
+        shuffled = [...pool];
+        for (let i = shuffled.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+        }
+      } while (pool.length > 1 && shuffled[0][0] === this.lastHackerIdleCue);
+      this.hackerIdleDeck = shuffled.map(([name, fn]) => () => {
+        this.lastHackerIdleCue = name;
+        fn();
+      });
+    }
+    const nextCue = this.hackerIdleDeck.pop();
+    nextCue?.();
   }
 
   private fireAmbientSound(): void {
@@ -513,23 +583,11 @@ class PetAudioEngine {
           else this.playActionCheer();
         }
       } else {
-        // Idle cadence: persona-specific subtle background life signs
+        // Idle cadence: persona-specific subtle background life signs via non-repeating shuffle deck
         if (persona === 'hacker') {
-          // Hacker idle pool: 5 cues × 3 variants = 15 distinct outputs
-          const roll = Math.random();
-          if (roll < 0.25) this.playHackerTerminalNap();
-          else if (roll < 0.5) this.playHackerFlowchart();
-          else if (roll < 0.7) this.playHackerEmptyMug();
-          else if (roll < 0.88) this.playHackerCodeFrenzy();
-          else this.playHackerZeroErrors();
+          this.drawHackerIdleCue();
         } else {
-          // Mascot idle pool: 5 cues × 3 variants = 15 distinct outputs
-          const roll = Math.random();
-          if (roll < 0.25) this.playChime();
-          else if (roll < 0.5) this.playMascotSensorPolish();
-          else if (roll < 0.72) this.playMascotModelJuggler();
-          else if (roll < 0.88) this.playSadTiredSigh();
-          else this.playMugTableTap();
+          this.drawMascotIdleCue();
         }
       }
     } finally {
@@ -589,7 +647,18 @@ class PetAudioEngine {
         voice.nodes.push(osc);
       });
     } else {
-      // Low-Noise Standby Vent: brown noise filtered at 180 Hz
+      // Low-Noise Standby Vent: brown noise filtered at 180 Hz + subtle sub tone
+      const sub = this.ctx!.createOscillator();
+      const sg = this.ctx!.createGain();
+      sub.type = 'sine';
+      sub.frequency.setValueAtTime(90 * pMod, t);
+      sg.gain.setValueAtTime(0.0001, t);
+      sg.gain.linearRampToValueAtTime(0.32, t + 0.3);
+      sg.gain.exponentialRampToValueAtTime(0.0001, t + 1.1);
+      sub.connect(sg); sg.connect(out);
+      sub.start(t); sub.stop(t + 1.15);
+      voice.nodes.push(sub);
+
       const vent = this.getBrown();
       if (vent) {
         const vf = this.ctx!.createBiquadFilter();
@@ -597,7 +666,7 @@ class PetAudioEngine {
         vf.type = 'lowpass';
         vf.frequency.setValueAtTime(180 * pMod, t);
         vg.gain.setValueAtTime(0.0001, t);
-        vg.gain.linearRampToValueAtTime(0.70, t + 0.35);
+        vg.gain.linearRampToValueAtTime(0.40, t + 0.35);
         vg.gain.exponentialRampToValueAtTime(0.0001, t + 1.2);
         vent.connect(vf); vf.connect(vg); vg.connect(out);
         vent.start(t); vent.stop(t + 1.25);
@@ -633,18 +702,18 @@ class PetAudioEngine {
       hum.start(t); hum.stop(t + 1.15);
       voice.nodes.push(hum);
     } else if (vIdx === 1) {
-      // Terminal Cursor Sleep Tick: 2 soft, crisp clock ticks (380 Hz)
-      [0, 0.45].forEach((dt) => {
+      // Terminal Cursor Sleep Tick: 3 soft, crisp clock ticks (380 Hz)
+      [0, 0.24, 0.48].forEach((dt) => {
         const tt = t + dt;
         const tick = this.ctx!.createOscillator();
         const tg = this.ctx!.createGain();
         tick.type = 'sine';
         tick.frequency.setValueAtTime(380 * pMod, tt);
         tg.gain.setValueAtTime(0.0001, tt);
-        tg.gain.linearRampToValueAtTime(0.36, tt + 0.004);
-        tg.gain.exponentialRampToValueAtTime(0.0001, tt + 0.09);
+        tg.gain.linearRampToValueAtTime(0.48, tt + 0.004);
+        tg.gain.exponentialRampToValueAtTime(0.0001, tt + 0.11);
         tick.connect(tg); tg.connect(out);
-        tick.start(tt); tick.stop(tt + 0.095);
+        tick.start(tt); tick.stop(tt + 0.115);
         voice.nodes.push(tick);
       });
     } else {
@@ -654,7 +723,7 @@ class PetAudioEngine {
       motor.type = 'triangle';
       motor.frequency.setValueAtTime(60 * pMod, t);
       mg.gain.setValueAtTime(0.0001, t);
-      mg.gain.linearRampToValueAtTime(0.22, t + 0.2);
+      mg.gain.linearRampToValueAtTime(0.24, t + 0.2);
       mg.gain.exponentialRampToValueAtTime(0.0001, t + 1.0);
       motor.connect(mg); mg.connect(out);
       motor.start(t); motor.stop(t + 1.05);
@@ -830,7 +899,19 @@ class PetAudioEngine {
     const pMod = this.jitter(0.03);
 
     if (vIdx === 0) {
-      // Gentle Pneumatic Release: soft pink noise bandpassed at 480 Hz
+      // Gentle Pneumatic Release: soft pink noise bandpassed at 480 Hz + gentle sub release
+      const sub = this.ctx!.createOscillator();
+      const sg = this.ctx!.createGain();
+      sub.type = 'sine';
+      sub.frequency.setValueAtTime(120 * pMod, t);
+      sub.frequency.exponentialRampToValueAtTime(60 * pMod, t + 0.5);
+      sg.gain.setValueAtTime(0.0001, t);
+      sg.gain.linearRampToValueAtTime(0.16, t + 0.08);
+      sg.gain.exponentialRampToValueAtTime(0.0001, t + 0.6);
+      sub.connect(sg); sg.connect(out);
+      sub.start(t); sub.stop(t + 0.65);
+      voice.nodes.push(sub);
+
       const noise = this.getPink();
       if (noise) {
         const f = this.ctx!.createBiquadFilter();
@@ -839,10 +920,10 @@ class PetAudioEngine {
         f.frequency.setValueAtTime(480 * pMod, t);
         f.Q.value = 1.0;
         g.gain.setValueAtTime(0.0001, t);
-        g.gain.linearRampToValueAtTime(1.5, t + 0.12);
-        g.gain.exponentialRampToValueAtTime(0.0001, t + 0.65);
+        g.gain.linearRampToValueAtTime(1.40, t + 0.12);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + 0.75);
         noise.connect(f); f.connect(g); g.connect(out);
-        noise.start(t); noise.stop(t + 0.7);
+        noise.start(t); noise.stop(t + 0.8);
         voice.nodes.push(noise);
       }
     } else if (vIdx === 1) {
@@ -1079,18 +1160,18 @@ class PetAudioEngine {
     } else if (vIdx === 1) {
       // 3-tone arcade bonus chime
       const notes = [
-        { f: 1046.5, dt: 0, dur: 0.05 },
-        { f: 1318.51, dt: 0.055, dur: 0.05 },
-        { f: 2093.0, dt: 0.11, dur: 0.25 },
+        { f: 1046.5, dt: 0, dur: 0.06 },
+        { f: 1318.51, dt: 0.06, dur: 0.06 },
+        { f: 2093.0, dt: 0.12, dur: 0.28 },
       ];
-      notes.forEach((n) => {
+      notes.forEach((n, idx) => {
         const tn = t + n.dt;
         const osc = this.ctx!.createOscillator();
         const g = this.ctx!.createGain();
         osc.type = 'triangle';
         osc.frequency.setValueAtTime(n.f * pMod, tn);
         g.gain.setValueAtTime(0.0001, tn);
-        g.gain.linearRampToValueAtTime(0.42, tn + 0.003);
+        g.gain.linearRampToValueAtTime(idx === 2 ? 0.48 : 0.45, tn + 0.003);
         g.gain.exponentialRampToValueAtTime(0.0001, tn + n.dur);
         osc.connect(g); g.connect(out);
         osc.start(tn); osc.stop(tn + n.dur + 0.01);
@@ -1132,7 +1213,7 @@ class PetAudioEngine {
    */
   playMugTableTap(variantIndex?: number): number {
     const vIdx = this.pickVariant('playMugTableTap', variantIndex);
-    const v = this.createVoice({ duration: 0.45, volume: 0.85 });
+    const v = this.createVoice({ duration: 0.45, volume: 0.74 });
     if (!v) return -1;
     const { out, t, voice } = v;
     const pMod = this.jitter(0.03);
@@ -1144,7 +1225,7 @@ class PetAudioEngine {
       ping.type = 'sine';
       ping.frequency.setValueAtTime(1320 * pMod, t);
       pg.gain.setValueAtTime(0.0001, t);
-      pg.gain.linearRampToValueAtTime(0.72, t + 0.003);
+      pg.gain.linearRampToValueAtTime(0.75, t + 0.003);
       pg.gain.exponentialRampToValueAtTime(0.0001, t + 0.1);
       ping.connect(pg); pg.connect(out);
       ping.start(t); ping.stop(t + 0.12);
@@ -1155,7 +1236,7 @@ class PetAudioEngine {
       overtone.type = 'sine';
       overtone.frequency.setValueAtTime(880 * pMod, t);
       og.gain.setValueAtTime(0.0001, t);
-      og.gain.linearRampToValueAtTime(0.48, t + 0.002);
+      og.gain.linearRampToValueAtTime(0.35, t + 0.002);
       og.gain.exponentialRampToValueAtTime(0.0001, t + 0.08);
       overtone.connect(og); og.connect(out);
       overtone.start(t); overtone.stop(t + 0.09);
@@ -1192,7 +1273,7 @@ class PetAudioEngine {
       glide.frequency.setValueAtTime(1100 * pMod, t);
       glide.frequency.exponentialRampToValueAtTime(1450 * pMod, t + 0.08);
       gg.gain.setValueAtTime(0.0001, t);
-      gg.gain.linearRampToValueAtTime(0.55, t + 0.01);
+      gg.gain.linearRampToValueAtTime(0.70, t + 0.01);
       gg.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
       glide.connect(gg); gg.connect(out);
       glide.start(t); glide.stop(t + 0.14);
@@ -1222,7 +1303,7 @@ class PetAudioEngine {
    */
   playHackerEmptyMug(variantIndex?: number): number {
     const vIdx = this.pickVariant('playHackerEmptyMug', variantIndex);
-    const v = this.createVoice({ duration: 0.45, volume: 0.85 });
+    const v = this.createVoice({ duration: 0.45, volume: 0.84 });
     if (!v) return -1;
     const { out, t, voice } = v;
     const pMod = this.jitter(0.04);
@@ -1334,12 +1415,12 @@ class PetAudioEngine {
 
   playMascotBugHunter(variantIndex?: number): number {
     const vIdx = this.pickVariant('playMascotBugHunter', variantIndex);
-    const v = this.createVoice({ duration: 0.5, volume: 0.75 });
+    const v = this.createVoice({ duration: 0.5, volume: 0.70 });
     if (!v) return -1;
     const { out, t, voice } = v;
     const pMod = this.jitter(0.04);
 
-    const fireLaser = (delay: number, f0: number, f1: number, dur: number, gainVol = 0.40): void => {
+    const fireLaser = (delay: number, f0: number, f1: number, dur: number, gainVol = 0.50): void => {
       const t0 = t + delay;
       const osc = this.ctx!.createOscillator();
       const g = this.ctx!.createGain();
@@ -1368,9 +1449,9 @@ class PetAudioEngine {
 
     if (vIdx === 0) {
       // 3-Pulse Rapid Plasma Blaster
-      fireLaser(0, 1800, 320, 0.035, 0.40);
-      fireLaser(0.045, 2200, 300, 0.035, 0.40);
-      fireLaser(0.09, 2600, 280, 0.045, 0.40);
+      fireLaser(0, 1800, 320, 0.045, 0.46);
+      fireLaser(0.045, 2200, 300, 0.045, 0.46);
+      fireLaser(0.09, 2600, 280, 0.055, 0.46);
     } else if (vIdx === 1) {
       // Electromagnetic Laser Stunner: punch + high-voltage laser sweep
       const zap = this.ctx!.createOscillator();
@@ -1379,13 +1460,13 @@ class PetAudioEngine {
       zap.frequency.setValueAtTime(240 * pMod, t);
       zap.frequency.exponentialRampToValueAtTime(60 * pMod, t + 0.05);
       zg.gain.setValueAtTime(0.0001, t);
-      zg.gain.linearRampToValueAtTime(1.10, t + 0.002);
+      zg.gain.linearRampToValueAtTime(0.40, t + 0.002);
       zg.gain.exponentialRampToValueAtTime(0.0001, t + 0.08);
       zap.connect(zg); zg.connect(out);
       zap.start(t); zap.stop(t + 0.09);
       voice.nodes.push(zap);
 
-      fireLaser(0, 2400, 400, 0.12, 0.70);
+      fireLaser(0.02, 2400, 400, 0.12, 0.68);
     } else {
       // Plasma Orb Burst
       const kick = this.ctx!.createOscillator();
@@ -1394,19 +1475,19 @@ class PetAudioEngine {
       kick.frequency.setValueAtTime(110 * pMod, t);
       kick.frequency.exponentialRampToValueAtTime(45 * pMod, t + 0.06);
       kg.gain.setValueAtTime(0.0001, t);
-      kg.gain.linearRampToValueAtTime(0.85, t + 0.002);
+      kg.gain.linearRampToValueAtTime(0.70, t + 0.002);
       kg.gain.exponentialRampToValueAtTime(0.0001, t + 0.07);
       kick.connect(kg); kg.connect(out);
       kick.start(t); kick.stop(t + 0.08);
       voice.nodes.push(kick);
-      fireLaser(0.02, 2800, 500, 0.08, 0.75);
+      fireLaser(0.02, 2800, 500, 0.08, 0.65);
     }
     return vIdx;
   }
 
   playHackerBugSlayer(variantIndex?: number): number {
     const vIdx = this.pickVariant('playHackerBugSlayer', variantIndex);
-    const v = this.createVoice({ duration: 0.55, volume: 0.75 });
+    const v = this.createVoice({ duration: 0.35, volume: 0.75 });
     if (!v) return -1;
     const { out, t, voice } = v;
     const pMod = this.jitter(0.04);
@@ -1464,19 +1545,22 @@ class PetAudioEngine {
       clang.start(t + 0.01); clang.stop(t + 0.25);
       voice.nodes.push(clang);
     } else {
-      // Dual Pixel Cross Slash
-      [0, 0.08].forEach((d, i) => {
+      // Dual Pixel Cross Slash: fast crisp dual slash
+      [0, 0.045].forEach((d, i) => {
         const td = t + d;
         const osc = this.ctx!.createOscillator();
+        const f = this.ctx!.createBiquadFilter();
         const g = this.ctx!.createGain();
         osc.type = 'sawtooth';
         osc.frequency.setValueAtTime((1800 + i * 600) * pMod, td);
         osc.frequency.exponentialRampToValueAtTime(400 * pMod, td + 0.06);
+        f.type = 'lowpass';
+        f.frequency.setValueAtTime(2600 * pMod, td);
         g.gain.setValueAtTime(0.0001, td);
-        g.gain.linearRampToValueAtTime(0.42, td + 0.003);
-        g.gain.exponentialRampToValueAtTime(0.0001, td + 0.08);
-        osc.connect(g); g.connect(out);
-        osc.start(td); osc.stop(td + 0.09);
+        g.gain.linearRampToValueAtTime(0.48, td + 0.003);
+        g.gain.exponentialRampToValueAtTime(0.0001, td + 0.28);
+        osc.connect(f); f.connect(g); g.connect(out);
+        osc.start(td); osc.stop(td + 0.29);
         voice.nodes.push(osc);
       });
     }
@@ -1651,10 +1735,10 @@ class PetAudioEngine {
           f.frequency.setValueAtTime(2200 * pMod, tw);
           f.Q.value = 1.2;
           g.gain.setValueAtTime(0.0001, tw);
-          g.gain.linearRampToValueAtTime(2.6, tw + 0.02);
-          g.gain.exponentialRampToValueAtTime(0.0001, tw + 0.08);
+          g.gain.linearRampToValueAtTime(2.45, tw + 0.02);
+          g.gain.exponentialRampToValueAtTime(0.0001, tw + 0.26);
           noise.connect(f); f.connect(g); g.connect(out);
-          noise.start(tw); noise.stop(tw + 0.09);
+          noise.start(tw); noise.stop(tw + 0.27);
           voice.nodes.push(noise);
         }
       });
@@ -1667,9 +1751,9 @@ class PetAudioEngine {
       pulse.frequency.exponentialRampToValueAtTime(880 * pMod, t + 0.08);
       g.gain.setValueAtTime(0.0001, t);
       g.gain.linearRampToValueAtTime(0.95, t + 0.005);
-      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.25);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.48);
       pulse.connect(g); g.connect(out);
-      pulse.start(t); pulse.stop(t + 0.28);
+      pulse.start(t); pulse.stop(t + 0.50);
       voice.nodes.push(pulse);
     }
     return vIdx;
@@ -1677,7 +1761,7 @@ class PetAudioEngine {
 
   playMascotNanoCoffee(variantIndex?: number): number {
     const vIdx = this.pickVariant('playMascotNanoCoffee', variantIndex);
-    const v = this.createVoice({ duration: 0.7, volume: 0.75 });
+    const v = this.createVoice({ duration: 0.7, volume: 0.60 });
     if (!v) return -1;
     const { out, t, voice } = v;
     const pMod = this.jitter(0.03);
@@ -1692,7 +1776,7 @@ class PetAudioEngine {
         f.frequency.setValueAtTime(2800 * pMod, t);
         f.Q.value = 1.4;
         g.gain.setValueAtTime(0.0001, t);
-        g.gain.linearRampToValueAtTime(1.4, t + 0.03);
+        g.gain.linearRampToValueAtTime(1.6, t + 0.03);
         g.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
         steam.connect(f); f.connect(g); g.connect(out);
         steam.start(t); steam.stop(t + 0.25);
@@ -1763,7 +1847,7 @@ class PetAudioEngine {
 
   playHackerZeroErrors(variantIndex?: number): number {
     const vIdx = this.pickVariant('playHackerZeroErrors', variantIndex);
-    const v = this.createVoice({ duration: 0.8, volume: 0.75 });
+    const v = this.createVoice({ duration: 0.8, volume: 0.78 });
     if (!v) return -1;
     const { out, t, voice } = v;
     const pMod = this.jitter(0.01);
@@ -1801,7 +1885,7 @@ class PetAudioEngine {
         f.type = 'lowpass';
         f.frequency.setValueAtTime(1400, t);
         g.gain.setValueAtTime(0.0001, t);
-        g.gain.linearRampToValueAtTime(1.0 / chord.length, t + 0.015);
+        g.gain.linearRampToValueAtTime(1.10 / chord.length, t + 0.015);
         g.gain.exponentialRampToValueAtTime(0.0001, t + 0.55);
         osc.connect(f); f.connect(g); g.connect(out);
         osc.start(t); osc.stop(t + 0.6);
@@ -1835,7 +1919,7 @@ class PetAudioEngine {
 
   playHackerFlowchart(variantIndex?: number): number {
     const vIdx = this.pickVariant('playHackerFlowchart', variantIndex);
-    const v = this.createVoice({ duration: 0.45, volume: 0.60 });
+    const v = this.createVoice({ duration: 0.45, volume: 0.55 });
     if (!v) return -1;
     const { out, t, voice } = v;
     const pMod = this.jitter(0.03);
@@ -1849,10 +1933,10 @@ class PetAudioEngine {
         osc.type = 'triangle';
         osc.frequency.setValueAtTime(freq * pMod, tc);
         g.gain.setValueAtTime(0.0001, tc);
-        g.gain.linearRampToValueAtTime(0.40, tc + 0.002);
-        g.gain.exponentialRampToValueAtTime(0.0001, tc + 0.025);
+        g.gain.linearRampToValueAtTime(0.55, tc + 0.002);
+        g.gain.exponentialRampToValueAtTime(0.0001, tc + 0.045);
         osc.connect(g); g.connect(out);
-        osc.start(tc); osc.stop(tc + 0.03);
+        osc.start(tc); osc.stop(tc + 0.05);
         voice.nodes.push(osc);
       });
     } else if (vIdx === 1) {
@@ -1941,20 +2025,185 @@ class PetAudioEngine {
     } else {
       // Grand Architect Brass Fanfare: F# Major chord progression
       const freqs = [369.99, 466.16, 554.37, 739.99];
-      freqs.forEach((f0) => {
+      freqs.forEach((f0, idx) => {
+        const tn = t + idx * 0.035;
         const osc = this.ctx!.createOscillator();
         const g = this.ctx!.createGain();
         const f = this.ctx!.createBiquadFilter();
         osc.type = 'sawtooth';
-        osc.frequency.setValueAtTime(f0 * pMod, t);
+        osc.frequency.setValueAtTime(f0 * pMod, tn);
         f.type = 'lowpass';
-        f.frequency.setValueAtTime(1400, t);
-        g.gain.setValueAtTime(0.0001, t);
-        g.gain.linearRampToValueAtTime(0.75 / freqs.length, t + 0.04);
-        g.gain.exponentialRampToValueAtTime(0.0001, t + 0.9);
+        f.frequency.setValueAtTime(1400, tn);
+        g.gain.setValueAtTime(0.0001, tn);
+        g.gain.linearRampToValueAtTime(0.92 / freqs.length, tn + 0.08);
+        g.gain.exponentialRampToValueAtTime(0.0001, tn + 1.28);
         osc.connect(f); f.connect(g); g.connect(out);
-        osc.start(t); osc.stop(t + 0.95);
+        osc.start(tn); osc.stop(tn + 1.31);
         voice.nodes.push(osc);
+      });
+    }
+    return vIdx;
+  }
+
+  /**
+   * Pixel Hacker Cursor Tick: Lone mechanical switch tick / terminal cursor blip / relay micro-snap.
+   * Autonomous ambient life sign for idle terminal state.
+   */
+  playHackerCursorTick(variantIndex?: number): number {
+    const vIdx = this.pickVariant('playHackerCursorTick', variantIndex);
+    const v = this.createVoice({ duration: 0.5, volume: 0.72 });
+    if (!v) return -1;
+    const { out, t, voice } = v;
+    const pMod = this.jitter(0.02);
+
+    if (vIdx === 0) {
+      // Lone Lubed Mechanical Switch Tap: single 140 Hz thock + 2.4 kHz tactile click transient
+      const noise = this.getPink();
+      if (noise) {
+        const sf = this.ctx!.createBiquadFilter();
+        const sg = this.ctx!.createGain();
+        sf.type = 'bandpass';
+        sf.frequency.setValueAtTime(2400 * pMod, t);
+        sf.Q.value = 3.0;
+        sg.gain.setValueAtTime(0.0001, t);
+        sg.gain.linearRampToValueAtTime(0.85, t + 0.002);
+        sg.gain.exponentialRampToValueAtTime(0.0001, t + 0.015);
+        noise.connect(sf); sf.connect(sg); sg.connect(out);
+        noise.start(t); noise.stop(t + 0.02);
+        voice.nodes.push(noise);
+      }
+
+      const thud = this.ctx!.createOscillator();
+      const tg = this.ctx!.createGain();
+      thud.type = 'sine';
+      thud.frequency.setValueAtTime(140 * pMod, t);
+      thud.frequency.exponentialRampToValueAtTime(50 * pMod, t + 0.045);
+      tg.gain.setValueAtTime(0.0001, t);
+      tg.gain.linearRampToValueAtTime(0.95, t + 0.008);
+      tg.gain.exponentialRampToValueAtTime(0.0001, t + 0.09);
+      thud.connect(tg); tg.connect(out);
+      thud.start(t); thud.stop(t + 0.095);
+      voice.nodes.push(thud);
+    } else if (vIdx === 1) {
+      // Green Phosphor Cursor Blink Chirp: 440 Hz -> 880 Hz micro-sine blip
+      const blip = this.ctx!.createOscillator();
+      const bg = this.ctx!.createGain();
+      blip.type = 'sine';
+      blip.frequency.setValueAtTime(440 * pMod, t);
+      blip.frequency.exponentialRampToValueAtTime(880 * pMod, t + 0.045);
+      bg.gain.setValueAtTime(0.0001, t);
+      bg.gain.linearRampToValueAtTime(0.90, t + 0.006);
+      bg.gain.exponentialRampToValueAtTime(0.0001, t + 0.11);
+      blip.connect(bg); bg.connect(out);
+      blip.start(t); blip.stop(t + 0.115);
+      voice.nodes.push(blip);
+    } else {
+      // Relay Contact Micro-Snap: 180 Hz punch + 1.6 kHz ceramic snap
+      const snap = this.ctx!.createOscillator();
+      const sg = this.ctx!.createGain();
+      snap.type = 'triangle';
+      snap.frequency.setValueAtTime(180 * pMod, t);
+      snap.frequency.exponentialRampToValueAtTime(60 * pMod, t + 0.035);
+      sg.gain.setValueAtTime(0.0001, t);
+      sg.gain.linearRampToValueAtTime(1.20, t + 0.006);
+      sg.gain.exponentialRampToValueAtTime(0.0001, t + 0.08);
+      snap.connect(sg); sg.connect(out);
+      snap.start(t); snap.stop(t + 0.085);
+      voice.nodes.push(snap);
+
+      const high = this.ctx!.createOscillator();
+      const hg = this.ctx!.createGain();
+      high.type = 'square';
+      high.frequency.setValueAtTime(1600 * pMod, t);
+      hg.gain.setValueAtTime(0.55, t);
+      hg.gain.exponentialRampToValueAtTime(0.0001, t + 0.012);
+      high.connect(hg); hg.connect(out);
+      high.start(t); high.stop(t + 0.015);
+      voice.nodes.push(high);
+    }
+    return vIdx;
+  }
+
+  /**
+   * Pixel Hacker Disk Seek: Stepper motor seek / high-voltage capacitor whine / floppy spindle step.
+   * Autonomous ambient life sign for idle terminal state.
+   */
+  playHackerDiskSeek(variantIndex?: number): number {
+    const vIdx = this.pickVariant('playHackerDiskSeek', variantIndex);
+    const v = this.createVoice({ duration: 0.6, volume: 0.65 });
+    if (!v) return -1;
+    const { out, t, voice } = v;
+    const pMod = this.jitter(0.02);
+
+    if (vIdx === 0) {
+      // Stepper Motor Head Settle: 120 Hz -> 75 Hz mechanical sweep with lowpass friction
+      const seek = this.ctx!.createOscillator();
+      const sg = this.ctx!.createGain();
+      const sf = this.ctx!.createBiquadFilter();
+      seek.type = 'triangle';
+      seek.frequency.setValueAtTime(120 * pMod, t);
+      seek.frequency.exponentialRampToValueAtTime(75 * pMod, t + 0.12);
+      sf.type = 'lowpass';
+      sf.frequency.setValueAtTime(380, t);
+      sg.gain.setValueAtTime(0.0001, t);
+      sg.gain.linearRampToValueAtTime(0.85, t + 0.01);
+      sg.gain.exponentialRampToValueAtTime(0.0001, t + 0.14);
+      seek.connect(sf); sf.connect(sg); sg.connect(out);
+      seek.start(t); seek.stop(t + 0.15);
+      voice.nodes.push(seek);
+
+      const friction = this.getPink();
+      if (friction) {
+        const ff = this.ctx!.createBiquadFilter();
+        const fg = this.ctx!.createGain();
+        ff.type = 'bandpass';
+        ff.frequency.setValueAtTime(1400 * pMod, t);
+        ff.Q.value = 2.0;
+        fg.gain.setValueAtTime(0.0001, t);
+        fg.gain.linearRampToValueAtTime(0.95, t + 0.015);
+        fg.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
+        friction.connect(ff); ff.connect(fg); fg.connect(out);
+        friction.start(t); friction.stop(t + 0.13);
+        voice.nodes.push(friction);
+      }
+    } else if (vIdx === 1) {
+      // High-Voltage Capacitor Charge Whine: 800 Hz -> 1800 Hz soft sine sweep
+      const cap = this.ctx!.createOscillator();
+      const cg = this.ctx!.createGain();
+      cap.type = 'sine';
+      cap.frequency.setValueAtTime(800 * pMod, t);
+      cap.frequency.exponentialRampToValueAtTime(1800 * pMod, t + 0.22);
+      cg.gain.setValueAtTime(0.0001, t);
+      cg.gain.linearRampToValueAtTime(0.42, t + 0.04);
+      cg.gain.exponentialRampToValueAtTime(0.0001, t + 0.26);
+      cap.connect(cg); cg.connect(out);
+      cap.start(t); cap.stop(t + 0.28);
+      voice.nodes.push(cap);
+    } else {
+      // Floppy Drive Spindle Spin-Up / Head Step: 65 Hz sub-hum + dual micro-step pulse
+      const motor = this.ctx!.createOscillator();
+      const mg = this.ctx!.createGain();
+      motor.type = 'triangle';
+      motor.frequency.setValueAtTime(65 * pMod, t);
+      mg.gain.setValueAtTime(0.0001, t);
+      mg.gain.linearRampToValueAtTime(0.45, t + 0.02);
+      mg.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
+      motor.connect(mg); mg.connect(out);
+      motor.start(t); motor.stop(t + 0.2);
+      voice.nodes.push(motor);
+
+      [0, 0.06].forEach((dt, i) => {
+        const ts = t + dt;
+        const step = this.ctx!.createOscillator();
+        const sg = this.ctx!.createGain();
+        step.type = 'square';
+        step.frequency.setValueAtTime((240 + i * 80) * pMod, ts);
+        sg.gain.setValueAtTime(0.0001, ts);
+        sg.gain.linearRampToValueAtTime(0.36, ts + 0.002);
+        sg.gain.exponentialRampToValueAtTime(0.0001, ts + 0.025);
+        step.connect(sg); sg.connect(out);
+        step.start(ts); step.stop(ts + 0.03);
+        voice.nodes.push(step);
       });
     }
     return vIdx;

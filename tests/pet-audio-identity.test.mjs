@@ -162,7 +162,7 @@ class MockAudioContext {
   resume() { this.state = 'running'; return Promise.resolve(); }
 }
 
-function loadPetAudioWithContext() {
+function loadPetAudioWithContext(sessionStorageMock = null) {
   const compiled = typescript.transpileModule(read('src/renderer/pet/audioEngine.ts'), {
     compilerOptions: {
       module: typescript.ModuleKind.CommonJS,
@@ -178,6 +178,7 @@ function loadPetAudioWithContext() {
     AudioContext: function () { return mockCtx; },
     setTimeout: (fn, ms) => setTimeout(fn, 0),
     clearTimeout: (id) => clearTimeout(id),
+    sessionStorage: sessionStorageMock,
   };
   vm.runInNewContext(compiled.outputText, context, {
     filename: 'src/renderer/pet/audioEngine.ts',
@@ -187,7 +188,7 @@ function loadPetAudioWithContext() {
   return { petAudio, mockCtx };
 }
 
-const ALL_24_CUES = [
+const ALL_CUES = [
   'playOrganicSnoring',
   'playMascotPowerNap',
   'playHackerTerminalNap',
@@ -208,18 +209,20 @@ const ALL_24_CUES = [
   'playMascotNanoCoffee',
   'playHackerZeroErrors',
   'playHackerFlowchart',
+  'playHackerCursorTick',
+  'playHackerDiskSeek',
   'playAscensionRitual',
   'playActionCheer',
   'playEasterEggDisk',
   'playChime',
 ];
 
-test('all 24 audio cues exist, are callable, and return valid variant index [0..2]', () => {
+test('all 26 audio cues exist, are callable, and return valid variant index [0..2]', () => {
   const { petAudio } = loadPetAudioWithContext();
   petAudio.setEnabled(true);
 
-  assert.equal(ALL_24_CUES.length, 24, 'must have exactly 24 distinct cue methods');
-  for (const cue of ALL_24_CUES) {
+  assert.equal(ALL_CUES.length, 26, 'must have exactly 26 distinct cue methods');
+  for (const cue of ALL_CUES) {
     assert.equal(typeof petAudio[cue], 'function', `cue ${cue} must exist`);
     const v = petAudio[cue]();
     assert.ok(v >= 0 && v <= 2, `cue ${cue} returned invalid variant ${v}`);
@@ -230,7 +233,7 @@ test('round-robin variant pool guarantees no consecutive repeats across repeated
   const { petAudio } = loadPetAudioWithContext();
   petAudio.setEnabled(true);
 
-  for (const cue of ALL_24_CUES) {
+  for (const cue of ALL_CUES) {
     let last = -1;
     for (let i = 0; i < 20; i++) {
       const chosen = petAudio[cue]();
@@ -244,7 +247,7 @@ test('explicit variant index 0, 1, 2 is strictly respected and out-of-bounds val
   const { petAudio } = loadPetAudioWithContext();
   petAudio.setEnabled(true);
 
-  for (const cue of ALL_24_CUES) {
+  for (const cue of ALL_CUES) {
     assert.equal(petAudio[cue](0), 0, `${cue}(0) must return 0`);
     assert.equal(petAudio[cue](1), 1, `${cue}(1) must return 1`);
     assert.equal(petAudio[cue](2), 2, `${cue}(2) must return 2`);
@@ -259,18 +262,18 @@ test('audibility gate rejection returns -1 and creates no active audio voice nod
   petAudio.setAudibleGate(() => false);
 
   const prevNodeCount = mockCtx.createdNodes.length;
-  for (const cue of ALL_24_CUES) {
+  for (const cue of ALL_CUES) {
     const res = petAudio[cue]();
     assert.equal(res, -1, `gated cue ${cue} must return -1`);
   }
   assert.equal(mockCtx.createdNodes.length, prevNodeCount, 'no new nodes created while inaudible');
 });
 
-test('disabled sound preference returns -1 immediately for all 24 cues', () => {
+test('disabled sound preference returns -1 immediately for all cues', () => {
   const { petAudio } = loadPetAudioWithContext();
   petAudio.setEnabled(false);
 
-  for (const cue of ALL_24_CUES) {
+  for (const cue of ALL_CUES) {
     const res = petAudio[cue]();
     assert.equal(res, -1, `disabled cue ${cue} must return -1`);
   }
@@ -318,6 +321,8 @@ test('persona separation: paired cues (sleep, coins, mugs, combat, focus, idle) 
     { mascot: 'playMascotBugHunter', hacker: 'playHackerBugSlayer', domain: 'bug combat' },
     { mascot: 'playMascotModelJuggler', hacker: 'playHackerCodeFrenzy', domain: 'active focus / interaction' },
     { mascot: 'playMascotSensorPolish', hacker: 'playHackerFlowchart', domain: 'idle inspection / calibration' },
+    { mascot: 'playChime', hacker: 'playHackerCursorTick', domain: 'idle crystal chime vs lone key tick' },
+    { mascot: 'playMascotSensorPolish', hacker: 'playHackerDiskSeek', domain: 'idle sensor wipe vs disk seek' },
   ];
 
   for (const { mascot, hacker, domain } of PAIRS) {
@@ -384,3 +389,56 @@ test('persona acoustic domain constraints: Mascot lives in FM/sine/ceramic domai
     assert.ok(hasArcadeWave, `playHackerCoinDrop v${variant} must use 8-bit square/triangle oscillators`);
   }
 });
+
+test('persona resolution: stored hacker session ALWAYS resolves to hacker, never mascot, across all activity slugs', () => {
+  const hackerSessionStorage = {
+    getItem: (k) => (k === 'nv_pet_character' ? 'hacker' : null),
+  };
+  const mascotSessionStorage = {
+    getItem: (k) => (k === 'nv_pet_character' ? 'mascot' : null),
+  };
+
+  const testActivities = [
+    'idle',
+    '',
+    'code-frenzy',
+    'bug-hunter', // FRESH BOOT activity
+    'low-battery',
+    'turbine-generator',
+    'sensor-polish',
+    'model-juggler',
+    'nano-coffee',
+    'power-nap',
+    'syndicate-salute',
+  ];
+
+  for (const act of testActivities) {
+    const { petAudio: hackerAudio } = loadPetAudioWithContext(hackerSessionStorage);
+    hackerAudio.scheduleAmbient(() => act);
+    const hackerResolved = hackerAudio['getActivePersona']();
+    assert.equal(
+      hackerResolved,
+      'hacker',
+      `stored hacker session with activity '${act}' resolved to '${hackerResolved}' instead of 'hacker'`
+    );
+
+    const { petAudio: mascotAudio } = loadPetAudioWithContext(mascotSessionStorage);
+    mascotAudio.scheduleAmbient(() => act);
+    const mascotResolved = mascotAudio['getActivePersona']();
+    assert.equal(
+      mascotResolved,
+      'mascot',
+      `stored mascot session with activity '${act}' resolved to '${mascotResolved}' instead of 'mascot'`
+    );
+  }
+
+  // Fallback behavior when sessionStorage is unavailable (null)
+  const { petAudio: fallbackIdle } = loadPetAudioWithContext(null);
+  fallbackIdle.scheduleAmbient(() => 'idle');
+  assert.equal(fallbackIdle['getActivePersona'](), 'mascot', 'null storage with idle activity must fall back to mascot default');
+
+  const { petAudio: fallbackHacker } = loadPetAudioWithContext(null);
+  fallbackHacker.scheduleAmbient(() => 'code-frenzy');
+  assert.equal(fallbackHacker['getActivePersona'](), 'hacker', 'null storage with hacker activity must fall back to hacker');
+});
+

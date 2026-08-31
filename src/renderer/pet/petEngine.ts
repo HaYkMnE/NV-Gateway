@@ -214,7 +214,8 @@ export function createPetEngine(opts: PetEngineOptions): PetEngine {
   let character: PetCharacter = readStoredCharacter() ?? rollCharacter();
   if (readStoredCharacter() === null) persistCharacter(character);
 
-  let currentActivity: AnyActivity = MASCOT_ACTIVITIES[0];
+  let currentActivity: AnyActivity =
+    character === 'mascot' ? MASCOT_ACTIVITIES[0] : HACKER_ACTIVITIES[0];
   let affective: AffectiveState = 'nominal';
   let wasAway = false;
   /** Timestamp of the last observed attention loss (blur/hidden). */
