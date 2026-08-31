@@ -88,6 +88,7 @@ nodeRequire.cache[electronId] = {
 const built = (name) => pathToFileURL(join(root, 'build', 'src', 'main', name)).href;
 const {
   assertFeedbackData,
+  snapshotFeedbackData,
   FEEDBACK_TITLE_MAX,
   FEEDBACK_DESCRIPTION_MAX,
   FEEDBACK_EMAIL_MAX
@@ -106,6 +107,30 @@ const valid = () => ({
   email: 'a@b.test',
   attachDiagnostic: true
 });
+
+/**
+ * THE DERIVED BOUND, hoisted so every test in this file measures against the same
+ * arithmetic instead of restating it. `encodeURIComponent` expands at most 9 URL
+ * characters per UTF-16 code unit, and the title is emitted TWICE (query parameter
+ * and body), so the ceiling over validator-accepted payloads is
+ *
+ *   9 * (2*title + description + email) + fixed scaffolding
+ *
+ * 9 per unit is the WORST case and it belongs to 3-byte BMP characters such as CJK
+ * U+65E5, which occupy ONE unit: `encodeURIComponent('\u65E5').length === 9`. An
+ * astral emoji is 4 bytes across TWO units, so `encodeURIComponent('\u{1F389}')` is
+ * 12 characters, i.e. only 6 per unit. CJK is therefore the worst script, not emoji.
+ */
+const DERIVED_BOUND = 9 * (2 * FEEDBACK_TITLE_MAX + FEEDBACK_DESCRIPTION_MAX + FEEDBACK_EMAIL_MAX) + 1024;
+
+/**
+ * THE MEASURED MAXIMUM over validator-accepted payloads, pinned so the figures in
+ * the source comments cannot rot again. GATE F2/F4: the numbers previously shipped
+ * in `feedback-validation.ts` (20,147) and `external-open.ts` (13,514, "~4.8x
+ * headroom", emoji named as the worst case) were all wrong. Measured here.
+ */
+const MEASURED_MAX_URL = 23_014;
+const REPO_DOOR_CAP = 65_536;
 
 test('R1: a feedback payload validator exists, in the assertion style of its neighbours', () => {
   assert.equal(
@@ -245,10 +270,25 @@ test('R1: BOTH feedback IPC handlers validate their payload before using it', ()
       .split('\n')
       .find((candidate) => candidate.includes(`ipcMain.handle("${channel}"`));
     assert.ok(line, `${channel} must still be registered`);
+    // STRENGTHENED for GATE F1. This previously asserted only `/assertFeedbackData\(/`
+    // — that the handler CALLED a validator. That is not enough, and the gap it left
+    // is the whole of F1: `assertFeedbackData` is a TypeScript assertion function, so
+    // it narrows the type of the object it was handed and then the handler passed THAT
+    // SAME object onward, to be read a second time by the consumer. A property whose
+    // value differs between the two reads defeats the validator completely.
+    //
+    // So the requirement is now the stronger one: the handler must SNAPSHOT the
+    // payload and hand the CONSUMER THE SNAPSHOT. Both halves are asserted, because
+    // snapshotting and then passing `data` anyway would be the same defect.
     assert.match(
       line,
-      /assertFeedbackData\(/,
-      `${channel} must validate its payload, as check-ports and the admin handlers do`
+      /snapshotFeedbackData\(\s*data\s*\)/,
+      `${channel} must snapshot its payload, so validation and consumption read the same values`
+    );
+    assert.doesNotMatch(
+      line,
+      /(saveFeedback|openGitHubIssue)\(\s*data\s*\)/,
+      `${channel} must pass the SNAPSHOT to its consumer, never the raw payload it was handed`
     );
     // The payload must arrive as `unknown` and be narrowed by the assertion, not
     // declared `FeedbackData` and trusted — a type annotation is erased at runtime.
@@ -257,6 +297,222 @@ test('R1: BOTH feedback IPC handlers validate their payload before using it', ()
       /data: unknown/,
       `${channel} must take its payload as unknown, since a TS annotation is not a runtime check`
     );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GATE F1 (MEDIUM) — THE VALIDATOR READ EACH FIELD ONCE AND THE CONSUMER READ IT
+// AGAIN, so a payload could return one value to the validator and another to the
+// consumer. A validator at a trust boundary that can be lied to is worse than no
+// validator: it manufactures confidence in a bound it does not actually enforce.
+//
+// MEASURED against the built modules BEFORE the fix, with a getter on `title`
+// returning 'short' on its first read and 1,000,000 UTF-16 units afterwards:
+//
+//   assertFeedbackData(hostile) -> PASSED          (it saw 5 units)
+//   openGitHubIssue(hostile)    -> OPENED 33,137 characters
+//   `title` reads recorded      -> 3
+//
+// 33,137 is past the 23,704 bound this file's own arithmetic derives, so the
+// validator's stated guarantee was false for that payload. It stayed under the
+// door's 65,536 cap, so it opened rather than erroring.
+//
+// NOT REACHABLE FROM A RENDERER TODAY, stated honestly: Electron IPC serialises
+// with the structured clone algorithm and MEASURED, `structuredClone` flattens a
+// getter to a plain value (one read, and the far-side descriptor is
+// `{value:'short',writable:true,...}`), so a live getter cannot cross the IPC
+// boundary, and no other main-process module calls either consumer. This is
+// defence-in-depth against a future main-process caller.
+// ---------------------------------------------------------------------------
+
+/** An object that lies: cheap on the first read, enormous on every read after. */
+function hostilePayload(field, counter) {
+  const big = 'A'.repeat(1_000_000);
+  return {
+    type: 'bug',
+    title: 'ordinary title',
+    description: 'ordinary description',
+    email: 'a@b.test',
+    attachDiagnostic: true,
+    get [field]() {
+      counter.reads += 1;
+      return counter.reads === 1 ? 'short' : big;
+    }
+  };
+}
+
+test('F1: the boundary exposes a snapshotting validator, not only a type assertion', () => {
+  assert.equal(
+    typeof snapshotFeedbackData,
+    'function',
+    'the boundary needs a validator that RETURNS what it validated; an assertion function cannot replace the object it narrowed'
+  );
+});
+
+test('F1: a getter that changes value between reads cannot smuggle an oversized field', async () => {
+  for (const field of ['title', 'description', 'email']) {
+    const counter = { reads: 0 };
+    const snapshot = snapshotFeedbackData(hostilePayload(field, counter));
+
+    // The field was read EXACTLY ONCE. That is the property that makes the
+    // validated value and the consumed value the same value by construction.
+    assert.equal(counter.reads, 1, `${field} must be read exactly once, got ${counter.reads}`);
+
+    // What came back is the value that was validated, and it is bounded.
+    assert.equal(snapshot[field], 'short', `the snapshot must carry the validated ${field}`);
+    assert.ok(snapshot[field].length <= 1000, `the snapshot ${field} must be the bounded value`);
+
+    // Consuming the snapshot cannot re-trigger the getter, so the URL stays inside
+    // the derived bound instead of the 33,137 characters measured before the fix.
+    openedUrls.length = 0;
+    await openGitHubIssue(snapshot);
+    assert.equal(counter.reads, 1, `consuming the snapshot must not re-read ${field}`);
+    assert.equal(openedUrls.length, 1, `the snapshotted report must still open: ${field}`);
+    assert.ok(
+      openedUrls[0].length < DERIVED_BOUND,
+      `URL ${openedUrls[0].length} must stay under the derived bound ${DERIVED_BOUND} for ${field}`
+    );
+    const opened = new URL(openedUrls[0]);
+    assert.equal(opened.origin, 'https://github.com', `origin stays pinned for ${field}`);
+    assert.equal(opened.pathname, '/HaYkMnE/NV-Gateway/issues/new', `path stays pinned for ${field}`);
+  }
+});
+
+test('F1: a getter that is oversized on its FIRST read is still rejected', () => {
+  // The mirror case: reading once must not become a way to skip the bound.
+  for (const field of ['title', 'description', 'email']) {
+    const counter = { reads: 1 }; // so the getter returns the big value immediately
+    assert.throws(
+      () => snapshotFeedbackData(hostilePayload(field, counter)),
+      /feedback/i,
+      `an oversized ${field} must be refused even when read once`
+    );
+  }
+});
+
+test('F1: the snapshot is FROZEN, so a getter cannot be installed on it afterwards', () => {
+  const snapshot = snapshotFeedbackData(valid());
+  assert.ok(Object.isFrozen(snapshot), 'the snapshot must be frozen');
+  for (const field of ['title', 'description', 'email', 'type', 'attachDiagnostic']) {
+    assert.throws(
+      () => Object.defineProperty(snapshot, field, { get: () => 'A'.repeat(1_000_000) }),
+      TypeError,
+      `a frozen snapshot must refuse a re-armed getter on ${field}`
+    );
+  }
+  // And every field is a plain data property, with nothing left to re-evaluate.
+  for (const field of Object.keys(snapshot)) {
+    const descriptor = Object.getOwnPropertyDescriptor(snapshot, field);
+    assert.equal(descriptor.get, undefined, `${field} must not be an accessor`);
+    assert.equal(descriptor.writable, false, `${field} must not be writable`);
+  }
+});
+
+test('F1: a Proxy that lies on repeated reads is defeated by the same property', async () => {
+  // Not just getters. Any exotic object whose `get` trap is non-deterministic is
+  // covered, because the snapshot reads once and never consults the source again.
+  let reads = 0;
+  const proxied = new Proxy(
+    { type: 'bug', title: 'x', description: 'ordinary description', email: 'a@b.test', attachDiagnostic: true },
+    {
+      get(target, property, receiver) {
+        if (property === 'title') {
+          reads += 1;
+          return reads === 1 ? 'short' : 'A'.repeat(1_000_000);
+        }
+        return Reflect.get(target, property, receiver);
+      }
+    }
+  );
+  const snapshot = snapshotFeedbackData(proxied);
+  assert.equal(reads, 1, 'the proxy title must be read exactly once');
+  assert.equal(snapshot.title, 'short');
+  openedUrls.length = 0;
+  await openGitHubIssue(snapshot);
+  assert.equal(reads, 1, 'consuming the snapshot must not hit the proxy trap again');
+  assert.ok(openedUrls[0].length < DERIVED_BOUND, `URL ${openedUrls[0].length} must stay bounded`);
+});
+
+test('F1: the snapshot accepts and rejects EXACTLY what the assertion always did', () => {
+  // The fix must not change the accepted set in either direction.
+  for (const accepted of [
+    valid(),
+    { ...valid(), email: undefined },
+    (() => { const { email, ...rest } = valid(); return rest; })(),
+    { ...valid(), type: 'suggestion' },
+    { ...valid(), attachDiagnostic: false },
+    { ...valid(), title: 'a'.repeat(FEEDBACK_TITLE_MAX) },
+    { ...valid(), description: 'a'.repeat(FEEDBACK_DESCRIPTION_MAX) },
+    { ...valid(), email: 'e'.repeat(FEEDBACK_EMAIL_MAX) }
+  ]) {
+    assert.doesNotThrow(() => snapshotFeedbackData(accepted));
+    assert.doesNotThrow(() => assertFeedbackData(accepted));
+  }
+  for (const rejected of [
+    'nope', null, undefined, [], 42,
+    { ...valid(), type: 'exploit' },
+    { ...valid(), title: 12345 },
+    { ...valid(), title: '' },
+    { ...valid(), description: '' },
+    { ...valid(), email: 99 },
+    { ...valid(), attachDiagnostic: 'yes' },
+    { ...valid(), title: 'a'.repeat(FEEDBACK_TITLE_MAX + 1) },
+    { ...valid(), description: 'a'.repeat(FEEDBACK_DESCRIPTION_MAX + 1) },
+    { ...valid(), email: 'e'.repeat(FEEDBACK_EMAIL_MAX + 1) }
+  ]) {
+    assert.throws(() => snapshotFeedbackData(rejected), /feedback/i);
+    assert.throws(() => assertFeedbackData(rejected), /feedback/i);
+  }
+  // An absent email stays absent rather than becoming an empty string.
+  const { email, ...withoutEmail } = valid();
+  assert.ok(!('email' in snapshotFeedbackData(withoutEmail)), 'an absent email must not be invented');
+  assert.ok(!('email' in snapshotFeedbackData({ ...valid(), email: undefined })), 'undefined email must not become a field');
+});
+
+test('F1: the snapshot never echoes the payload into the error message either', () => {
+  const secret = 'nvapi-must-not-appear-in-any-message';
+  try {
+    snapshotFeedbackData({ ...valid(), title: secret.repeat(200) });
+    assert.fail('expected a rejection');
+  } catch (error) {
+    assert.ok(!error.message.includes('nvapi'), `message leaked the payload: ${error.message}`);
+    assert.ok(error.message.length < 120, `message is suspiciously large: ${error.message.length}`);
+  }
+});
+
+test('F1: the consumers read each field once too, so a direct main-process caller is covered', () => {
+  // openGitHubIssue and saveFeedback are exported and could be called by a future
+  // main-process caller that forgets to snapshot. Their own reads are therefore
+  // single-read as well. Asserted statically: `data.<field>` must appear at most
+  // once per field per function, because a `typeof x === 'string' ? x : ...`
+  // ternary is itself TWO reads — which is where 2 of the 3 measured title reads
+  // came from.
+  const serviceSource = readFileSync(join(root, 'src', 'main', 'feedback-service.ts'), 'utf8');
+  const code = serviceSource
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .filter((line) => !line.trim().startsWith('//'))
+    .join('\n');
+
+  // PER FUNCTION, not per file: both consumers legitimately read `data.title` once
+  // each, so a file-wide count of 1 would be wrong. Each function body is sliced out
+  // by its own signature and counted on its own.
+  const bodies = {
+    saveFeedback: code.slice(
+      code.indexOf('export async function saveFeedback'),
+      code.indexOf('export async function openGitHubIssue')
+    ),
+    openGitHubIssue: code.slice(code.indexOf('export async function openGitHubIssue'))
+  };
+  for (const [name, body] of Object.entries(bodies)) {
+    assert.ok(body.length > 200, `guard assumption: ${name} body was located in the source`);
+    for (const field of ['title', 'description', 'email', 'type', 'attachDiagnostic']) {
+      const occurrences = body.match(new RegExp(`\\bdata\\s*\\.\\s*${field}\\b`, 'g')) ?? [];
+      assert.ok(
+        occurrences.length <= 1,
+        `${name} reads data.${field} ${occurrences.length} times; it must read it once into a local`
+      );
+    }
   }
 });
 

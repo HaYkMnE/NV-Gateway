@@ -33,7 +33,7 @@ import { createTrayIconCache } from "./tray-icons";
 import { createWindowCloseGuard } from "./window-close-guard";
 import { buildApplicationMenu, buildContextMenu, getMenuStrings } from "./app-menu";
 import { saveFeedback, openGitHubIssue } from "./feedback-service";
-import { assertFeedbackData } from "./feedback-validation";
+import { snapshotFeedbackData } from "./feedback-validation";
 import { openExternalUrl, REPO_URL } from "./external-open";
 import { exportDiagnostic } from "./diagnostic-export";
 import { init as initErrorReporter, logError, getErrorCount, previewErrors, sendErrors, type ErrorEntry } from "./error-reporter";
@@ -816,13 +816,25 @@ ipcMain.handle("error-report:log", wrapIpcHandler("error-report:log", secure((_e
 ipcMain.handle("error-report:get-count", wrapIpcHandler("error-report:get-count", secure(() => getErrorCount())));
 ipcMain.handle("error-report:preview", wrapIpcHandler("error-report:preview", secure(() => previewErrors())));
 ipcMain.handle("error-report:send", wrapIpcHandler("error-report:send", secure(async () => sendErrors())));
-// `data: unknown` then assert, exactly as clipboard:write-text and
+// `data: unknown` then validate, exactly as clipboard:write-text and
 // shell:open-external do. secure() is validateIpcSender ONLY — it proves WHO is
-// speaking, never WHAT they said — so without assertFeedbackData these two
-// channels trusted the renderer's payload, and the DOM maxLength attributes in
+// speaking, never WHAT they said — so without validation these two channels
+// trusted the renderer's payload, and the DOM maxLength attributes in
 // FeedbackModal are a typing affordance rather than a boundary.
-ipcMain.handle("feedback:save", wrapIpcHandler("feedback:save", secure((_event, data: unknown) => { assertFeedbackData(data); return saveFeedback(data); })));
-ipcMain.handle("feedback:open-github-issue", wrapIpcHandler("feedback:open-github-issue", secure((_event, data: unknown) => { assertFeedbackData(data); return openGitHubIssue(data); })));
+//
+// snapshotFeedbackData, NOT assertFeedbackData. These handlers previously called
+// the assertion and then passed THE SAME OBJECT on to the consumer, which read the
+// fields AGAIN — `openGitHubIssue` re-read `data.title`, `saveFeedback` re-read all
+// three. An assertion function can only narrow a type; it cannot replace the object
+// it narrowed. MEASURED, a payload with a getter on `title` returning 'short' on the
+// first read and 1,000,000 units afterwards PASSED validation and produced a
+// 33,137-character URL, past the 23,704-character bound feedback-validation.ts
+// derives. The snapshot reads every field exactly once and returns a frozen copy, so
+// the values that were validated are by construction the values that get consumed.
+// Not reachable from a renderer today (structured clone flattens a getter before it
+// crosses IPC) — this is defence-in-depth against a future main-process caller.
+ipcMain.handle("feedback:save", wrapIpcHandler("feedback:save", secure((_event, data: unknown) => saveFeedback(snapshotFeedbackData(data)))));
+ipcMain.handle("feedback:open-github-issue", wrapIpcHandler("feedback:open-github-issue", secure((_event, data: unknown) => openGitHubIssue(snapshotFeedbackData(data)))));
 ipcMain.handle("shell:open-external", wrapIpcHandler("shell:open-external", secure((_event, url: unknown) => openExternalUrl(url))));
 ipcMain.handle("diagnostic:export", wrapIpcHandler("diagnostic:export", secure(() => exportDiagnostic())));
 ipcMain.handle("about:get-info", wrapIpcHandler("about:get-info", secure(() => getAboutInfo())));

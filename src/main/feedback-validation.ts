@@ -109,24 +109,96 @@ function assertText(value: unknown, field: string, max: number, required: boolea
  *
  * CHARACTERS vs UNITS vs BYTES, since all three differ here: 2000 units of Cyrillic
  * is 4000 UTF-8 bytes and 12,000 URL characters; the same 2000 units of CJK is 6000
- * bytes and 18,000 URL characters. MEASURED end to end, the largest URL the UI can
+ * bytes and 18,000 URL characters.
+ *
+ * MEASURED end to end, the largest URL the UI can
  * produce is 20,147 characters, with title and description both full of CJK — NOT
  * the emoji case, which measures 13,547. That 9x spread between units and URL
  * characters is exactly why the URL bound must be DERIVED from the unit count
  * rather than assumed equal to it.
  */
 export function assertFeedbackData(value: unknown): asserts value is FeedbackData {
+  snapshotFeedbackData(value);
+}
+
+/**
+ * READ EACH FIELD EXACTLY ONCE, validate what was read, and return THAT.
+ *
+ * WHY THIS EXISTS AND WHY THE BOUNDARY USES IT INSTEAD OF THE ASSERTION ABOVE.
+ * `assertFeedbackData` is a TypeScript assertion function, so it can only narrow the
+ * type of the object it was handed — it cannot replace it. The IPC handlers therefore
+ * validated `data` and then passed THE SAME `data` on to `saveFeedback` /
+ * `openGitHubIssue`, which read the fields AGAIN. A property whose value differs
+ * between the validating read and the consuming read defeats the validator entirely.
+ *
+ * MEASURED against the built modules before this function existed, with an object
+ * carrying a getter on `title` that returned `'short'` on its first read and
+ * 1,000,000 UTF-16 units on every read after:
+ *
+ *   assertFeedbackData(hostile)  -> PASSED (it saw 'short', 5 units)
+ *   openGitHubIssue(hostile)     -> OPENED a 33,137-character URL
+ *   `title` reads recorded       -> 3
+ *
+ * 33,137 is past the 23,704 bound the comment above derives, so the validator's own
+ * stated guarantee was false for that payload. It stayed under the door's 65,536 cap,
+ * so the URL opened; the origin and path never moved, because every user byte still
+ * goes through `encodeURIComponent`. The oversize came from `redaction.ts`'s
+ * `.slice(0, 16_384)` capping each field, which is the same incidental truncation
+ * this file exists to stop relying on.
+ *
+ * NOT REACHABLE FROM A RENDERER TODAY, stated honestly. Electron IPC serialises with
+ * the structured clone algorithm, and MEASURED, `structuredClone` flattens a getter
+ * to a plain value — one read during the clone, and the descriptor on the far side
+ * comes back `{value:'short',writable:true,enumerable:true,configurable:true}`. A
+ * live getter cannot cross the boundary, and no other main-process module calls
+ * either consumer. So this is defence-in-depth against a future main-process caller,
+ * not a live renderer escape.
+ *
+ * THE SHAPE. Every field is read into a local ONCE, the locals are validated, and a
+ * fresh object built from the locals is FROZEN and returned. Freezing matters as much
+ * as copying: a plain copy could have a getter installed on it afterwards, whereas a
+ * frozen object with plain data properties cannot be re-armed. Consumers that receive
+ * this object cannot observe a value that was not the validated one, because there is
+ * nothing left to re-evaluate.
+ *
+ * `assertFeedbackData` is kept, delegates here, and therefore rejects exactly what it
+ * always rejected — but it must NOT be used at a boundary that hands the object
+ * onward, because narrowing a type is not the same as controlling what the consumer
+ * reads. That is the whole lesson of this defect.
+ */
+export function snapshotFeedbackData(value: unknown): FeedbackData {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("Invalid feedback data.");
   }
-  const data = value as Record<string, unknown>;
-  if (typeof data.type !== "string" || !FEEDBACK_TYPES.has(data.type)) {
+  const source = value as Record<string, unknown>;
+
+  // ONE read per field. Nothing below this line touches `source` again, so a getter,
+  // a Proxy trap or a concurrent mutation cannot make the validated value and the
+  // consumed value disagree.
+  const type = source.type;
+  const title = source.title;
+  const description = source.description;
+  const email = source.email;
+  const attachDiagnostic = source.attachDiagnostic;
+
+  if (typeof type !== "string" || !FEEDBACK_TYPES.has(type)) {
     throw new Error("Invalid feedback type.");
   }
-  assertText(data.title, "title", FEEDBACK_TITLE_MAX, true);
-  assertText(data.description, "description", FEEDBACK_DESCRIPTION_MAX, true);
-  assertText(data.email, "email", FEEDBACK_EMAIL_MAX, false);
-  if (typeof data.attachDiagnostic !== "boolean") {
+  assertText(title, "title", FEEDBACK_TITLE_MAX, true);
+  assertText(description, "description", FEEDBACK_DESCRIPTION_MAX, true);
+  assertText(email, "email", FEEDBACK_EMAIL_MAX, false);
+  if (typeof attachDiagnostic !== "boolean") {
     throw new Error("Invalid feedback attachDiagnostic flag.");
   }
+
+  const snapshot: FeedbackData = {
+    type: type as FeedbackData["type"],
+    title: title as string,
+    description: description as string,
+    attachDiagnostic
+  };
+  // Absent and empty are both "the user declined to leave one"; only a real string
+  // is carried, so the snapshot never invents a field the payload did not have.
+  if (typeof email === "string") snapshot.email = email;
+  return Object.freeze(snapshot);
 }

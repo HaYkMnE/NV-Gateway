@@ -99,13 +99,23 @@ export async function saveFeedback(data: FeedbackData, options?: FeedbackOptions
   if (!data || typeof data !== "object") {
     return { success: false, message: "Invalid feedback data." };
   }
-  if (typeof data.title !== "string" || typeof data.description !== "string") {
+  // ONE READ PER FIELD, into a local, before any of them is inspected — same reason
+  // as openGitHubIssue below. This function previously read `data.title` at the shape
+  // check and AGAIN at the sanitise call, and `data.email` twice in one expression, so
+  // the value it validated was not necessarily the value it wrote to disk.
+  const rawTitle = data.title;
+  const rawDescription = data.description;
+  const rawEmail = data.email;
+  const rawType = data.type;
+  const attachDiagnostic = Boolean(data.attachDiagnostic);
+
+  if (typeof rawTitle !== "string" || typeof rawDescription !== "string") {
     return { success: false, message: "Invalid feedback data: title and description are required." };
   }
-  const title = sanitizeReportText(typeof data.title === "string" ? data.title : String(data.title ?? ""));
-  const description = sanitizeReportText(typeof data.description === "string" ? data.description : String(data.description ?? ""));
-  const email = typeof data.email === "string" && data.email.trim() ? sanitizeReportText(data.email.trim()) : "";
-  const attachDiagnostic = Boolean(data.attachDiagnostic);
+  const title = sanitizeReportText(rawTitle);
+  const description = sanitizeReportText(rawDescription);
+  const trimmedEmail = typeof rawEmail === "string" ? rawEmail.trim() : "";
+  const email = trimmedEmail ? sanitizeReportText(trimmedEmail) : "";
 
   const dir = feedbackDir(options);
   fs.mkdirSync(dir, { recursive: true });
@@ -125,7 +135,7 @@ export async function saveFeedback(data: FeedbackData, options?: FeedbackOptions
 
   const entry: Record<string, unknown> = {
     timestamp,
-    type: data.type === "bug" ? "bug" : "suggestion",
+    type: rawType === "bug" ? "bug" : "suggestion",
     title,
     description,
     attachDiagnostic
@@ -162,10 +172,27 @@ export async function saveFeedback(data: FeedbackData, options?: FeedbackOptions
 // nothing: the user reviews the prefilled text and presses GitHub's own submit
 // button, so this remains an explicit user action end to end.
 export async function openGitHubIssue(data: FeedbackData): Promise<void> {
-  const title = sanitizeReportText(typeof data.title === "string" ? data.title : String(data.title ?? ""));
-  const description = sanitizeReportText(typeof data.description === "string" ? data.description : String(data.description ?? ""));
-  const email = typeof data.email === "string" && data.email.trim() ? sanitizeReportText(data.email.trim()) : "";
-  const typeLabel = data.type === "bug" ? "Bug report" : "Suggestion";
+  // ONE READ PER FIELD, into a local, BEFORE anything is used. The previous shape,
+  // `typeof data.title === "string" ? data.title : String(data.title ?? "")`, read
+  // `data.title` TWICE by itself, and the validator at the IPC boundary had already
+  // read it once — 3 reads of one property, MEASURED. A property that returns a
+  // different value on a later read therefore defeated the validation entirely: a
+  // getter yielding 'short' then 1,000,000 units passed the boundary and produced a
+  // 33,137-character URL. The boundary now hands this function a frozen snapshot
+  // (see feedback-validation.ts), and this function reads each field once regardless,
+  // so a future main-process caller that forgets to snapshot cannot reintroduce the
+  // gap. `tests/feedback-ipc-payload-bounds.test.mjs` asserts the single-read shape
+  // statically, per function.
+  const rawTitle = data.title;
+  const rawDescription = data.description;
+  const rawEmail = data.email;
+  const rawType = data.type;
+  const attachDiagnostic = Boolean(data.attachDiagnostic);
+
+  const title = sanitizeReportText(typeof rawTitle === "string" ? rawTitle : String(rawTitle ?? ""));
+  const description = sanitizeReportText(typeof rawDescription === "string" ? rawDescription : String(rawDescription ?? ""));
+  const email = typeof rawEmail === "string" && rawEmail.trim() ? sanitizeReportText(rawEmail.trim()) : "";
+  const typeLabel = rawType === "bug" ? "Bug report" : "Suggestion";
 
   const lines: string[] = [];
   lines.push(`**Type:** ${typeLabel}`);
@@ -176,7 +203,7 @@ export async function openGitHubIssue(data: FeedbackData): Promise<void> {
   lines.push("");
   lines.push(description);
   lines.push("");
-  if (data.attachDiagnostic) {
+  if (attachDiagnostic) {
     lines.push("> A diagnostic bundle was exported locally when this feedback was saved.");
     lines.push("> Please attach it to this issue if relevant.");
     lines.push("");
