@@ -66,7 +66,23 @@ export function isAllowedExternalUrl(value: unknown): value is string {
   if (typeof value !== "string" || value.length > 2048) return false;
   try {
     const url = new URL(value);
-    if (url.protocol === "https:") {
+    // THE PORT IS PART OF THE DESTINATION. `url.port` is the empty string when
+    // the authority carries no port OR carries the scheme's default, because the
+    // WHATWG parser strips a default port while parsing — measured:
+    // `new URL("https://github.com:443/…").port === ""`. Requiring the empty
+    // string therefore accepts the bare form AND an explicit `:443` (identical
+    // destinations, and `href` comes back without the port) while rejecting
+    // every other port: 8080, 80, 0, 65535. That needs no special case for 443
+    // and no port list to keep in sync, and it is the narrowest rule available.
+    // All six links the product really opens carry no port.
+    //
+    // Before this, the check never looked at `url.port`, so
+    // `https://github.com:8080/HaYkMnE/NV-Gateway` and
+    // `https://ko-fi.com:8080/haykmne` were both allowed. The hostname was still
+    // the operator's, so neither could reach a third party's server and in
+    // practice the connection simply fails — but a control whose entire job is
+    // constraining the destination was leaving part of it unconstrained.
+    if (url.protocol === "https:" && url.port === "") {
       return ALLOWED_EXTERNAL_HOSTS.has(url.hostname) || isAllowedRepoUrl(url);
     }
     return false;
