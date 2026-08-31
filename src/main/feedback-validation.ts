@@ -111,11 +111,22 @@ function assertText(value: unknown, field: string, max: number, required: boolea
  * is 4000 UTF-8 bytes and 12,000 URL characters; the same 2000 units of CJK is 6000
  * bytes and 18,000 URL characters.
  *
- * MEASURED end to end, the largest URL the UI can
- * produce is 20,147 characters, with title and description both full of CJK — NOT
- * the emoji case, which measures 13,547. That 9x spread between units and URL
- * characters is exactly why the URL bound must be DERIVED from the unit count
- * rather than assumed equal to it.
+ * MEASURED end to end over validator-accepted payloads, the largest URL the UI can
+ * produce is 23,014 characters: a CJK title, a CJK description, a 320-unit CJK
+ * e-mail, and `attachDiagnostic = true`. The worst case is CJK, NOT emoji, which
+ * measures 15,454 in the same configuration — a 3-byte BMP character occupies ONE
+ * UTF-16 unit and expands to 9 URL characters, while a 4-byte astral character
+ * occupies TWO units and expands to 12, i.e. only 6 per unit.
+ *
+ * The figure previously stated here was 20,147, which is the same CJK payload with
+ * an ASCII e-mail rather than a CJK one — 320 units of ASCII e-mail add 201 URL
+ * characters where 320 units of CJK add 2,868. Both sit under the derived bound and
+ * far under the door's 65,536 cap, so the conclusion never changed, but the number
+ * was wrong and is now the measured maximum. `tests/feedback-ipc-payload-bounds.test.mjs`
+ * pins BOTH the arithmetic above and this measured figure, so neither can rot again.
+ *
+ * That 9x spread between units and URL characters is exactly why the URL bound must
+ * be DERIVED from the unit count rather than assumed equal to it.
  */
 export function assertFeedbackData(value: unknown): asserts value is FeedbackData {
   snapshotFeedbackData(value);

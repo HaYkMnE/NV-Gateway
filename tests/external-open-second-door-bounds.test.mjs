@@ -19,11 +19,26 @@
 // `parseAllowedUrl` already takes an optional `maxLength`. D3 passed `undefined`
 // where it could have passed a generous explicit number for the same effort, so the
 // door is uncapped by choice rather than by necessity. The cap here is deliberately
-// far above anything the product can produce: the renderer caps the title at 100 and
-// the description at 2000 characters, and the worst-case encoding of that (emoji, 12
-// characters per 2 UTF-16 units) MEASURED at 13,514 characters. 65,536 leaves ~4.8x
-// headroom over the largest URL the UI can generate, so no legitimate report is
-// rejected, while a runaway payload is refused instead of handed to the OS.
+// far above anything the product can produce.
+//
+// CORRECTED (GATE F4). This comment, and the matching one in external-open.ts, used
+// to say the worst case was "emoji, 12 characters per 2 UTF-16 units" MEASURED at
+// 13,514 characters with "~4.8x headroom". That was wrong on the digit AND named the
+// wrong script. Per UTF-16 CODE UNIT, a 3-byte BMP character such as CJK U+65E5 is
+// ONE unit expanding to 9 URL characters, while a 4-byte astral emoji is TWO units
+// expanding to 12, i.e. only 6 per unit — so CJK expands 1.5x further than emoji and
+// emoji is the cheaper case. MEASURED over validator-accepted payloads:
+//
+//   emoji, no e-mail / no diagnostic    13,346
+//   emoji, 320-unit e-mail + diagnostic 15,454
+//   CJK,   no e-mail / no diagnostic    19,946
+//   CJK,   320-unit e-mail + diagnostic 23,014   <- the true maximum
+//
+// Real headroom is therefore 65,536 / 23,014 = 2.85x, not 4.8x. Still ample, and the
+// conclusion is unchanged — no legitimate report approaches the cap while a runaway
+// payload is refused instead of handed to the OS — but a future reader sizing this cap
+// must not be told emoji is the worst case. The figures are now pinned by assertion
+// below rather than left as prose that can rot.
 //
 // F2 (LOW) — THE "ONLY external-open MAY HOLD shell.openExternal" GUARD GREPS ONE
 // SPELLING.
@@ -75,8 +90,16 @@ const built = (name) => pathToFileURL(join(root, 'build', 'src', 'main', name)).
 const { openRepoUrl, REPO_ISSUES_URL } = await import(built('external-open.js'));
 const { openGitHubIssue } = await import(built('feedback-service.js'));
 
-/** The largest URL the product can actually generate, measured, plus headroom. */
-const UI_WORST_CASE_MEASURED = 13_514;
+/**
+ * The largest URL the product can actually generate, MEASURED over
+ * validator-accepted payloads: a CJK title, a CJK description, a 320-unit CJK
+ * e-mail and `attachDiagnostic = true`. The figure this file used to carry was
+ * 13,514 with emoji named as the worst case; both were wrong (GATE F4).
+ */
+const UI_MAX_URL_MEASURED = 23_014;
+/** The same payload shape in emoji, which is the CHEAPER case, not the worst. */
+const UI_MAX_URL_EMOJI_MEASURED = 15_454;
+const REPO_DOOR_CAP = 65_536;
 
 test('F1: the second door refuses a runaway payload instead of handing it to the OS', async () => {
   // 10 MB reached shell.openExternal before this fix.
@@ -96,10 +119,15 @@ test('F1: the bound is far above anything the product can generate', async () =>
   // The cap must not be the thing that breaks real feedback. These are the
   // renderer's own limits (TITLE_MAX 100, DESCRIPTION_MAX 2000) in the worst
   // encodings, which is what made reusing the 2048 cap wrong in the first place.
+  // CJK is included because it is the WORST case (GATE F4): 9 URL characters per
+  // UTF-16 unit against emoji's 6. It was missing from this list, which is part of
+  // why the stale 13,514 figure survived — the scenario that actually produces the
+  // maximum was never exercised here.
   const scenarios = [
     ['UI-max ASCII with spaces', { title: 'T'.repeat(100), description: 'word '.repeat(400).trim() }],
     ['UI-max Cyrillic', { title: '\u0417'.repeat(100), description: '\u041E'.repeat(2000) }],
-    ['UI-max emoji', { title: '\u{1F389}'.repeat(50), description: '\u{1F389}'.repeat(1000) }]
+    ['UI-max emoji', { title: '\u{1F389}'.repeat(50), description: '\u{1F389}'.repeat(1000) }],
+    ['UI-max CJK (the true worst case)', { title: '\u65E5'.repeat(100), description: '\u672C'.repeat(2000) }]
   ];
   for (const [label, fields] of scenarios) {
     openedUrls.length = 0;
@@ -111,10 +139,66 @@ test('F1: the bound is far above anything the product can generate', async () =>
     // The point of the second door: still comfortably past the primary door's cap.
     assert.ok(openedUrls[0].length > 2048, `still exceeds the 2048 cap, as measured: ${label}`);
     assert.ok(
-      openedUrls[0].length <= UI_WORST_CASE_MEASURED + 2000,
-      `measured ${openedUrls[0].length}; if this grew, re-derive the cap: ${label}`
+      openedUrls[0].length <= UI_MAX_URL_MEASURED,
+      `measured ${openedUrls[0].length}; if this grew past the measured maximum ${UI_MAX_URL_MEASURED}, re-derive the cap: ${label}`
     );
   }
+});
+
+test('F4: the measured maxima are pinned, and CJK is the worst script — not emoji', async () => {
+  // GATE F4. No behavioural RED test exists for a stale comment, so the figures are
+  // pinned by assertion instead: if the maximum moves, this fails and the comments
+  // must be re-derived rather than silently rotting.
+  const ceiling = (script) => ({
+    type: 'bug',
+    title: script.title,
+    description: script.description,
+    email: script.email,
+    attachDiagnostic: true
+  });
+  const cjk = {
+    title: '\u65E5'.repeat(100),
+    description: '\u672C'.repeat(2000),
+    email: '\u65E5'.repeat(320)
+  };
+  const emoji = {
+    title: '\u{1F389}'.repeat(50),
+    description: '\u{1F389}'.repeat(1000),
+    email: '\u{1F389}'.repeat(160)
+  };
+
+  openedUrls.length = 0;
+  await openGitHubIssue(ceiling(cjk));
+  const cjkLength = openedUrls[0].length;
+  openedUrls.length = 0;
+  await openGitHubIssue(ceiling(emoji));
+  const emojiLength = openedUrls[0].length;
+
+  assert.equal(cjkLength, UI_MAX_URL_MEASURED, `the CJK maximum moved (got ${cjkLength}); re-derive MAX_REPO_URL_LENGTH's comment`);
+  assert.equal(emojiLength, UI_MAX_URL_EMOJI_MEASURED, `the emoji maximum moved (got ${emojiLength})`);
+  assert.ok(cjkLength > emojiLength, 'CJK must be the worst case; the old comment naming emoji was backwards');
+
+  // Per-unit arithmetic, which is WHY CJK is worse: 3 UTF-8 bytes in one UTF-16 unit
+  // is 9 URL characters per unit; 4 bytes across two units is 12, i.e. 6 per unit.
+  assert.equal(encodeURIComponent('\u65E5').length / '\u65E5'.length, 9);
+  assert.equal(encodeURIComponent('\u{1F389}').length / '\u{1F389}'.length, 6);
+
+  // The headroom the comment claims must be the real one.
+  assert.ok(cjkLength < REPO_DOOR_CAP, `the maximum must fit the door cap ${REPO_DOOR_CAP}`);
+  assert.equal(
+    (REPO_DOOR_CAP / cjkLength).toFixed(2),
+    '2.85',
+    'the stated headroom must match the measurement (the old comment claimed 4.8x)'
+  );
+
+  // And the stale CLAIMS must be gone from the module that sizes the cap. Targeted at
+  // the phrasing, not the digits: the file keeps a historical note saying the old
+  // figure was wrong, which is what stops it being restored in good faith.
+  const source = readFileSync(join(root, 'src', 'main', 'external-open.ts'), 'utf8');
+  assert.doesNotMatch(source, /MEASURED at 13,514 characters/, 'the stale 13,514 claim must be gone');
+  assert.doesNotMatch(source, /leaves roughly 4\.8x headroom/, 'the stale 4.8x headroom claim must be gone');
+  assert.match(source, /2\.85x/, 'the corrected headroom must be stated');
+  console.log(`\n  measured: CJK ${cjkLength}, emoji ${emojiLength}, door cap ${REPO_DOOR_CAP}, headroom ${(REPO_DOOR_CAP / cjkLength).toFixed(2)}x`);
 });
 
 test('F1: the door is bounded by an explicit constant, not by redaction.ts truncation', () => {

@@ -53,12 +53,26 @@ const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[
  * WHAT THE USER LOSES, stated exactly: one U+FFFD per lone surrogate, substituted
  * in place, with the surrounding text and the string length untouched. A lone
  * surrogate is not a character — it is half of one, it has no rendering, and it is
- * already broken on arrival. U+FFFD is not an invention of this fix either: it is
- * what UTF-8 encoding itself substitutes, MEASURED as
- * `Buffer.from("ab\uD800cd", "utf8") === 6162 efbfbd 6364`, which is what the local
- * SAVE path above already effectively writes to disk. So the two feedback paths now
- * agree rather than one of them inventing a behaviour, and the trade is one
- * unrenderable half character against the entire report.
+ * already broken on arrival. U+FFFD is not an invention of this fix either: it is what
+ * raw UTF-8 encoding substitutes, MEASURED as
+ * `Buffer.from("ab\uD800cd", "utf8") === 6162 efbfbd 6364`.
+ *
+ * WHAT THIS COMMENT USED TO CLAIM, AND WHY IT WAS WRONG. It said the substitution "is
+ * what the local SAVE path above already effectively writes to disk", i.e. that the
+ * two feedback paths agree. MEASURED, they do NOT. The save path does not encode the
+ * string as raw UTF-8; it goes through `JSON.stringify`, which emits the lone
+ * surrogate as a `\uXXXX` ESCAPE and therefore preserves it:
+ *
+ *   JSON.stringify({ description: "ab\uD800cd" })  ->  {"description":"ab\ud800cd"}
+ *   those bytes contain NO efbfbd
+ *
+ * So the save path keeps the broken half character and the URL path replaces it. The
+ * substitution here is still the right behaviour on its own merits — a lone surrogate
+ * makes `encodeURIComponent` throw and cost the user their entire report, it has no
+ * rendering, and one U+FFFD is a far smaller loss than the whole report — but it is
+ * NOT justified by agreement with the save path, because there is none. The two paths
+ * differ, deliberately: JSON has an escape for an unpaired surrogate and a URL does
+ * not.
  *
  * The alternative — surfacing an error instead — was rejected because it cannot be
  * done honestly. There is no existing localised string meaning "your text contains

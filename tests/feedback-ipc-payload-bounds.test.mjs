@@ -536,6 +536,146 @@ test('R1: the bound is stated at the boundary, not inherited from redaction.ts',
   );
 });
 
+// ---------------------------------------------------------------------------
+// GATE F2 / F4 (LOW) — THREE SHIPPED FIGURES WERE WRONG. No behavioural RED test
+// is possible for a comment: a stale number breaks nothing at runtime, so there is
+// nothing to make fail first, and claiming otherwise would be inventing a proof.
+// What IS possible, and is done here, is pinning the arithmetic and the measured
+// maximum by assertion so the figures cannot rot again without failing the suite.
+// ---------------------------------------------------------------------------
+
+test('F2/F4: the per-unit expansion arithmetic is what the comments claim', () => {
+  // The load-bearing claim behind every figure in these files, and the one the
+  // external-open.ts comment got backwards by naming emoji as the worst case.
+  // A 3-byte BMP character is ONE UTF-16 unit expanding to 9 URL characters.
+  assert.equal(encodeURIComponent('\u65E5').length, 9, 'CJK U+65E5 must expand to 9 URL characters');
+  assert.equal('\u65E5'.length, 1, 'and occupy one UTF-16 code unit');
+  // A 4-byte astral character is TWO units expanding to 12, i.e. only 6 per unit.
+  assert.equal(encodeURIComponent('\u{1F389}').length, 12, 'an astral emoji must expand to 12 URL characters');
+  assert.equal('\u{1F389}'.length, 2, 'across two UTF-16 code units');
+  assert.equal(
+    encodeURIComponent('\u{1F389}').length / '\u{1F389}'.length,
+    6,
+    'so emoji is 6 URL characters per unit'
+  );
+  // Therefore CJK is the worst script, by exactly 1.5x per unit.
+  assert.ok(
+    encodeURIComponent('\u65E5').length / '\u65E5'.length >
+      encodeURIComponent('\u{1F389}').length / '\u{1F389}'.length,
+    'CJK must expand further per UTF-16 unit than emoji — this is why CJK is the worst case, not emoji'
+  );
+});
+
+test('F2/F4: the MEASURED maximum URL matches the figure the comments now state', async () => {
+  // The true maximum over validator-accepted payloads. The figure previously stated
+  // in feedback-validation.ts was 20,147, which is this payload with an ASCII e-mail
+  // instead of a CJK one — 320 units of ASCII e-mail add 201 URL characters where 320
+  // units of CJK add 2,868.
+  const ceiling = {
+    type: 'bug',
+    title: '\u65E5'.repeat(FEEDBACK_TITLE_MAX),
+    description: '\u672C'.repeat(FEEDBACK_DESCRIPTION_MAX),
+    email: '\u65E5'.repeat(FEEDBACK_EMAIL_MAX),
+    attachDiagnostic: true
+  };
+  assert.doesNotThrow(() => snapshotFeedbackData(ceiling), 'the ceiling payload must be valid');
+  openedUrls.length = 0;
+  await openGitHubIssue(ceiling);
+  assert.equal(openedUrls.length, 1, 'the ceiling payload must still open');
+  assert.equal(
+    openedUrls[0].length,
+    MEASURED_MAX_URL,
+    `the measured maximum moved; re-derive the figures in feedback-validation.ts and external-open.ts (got ${openedUrls[0].length})`
+  );
+
+  // It must sit under the derived bound and the door cap, which is what makes the
+  // validator's stated guarantee true.
+  assert.ok(MEASURED_MAX_URL < DERIVED_BOUND, `measured max ${MEASURED_MAX_URL} must fit the derived bound ${DERIVED_BOUND}`);
+  assert.ok(MEASURED_MAX_URL < REPO_DOOR_CAP, `measured max ${MEASURED_MAX_URL} must fit the door cap ${REPO_DOOR_CAP}`);
+
+  // And CJK really is worse than emoji end to end, not just per unit.
+  openedUrls.length = 0;
+  await openGitHubIssue({
+    type: 'bug',
+    title: '\u{1F389}'.repeat(FEEDBACK_TITLE_MAX / 2),
+    description: '\u{1F389}'.repeat(FEEDBACK_DESCRIPTION_MAX / 2),
+    email: '\u{1F389}'.repeat(FEEDBACK_EMAIL_MAX / 2),
+    attachDiagnostic: true
+  });
+  const emojiMax = openedUrls[0].length;
+  assert.equal(emojiMax, 15_454, `the emoji maximum moved; it was measured at 15,454 (got ${emojiMax})`);
+  assert.ok(emojiMax < MEASURED_MAX_URL, 'the emoji case must be CHEAPER than CJK, which is why naming it the worst case was wrong');
+
+  console.log(`\n  measured maxima: CJK ${MEASURED_MAX_URL}, emoji ${emojiMax}; derived bound ${DERIVED_BOUND}, door cap ${REPO_DOOR_CAP} (headroom ${(REPO_DOOR_CAP / MEASURED_MAX_URL).toFixed(2)}x)`);
+});
+
+test('F2/F4: the source comments state the corrected figures, not the stale claims', () => {
+  const externalOpenSource = readFileSync(join(root, 'src', 'main', 'external-open.ts'), 'utf8');
+
+  // The stale CLAIMS must be gone. These target the claim PHRASING rather than the
+  // bare digits on purpose: both files deliberately keep a short historical note
+  // recording that the old figure was wrong and what replaced it, because deleting
+  // that note is how a future reader "restores" the old number in good faith. So what
+  // must not survive is the assertion that those figures are current.
+  // NOTE ON THE PHRASING OF THIS REGEX. The first attempt was
+  // /largest URL the UI can produce is 20,147/, which could NEVER match: the stale
+  // comment wrapped that sentence as "the largest URL the UI can\n * produce is
+  // 20,147 characters", so the assertion passed vacuously and proved nothing. It is
+  // now anchored on a fragment that really did sit on one line in the stale text —
+  // verified against the pre-fix revision, see the non-vacuity test below.
+  assert.doesNotMatch(
+    validationSource,
+    /produce is 20,147 characters/,
+    'feedback-validation.ts must no longer CLAIM 20,147 is the maximum'
+  );
+  assert.doesNotMatch(
+    externalOpenSource,
+    /MEASURED at 13,514 characters/,
+    'external-open.ts must no longer CLAIM 13,514 as the measured worst case'
+  );
+  assert.doesNotMatch(
+    externalOpenSource,
+    /leaves roughly 4\.8x headroom/,
+    'external-open.ts must no longer CLAIM 4.8x headroom'
+  );
+
+  // And the corrected ones must be present, so prose and measurement agree.
+  assert.match(validationSource, /23,014/, 'feedback-validation.ts must state the measured 23,014 maximum');
+  assert.match(externalOpenSource, /23,014/, 'external-open.ts must state the measured 23,014 maximum');
+  assert.match(externalOpenSource, /2\.85x/, 'external-open.ts must state the real 2.85x headroom');
+  // The worst-case SCRIPT must be named correctly in the file that sizes the cap.
+  assert.match(
+    externalOpenSource,
+    /WORST-CASE SCRIPT IS CJK, NOT EMOJI/,
+    'external-open.ts must name CJK as the worst case, since it expands 9 URL characters per unit against emoji 6'
+  );
+});
+
+test('F2/F4: those stale-claim regexes are NOT vacuous — they match the text they replaced', () => {
+  // A `doesNotMatch` assertion against prose is worthless if the pattern could never
+  // have matched anything. That is not hypothetical here: the first version of the
+  // check above used /largest URL the UI can produce is 20,147/, and the stale comment
+  // wrapped that sentence across two lines, so it passed while proving nothing.
+  //
+  // The exact stale fragments are reproduced below, copied from the pre-fix revision
+  // b1a9dfd, and each regex must MATCH them. So if a future edit reinstates the old
+  // wording, the assertions above really do fail.
+  const staleValidation = [
+    ' * bytes and 18,000 URL characters. MEASURED end to end, the largest URL the UI can',
+    ' * produce is 20,147 characters, with title and description both full of CJK — NOT',
+    ' * the emoji case, which measures 13,547.'
+  ].join('\n');
+  const staleExternalOpen = [
+    ' * the worst-case encoding of those limits (emoji, 12 characters per 2 UTF-16',
+    ' * units) MEASURED at 13,514 characters. 65,536 leaves roughly 4.8x headroom over',
+    ' * the largest URL the UI can produce, while a runaway payload is refused here'
+  ].join('\n');
+
+  assert.match(staleValidation, /produce is 20,147 characters/, 'the 20,147 pattern must match the text it replaced');
+  assert.match(staleExternalOpen, /MEASURED at 13,514 characters/, 'the 13,514 pattern must match the text it replaced');
+  assert.match(staleExternalOpen, /leaves roughly 4\.8x headroom/, 'the 4.8x pattern must match the text it replaced');
+});
+
 test('R1: a validated payload can never exceed the repository door cap', () => {
   // The bound must be DERIVED, not hoped for. encodeURIComponent expands at most 9
   // URL characters per UTF-16 code unit (a 3-byte BMP character such as U+65E5 ->

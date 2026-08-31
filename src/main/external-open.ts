@@ -98,11 +98,28 @@ const MAX_EXTERNAL_URL_LENGTH = 2048;
  * without ever looking at this file.
  *
  * The number is chosen so the cap can never be what breaks legitimate feedback:
- * the renderer caps the title at 100 and the description at 2000 characters, and
- * the worst-case encoding of those limits (emoji, 12 characters per 2 UTF-16
- * units) MEASURED at 13,514 characters. 65,536 leaves roughly 4.8x headroom over
- * the largest URL the UI can produce, while a runaway payload is refused here
- * instead of becoming a multi-megabyte argument to the OS.
+ * the renderer caps the title at 100 units, the description at 2000 and the
+ * validator caps the e-mail at 320.
+ *
+ * THE WORST-CASE SCRIPT IS CJK, NOT EMOJI. A 3-byte BMP character such as U+65E5
+ * occupies ONE UTF-16 code unit and expands to 9 URL characters (`%E6%97%A5`),
+ * whereas a 4-byte astral emoji occupies TWO units and expands to 12, i.e. only 6
+ * per unit. So the emoji case is the *cheaper* one and naming it as the worst case
+ * was backwards. MEASURED end to end over validator-accepted payloads:
+ *
+ *   emoji, no e-mail / no diagnostic   13,346
+ *   emoji, 320-unit e-mail + diagnostic 15,454
+ *   CJK,   no e-mail / no diagnostic   19,946
+ *   CJK,   320-unit e-mail + diagnostic 23,014   <- the true maximum
+ *
+ * This comment previously stated 13,514 characters and "~4.8x headroom", which was
+ * wrong on the digit and named the wrong script. Real headroom is 65,536 / 23,014 =
+ * 2.85x. That is still ample — a runaway payload is refused here instead of becoming
+ * a multi-megabyte argument to the OS, and no legitimate report comes close — but a
+ * future reader sizing this cap must not be told emoji is the worst case when CJK
+ * expands 1.5x further per unit. The 23,014 figure is pinned by
+ * `tests/feedback-ipc-payload-bounds.test.mjs` and
+ * `tests/external-open-second-door-bounds.test.mjs` so it cannot go stale again.
  */
 const MAX_REPO_URL_LENGTH = 65_536;
 
