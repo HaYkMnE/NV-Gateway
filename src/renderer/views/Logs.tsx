@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { AlertTriangle, Lightbulb, Send, X } from 'lucide-react';
@@ -9,6 +9,7 @@ import { useGatewayLifecycle } from '../lib/gateway-lifecycle';
 import { useModal } from '../lib/modal-context';
 
 type Log = Record<string, unknown> & { level?: string; message?: string; timestamp?: string; time?: string };
+interface LogLine { key: string; text: string; label: string; cls: string }
 
 export function Logs() {
   const { t } = useTranslation();
@@ -52,7 +53,25 @@ export function Logs() {
     data: query.data?.logs,
     stale: query.isError && Boolean(query.data),
   });
-  const lines = useMemo(() => logs.map(formatLog), [logs]);
+  // Format ONCE per log entry (previously the render called formatLog twice per
+  // row — aria-label + content — on every render) and hand memoized rows stable
+  // string props. Structural sharing keeps `logs` (and therefore `lines` and
+  // every row's strings) referentially stable across unchanged polls, so a
+  // poll/state-driven re-render of this view then costs ~zero row work instead
+  // of 2N formatLog calls + N element diffs for N rows.
+  const lines = useMemo<LogLine[]>(
+    () =>
+      logs.map((log, index) => {
+        const text = formatLog(log);
+        return {
+          key: log.id ? String(log.id) : `${log.timestamp ?? log.time ?? ''}-${index}-${log.message ?? ''}`,
+          text,
+          label: `${String(log.level ?? 'log')}: ${text}`,
+          cls: levelClass(log.level),
+        };
+      }),
+    [logs]
+  );
   useEffect(
     () => {
       if (autoScroll) {
@@ -132,7 +151,7 @@ export function Logs() {
   // length and the cap main enforces, so it names the size itself; any other
   // failure carries the real error detail, like Dashboard, Endpoint and Models.
   const copy = async () => {
-    const text = lines.join('\n');
+    const text = lines.map((line) => line.text).join('\n');
     try {
       await window.electronAPI.clipboard.writeText(text);
       setCopyError(null);
@@ -262,14 +281,8 @@ export function Logs() {
           aria-label={t('logs')}
           className="flex-1 bg-bg border border-border p-4 text-sm font-mono overflow-y-auto min-w-0"
         >
-          {logs.map((log, index) => (
-            <li
-              aria-label={`${String(log.level ?? 'log')}: ${formatLog(log)}`}
-              key={log.id ? String(log.id) : `${log.timestamp ?? log.time ?? ''}-${index}-${log.message ?? ''}`}
-              className={`py-1 whitespace-pre-wrap break-words ${levelClass(log.level)}`}
-            >
-              {formatLog(log)}
-            </li>
+          {lines.map((line) => (
+            <LogRow key={line.key} label={line.label} cls={line.cls} text={line.text} />
           ))}
         </ol>
       )}
@@ -360,6 +373,16 @@ function SendErrorsDialog({ count, preview, previewLoading, sending, onClose, on
     </div>
   );
 }
+
+// Memoized row: all props are stable strings (see the `lines` memo), so an
+// unchanged line bails out of re-render entirely when the view re-renders.
+const LogRow = memo(function LogRow({ label, cls, text }: { label: string; cls: string; text: string }) {
+  return (
+    <li aria-label={label} className={`py-1 whitespace-pre-wrap break-words ${cls}`}>
+      {text}
+    </li>
+  );
+});
 
 function formatLog(log: Log): string {
   return [

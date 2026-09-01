@@ -168,8 +168,23 @@ function ModelsSection() {
 
 export function Settings() {
   const { t, i18n } = useTranslation(); const navigate = useNavigate(); const client = useQueryClient(); const { setConfig } = useConfigStore(); const { openFeedback } = useModal();
-  const query = useQuery({ queryKey: queryKeys.runtime, queryFn: api.runtime, refetchInterval: 3000 });
-  const updatesQuery = useQuery({ queryKey: queryKeys.updates, queryFn: api.updateStatus, refetchInterval: 2000 });
+  // Runtime state changes only through this UI's own mutations (each of which
+  // invalidates this query immediately) or through rare external config edits;
+  // a 15s poll is a safety net, not the freshness mechanism. Every call costs
+  // main a synchronous config-file read (get-runtime-state in src/main), so
+  // 3s was ~20 blocking reads/min for information that virtually never changes.
+  const query = useQuery({ queryKey: queryKeys.runtime, queryFn: api.runtime, refetchInterval: 15000 });
+  // Poll fast only while an update check/download is actually in flight (the
+  // progress UX needs it); idle states change on user actions and updater
+  // events, not on a 2s cadence.
+  const updatesQuery = useQuery({
+    queryKey: queryKeys.updates,
+    queryFn: api.updateStatus,
+    refetchInterval: (q) => {
+      const state = (q.state.data as UpdaterStatus | undefined)?.state;
+      return state === 'checking' || state === 'downloading' ? 2000 : 10000;
+    },
+  });
   const checkUpdates = useMutation({ mutationFn: window.electronAPI.checkForUpdates, onSettled: () => client.invalidateQueries({ queryKey: queryKeys.updates }) });
   const autoLaunch = useMutation({ mutationFn: window.electronAPI.toggleAutoLaunch, onSuccess: () => client.invalidateQueries({ queryKey: queryKeys.runtime }) });
   const performanceModeMutation = useMutation({ mutationFn: async (mode: 'day' | 'night' | 'auto') => { const config = await window.electronAPI.setAppConfig({ performanceMode: mode }); setConfig(config); client.setQueryData(queryKeys.runtime, (prev: unknown) => prev && typeof prev === 'object' ? { ...(prev as object), performanceMode: mode } : prev); return config; }, onSuccess: () => client.invalidateQueries({ queryKey: queryKeys.runtime }) });

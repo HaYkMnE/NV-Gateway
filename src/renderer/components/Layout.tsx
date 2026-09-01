@@ -119,7 +119,14 @@ export function Layout() {
     queryKey: ['gateway-status'],
     queryFn: () => window.electronAPI.getGatewayStatus(),
     refetchInterval: 1000,
-    refetchIntervalInBackground: true,
+    // Default refetchIntervalInBackground (false) follows document.visibilityState,
+    // so the poll pauses when the window is hidden or minimised to tray — the
+    // previous `true` burned ~60 IPC round-trips per minute indefinitely on a
+    // window nobody could see. The status display itself cannot go stale while
+    // hidden BECAUSE it is hidden; on reveal, refetchOnWindowFocus (overriding
+    // the global false in App.tsx) picks up any change immediately, and the
+    // resumed 1s interval is the standing safety net.
+    refetchOnWindowFocus: true,
   });
 
   const status: GatewayStatus = useMemo(() => {
