@@ -133,7 +133,25 @@ export function verifyBakedUpdateFeed({
 }
 
 function main() {
-  const result = verifyBakedUpdateFeed();
+  // The CI entry point resolves the packaged output ITSELF and ignores
+  // NVGW_PACKAGE_OUTPUT_DIRECTORY. That env override is a test seam, and leaving
+  // it live in `main` was a measured neutralisation of this guard: pointing it at
+  // any directory containing a hand-written win-unpacked/resources/app-update.yml
+  // makes the guard validate that file and exit 0 while the REAL dist/ carries no
+  // feed at all. Measured against this repo's own dist/ (no app-update.yml, a
+  // --dir build):
+  //
+  //   $env:NVGW_PACKAGE_OUTPUT_DIRECTORY = "C:\...\nvgw-poc"
+  //   node scripts/verify-baked-update-feed.mjs
+  //   [verify-baked-update-feed] baked update feed: github.com/HaYkMnE/... ; EXIT=0
+  //
+  // `|| true`, `if: always()`, upload-from-another-job and job-level
+  // continue-on-error were all closed on this guard; a single workflow-level `env:`
+  // entry reopened the same silent-success mode without touching any of them, and
+  // no wiring test asserted its absence. The override cannot reach the release
+  // path if the release path never reads it.
+  const root = path.resolve(import.meta.dirname, '..');
+  const result = verifyBakedUpdateFeed({ root, packageOutputDirectory: path.join(root, 'dist') });
   if (!result.ok) {
     console.error(`[verify-baked-update-feed] ${result.error}`);
     process.exitCode = 1;
