@@ -92,7 +92,34 @@ export function classifyCanonicalAdminRequest(method, requestTarget) {
     } catch { return { status: 404 }; }
 }
 
+// Mask a stored key for display. The first8/last4 windows overlap (or exactly
+// tile) for keys of 12 chars or fewer, publishing the WHOLE key in the list
+// response; short keys are therefore masked in full. Non-strings (a corrupt
+// state record) are masked rather than thrown over.
+function maskKeyMaterial(key) {
+    if (typeof key !== 'string' || key.length === 0) return '[REDACTED]';
+    if (key.length <= 12) return '***';
+    return key.substring(0, 8) + '...' + key.substring(key.length - 4);
+}
+
+// Failure detail for the catch-all 500 bodies. Sanitize THEN bound: bounding
+// first can truncate a secret mid-string so the redaction rules (exact runtime
+// secrets, nvapi-/Bearer patterns) no longer match the fragment that survives.
+export function sanitizeFailureDetail(err) {
+    const raw = err && typeof err.message === 'string' ? err.message : String(err);
+    return String(redact(raw)).slice(0, 256);
+}
+
 export async function handleAdminRequest(req, res, overrides = {}) {
+    // Cross-origin lockout. The ONLY legitimate admin caller is the Electron
+    // main process over node:http (src/main/admin-client.ts), which NEVER sends
+    // an Origin header. Every browser-driven request (fetch/XHR/form, including
+    // `Origin: null`) carries one, so its presence is conclusive: deny with no
+    // CORS headers emitted. This closes the remaining path a hostile web page
+    // could otherwise use — a bearer-protected endpoint is only unreachable
+    // from a browser while the token stays secret; with this check even a
+    // leaked token cannot be driven cross-origin.
+    if (typeof req.headers?.origin === 'string') return sendJson(res, 403, { error: 'Forbidden' });
     const classification = classifyCanonicalAdminRequest(req.method, req.url);
     if (classification.status !== 200) return sendJson(res, classification.status, { error: classification.status === 405 ? 'Method Not Allowed' : 'Not Found' });
     const parsedUrl = new URL(req.url, 'http://127.0.0.1');
@@ -106,7 +133,7 @@ export async function handleAdminRequest(req, res, overrides = {}) {
     if (req.method === 'GET' && req.url === '/admin/keys') {
         const safeKeys = listKeys().map(k => ({
             ...k,
-            key: k.key.substring(0, 8) + '...' + k.key.substring(k.key.length - 4)
+            key: maskKeyMaterial(k.key)
         }));
         return sendJson(res, 200, { keys: safeKeys });
     }
@@ -348,7 +375,7 @@ export async function handleAdminRequest(req, res, overrides = {}) {
             // refreshCatalog is defensive (never throws a search-level error), so
             // this branch is only reachable on a true unhandled runtime fault.
             // Surface the actual error message for parity with /admin/models/refresh.
-            return sendJson(res, 500, { error: `Failed to sync catalog: ${err && err.message ? err.message : String(err)}` });
+            return sendJson(res, 500, { error: `Failed to sync catalog: ${sanitizeFailureDetail(err)}` });
         }
     }
 
