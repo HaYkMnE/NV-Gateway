@@ -305,8 +305,36 @@ export function createAutoUpdateService(options: AutoUpdateServiceOptions): Auto
   }
 
   function setState(state: UpdateStateKind, version: string | null = null, percent: number | null = null): UpdaterStatus {
+    const previous = status;
     status = { state, version, percent };
-    onStatusChanged?.({ ...status });
+    // Notify ONLY on an actual change of the observable status.
+    //
+    // MEASURED against the built module with a fake updater: electron-updater
+    // emits "download-progress" per network chunk, not per percent. 5,000 ticks
+    // carrying fractional percents produced 101 throttled log records here (the
+    // in-module `lastLoggedPercent` throttle, whose comment promises "~100
+    // records per download instead of a record per tick") but 5,000
+    // onStatusChanged calls — a 49.5x amplification that defeated that throttle
+    // downstream.
+    //
+    // Production wires `onStatusChanged: () => updateTray()` (src/main/index.ts),
+    // and one updateTray() does a synchronous readAppConfig() (readFileSync +
+    // JSON.parse), a Menu.buildFromTemplate + setImage/setToolTip/setContextMenu,
+    // and one unthrottled `tray_status_update` log line. Measured cost of the
+    // amplified part of a single download: 5,000 synchronous config reads
+    // (5,339.6 ms total, ~1.07 ms each, on the main thread) and 600,000 bytes of
+    // tray_status_update records (120 B x 5,000). app-logger rotates at 5 MB
+    // keeping 3 files, so that noise evicts real diagnostics rather than growing
+    // unbounded.
+    //
+    // percent is already rounded by readPercent(), so consecutive ticks inside the
+    // same integer percent are genuinely indistinguishable to every consumer:
+    // getStatus() still returns the freshly assigned status, and the tray label
+    // (getUpdateMenuText) renders only state/version/percent. Suppressing a
+    // no-op notification cannot change what any observer can see.
+    if (previous.state !== state || previous.version !== version || previous.percent !== percent) {
+      onStatusChanged?.({ ...status });
+    }
     return { ...status };
   }
 
