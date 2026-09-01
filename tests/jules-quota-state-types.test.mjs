@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
@@ -107,7 +108,45 @@ test('the quota-state reader still tolerates both spellings', () => {
     'the session counter must keep its 0 default');
 });
 
-test('the committed quota-state.json holds a real null, not a string', () => {
+/**
+ * Runs git and returns its exit status alongside stdout.
+ *
+ * `git check-ignore` exits 1 to mean "no match", which execFileSync turns into a
+ * throw; a thrown spawn error would masquerade as a missing ignore rule. Reading
+ * the status explicitly keeps a real "not ignored" result distinguishable from
+ * git being unavailable.
+ */
+function git(args) {
+  const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
+  if (result.error) assert.fail(`git ${args.join(' ')} could not be run: ${result.error.message}`);
+  return { status: result.status, stdout: (result.stdout ?? '').trim() };
+}
+
+test('quota-state.json is RUNTIME state and is not tracked in git', () => {
+  // quota-state.json is a mutable per-run counter that a scheduled workflow
+  // rewrites and commits back, so tracking it wrote runtime state into the
+  // project's permanent history. It is a cache, not source: untracked and
+  // ignored, exactly like keys.json and config.json above it in .gitignore.
+  const tracked = git(['ls-files', '--', '.jules/state/quota-state.json']);
+  assert.equal(tracked.status, 0, 'git ls-files must succeed');
+  assert.equal(tracked.stdout, '',
+    'quota-state.json must not be tracked: it is runtime state, not source');
+
+  // check-ignore deliberately reports nothing for a TRACKED path, so this also
+  // fails while the file is still in the index — the two assertions reinforce
+  // each other rather than duplicating.
+  const ignored = git(['check-ignore', '--', '.jules/state/quota-state.json']);
+  assert.equal(ignored.status, 0,
+    'quota-state.json must match an ignore rule so a local run cannot re-commit runtime state');
+  assert.equal(ignored.stdout, '.jules/state/quota-state.json');
+});
+
+test('when a local quota-state.json exists it still holds the right TYPES', () => {
+  // Absence is the correct state for a fresh clone, so absence is not a failure.
+  // Whenever a local file DOES exist (a developer or workflow run produced one),
+  // its types must still be right: exhausted_date strictly null or YYYY-MM-DD,
+  // never the four-character string "null" that `jq --arg` would produce.
+  if (!fs.existsSync(statePath)) return;
   const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
   assert.ok(Object.hasOwn(state, 'exhausted_date'), 'quota-state.json must carry exhausted_date');
   // strictly null, or a date string — "null" is neither.

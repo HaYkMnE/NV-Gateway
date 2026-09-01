@@ -4,6 +4,13 @@ keys.json
 /config/config.json
 !/config/config.example.json
 telemetry-bundle.json
+# Mutable per-run counter that the Jules workflows rewrite and commit back
+# (.github/workflows/autonomous-analysis.yml, autonomous-quota-reset.yml). It is
+# a cache, not source: tracking it wrote runtime state into permanent history.
+# Both workflows `mkdir -p .jules/state` and tolerate the file being absent
+# ("quota-state.json missing — first run. Proceeding."), so an untracked cache is
+# the shape they already expect.
+.jules/state/quota-state.json
 runtime/
 logs/
 *.log
