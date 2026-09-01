@@ -392,7 +392,7 @@ export function addKey(value) {
   const result = { id: crypto.randomUUID(), key, status: "active", backoffUntil: 0, usage: { success: 0, fail: 0, tokens: 0, lastUsed: 0 }, accessibleModels: [] };
   keys.push(result); saveState(); info("Key added", { id: result.id, keyCount: keys.length }); return result;
 }
-export function removeKey(id) { const before = keys.length; keys = keys.filter((item) => item.id !== id); if (keys.length === before) return false; saveState(); return true; }
+export function removeKey(id) { const before = keys.length; keys = keys.filter((item) => item.id !== id); if (keys.length === before) return false; quotaRetries.delete(id); saveState(); return true; }
 /**
  * Admin status transition. VALIDATED against STATUSES: normalize() guards this
  * on load, but the setter used to write any string through, and an out-of-set

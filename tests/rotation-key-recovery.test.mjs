@@ -29,6 +29,7 @@ const {
   setPersistenceAdapter,
   closeStateWatcher,
   markKeyUsedAndDebounceSave,
+  removeKey,
   QUOTA_RETRY_BASE_MS,
   QUOTA_RETRY_MAX_MS
 } = rotation;
@@ -190,6 +191,33 @@ test('DEFECT1-E: a success clears the escalation ladder so a recovered key resta
   assert.ok(Math.abs(afterSuccess - first) <= 1500,
     `after a success the ladder must restart at the base ${first}ms, got ${afterSuccess}ms`);
   assert.ok(afterSuccess < second, 'a recovered key must not keep carrying the escalated penalty');
+});
+
+test('DEFECT1-F: removeKey drops the escalation ladder — a re-added id restarts at the base', () => {
+  // NOTE: ID(n) is only valid for single-digit n; this id must also be unique
+  // in this file because the in-memory ladder is module-scoped.
+  const id = 'f0f0f0f0-f0f0-4f0f-8f0f-f0f0f0f0f0f0';
+  const parkWindowMs = () => {
+    const before = Date.now();
+    handleKeyError(id, 429, 'insufficient credits', null);
+    const key = getKeys().find((k) => k.id === id);
+    assert.equal(key.status, 'quota-exceeded', 'credit exhaustion must park the key');
+    return key.backoffUntil - before;
+  };
+
+  initializeState({ keys: [{ id, key: 'kr', status: 'active', backoffUntil: 0, usage: usage(0) }] });
+  parkWindowMs(); // ladder level 1 (base)
+  const escalated = parkWindowMs(); // same live id: ladder level 2
+  assert.ok(escalated > QUOTA_RETRY_BASE_MS + 60_000,
+    `consecutive failures on a live key must escalate first: ${escalated}ms`);
+
+  removeKey(id);
+  // The id gets a second life (state re-push / re-add with the stored id). Its
+  // escalation history must not follow it across the deletion.
+  initializeState({ keys: [{ id, key: 'kr', status: 'active', backoffUntil: 0, usage: usage(0) }] });
+  const afterReadd = parkWindowMs();
+  assert.ok(Math.abs(afterReadd - QUOTA_RETRY_BASE_MS) <= 1500,
+    `a removed id must restart at the base ${QUOTA_RETRY_BASE_MS}ms, got ${afterReadd}ms`);
 });
 
 // ---------------------------------------------------------------------------
