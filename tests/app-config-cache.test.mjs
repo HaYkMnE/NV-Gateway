@@ -130,14 +130,24 @@ test('the write merge base is never served from the cache', () => {
   // If that merge base were the CACHE, then a config change made by a different
   // writer (or externally) would be overwritten by whatever the cache still
   // held -- a silent revert of fields the user had just set.
+  //
+  // THE SEQUENCE HERE IS LOAD-BEARING, and the obvious one does NOT work.
+  // Arming the cache and then calling writeGatewayPort proves nothing: that
+  // writer INVALIDATES, so a cached merge base would re-read from disk and be
+  // correct by accident. MEASURED: with the merge base deliberately swapped to
+  // readAppConfigCached in the built module, that sequence still wrote 41777 and
+  // still passed. The change must therefore reach disk WITHOUT invalidating,
+  // which is exactly what an external edit does. Same mutation, this sequence:
+  // the port reverted to 41100.
   const { dir, configPath } = scratchConfig(baseConfig);
   try {
     built.invalidateAppConfigCache();
     built.readAppConfigCached(configPath); // arm the cache with gatewayPort 41100
 
-    // A writer that does not go through writeAppConfig changes the port...
-    built.writeGatewayPort(configPath, 41777);
-    // ...and now an unrelated writeAppConfig must PRESERVE it, not resurrect 41100.
+    // The file changes behind the app's back, leaving the cache armed and stale.
+    fs.writeFileSync(configPath, JSON.stringify({ ...baseConfig, gatewayPort: 41777 }, null, 2), 'utf8');
+
+    // An unrelated writeAppConfig must PRESERVE that port, not resurrect 41100.
     built.writeAppConfig(configPath, { language: 'zh' });
 
     const onDisk = JSON.parse(fs.readFileSync(configPath, 'utf8'));
@@ -147,6 +157,154 @@ test('the write merge base is never served from the cache', () => {
     assert.equal(onDisk.language, 'zh', 'the requested update must still land');
     assert.deepEqual(onDisk.modelLimits, baseConfig.modelLimits,
       'raw passthrough fields such as modelLimits must survive a merge');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a bypassing writer still leaves the port intact through a later writeAppConfig', () => {
+  // The original form of the guard above, kept because it is the real user story
+  // (retry-gateway writes the port, then the user changes language). It passes
+  // for two independent reasons, so it is NOT sufficient on its own -- see the
+  // external-edit sequence above for the one that actually discriminates.
+  const { dir, configPath } = scratchConfig(baseConfig);
+  try {
+    built.invalidateAppConfigCache();
+    built.readAppConfigCached(configPath);
+    built.writeGatewayPort(configPath, 41777);
+    built.writeAppConfig(configPath, { language: 'zh' });
+    const onDisk = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    assert.equal(onDisk.gatewayPort, 41777, 'a retried port must survive a later config write');
+    assert.equal(onDisk.language, 'zh', 'the requested update must still land');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('EVERY writer in the module invalidates, including the one that recreates the file', () => {
+  // ensureGatewayRuntime is the THIRD writer of config.json in this module and
+  // the easiest to miss, because it only writes when the file is ABSENT. If
+  // config.json disappears while the app runs -- a cleanup script, a synced or
+  // roamed userData directory, a user deleting it -- this rewrites DEFAULTS.
+  // MEASURED before the fix: disk 12000, cached parse still 41100.
+  const { dir, configPath } = scratchConfig(baseConfig);
+  try {
+    built.invalidateAppConfigCache();
+    assert.equal(built.readAppConfigCached(configPath).gatewayPort, 41100, 'precondition');
+
+    fs.rmSync(configPath, { force: true });
+    built.ensureGatewayRuntime(dir);
+
+    const onDisk = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    assert.equal(built.readAppConfigCached(configPath).gatewayPort, onDisk.gatewayPort,
+      'ensureGatewayRuntime rewrote config.json with defaults and left the cache armed with the '
+      + 'old parse. A writer that does not invalidate makes the set of writers that must remember '
+      + 'to do so grow silently, which is the whole failure mode this cache has to avoid.');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a writer whose ACL protector THROWS after the rename still invalidates', () => {
+  // protect() runs AFTER fs.renameSync, so the new contents are already on disk
+  // when it can fail. With the invalidation as a trailing statement it is simply
+  // skipped, and the cache pins a value the file no longer contains for the rest
+  // of the session. MEASURED before the fix, for BOTH writers:
+  //   writeAppConfig   -> disk "ru",  cached "en"
+  //   writeGatewayPort -> disk 41777, cached 41100
+  // The production protector degrades rather than throws, so this is defence in
+  // depth; the point is that correctness must not rest on that.
+  for (const writer of ['writeAppConfig', 'writeGatewayPort']) {
+    const { dir, configPath } = scratchConfig(baseConfig);
+    try {
+      built.invalidateAppConfigCache();
+      built.readAppConfigCached(configPath); // arm
+
+      const throwForConfig = (filePath) => {
+        if (path.resolve(filePath) === path.resolve(configPath)) throw new Error('ACL denied');
+      };
+      assert.throws(() => {
+        if (writer === 'writeAppConfig') built.writeAppConfig(configPath, { language: 'ru' }, throwForConfig);
+        else built.writeGatewayPort(configPath, 41777, throwForConfig);
+      }, /ACL denied/, `${writer} was expected to surface the protector failure`);
+
+      const onDisk = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      const cached = built.readAppConfigCached(configPath);
+      assert.equal(cached.language, onDisk.language,
+        `${writer}: the cached language (${cached.language}) disagrees with disk (${onDisk.language}) `
+        + 'after the protector threw. Invalidation must be in a finally, not a trailing statement.');
+      assert.equal(cached.gatewayPort, onDisk.gatewayPort,
+        `${writer}: the cached port (${cached.gatewayPort}) disagrees with disk (${onDisk.gatewayPort}).`);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test('an UNREADABLE config is never cached, so defaults cannot outlive the failure', () => {
+  // readAppConfig() returns defaults for a file it could not parse and gives the
+  // caller no way to tell that apart from a file that really said port 12000.
+  // Caching that is not staleness, it is FABRICATION that outlives its cause.
+  // MEASURED before the fix, with a half-written config.json: the cached reader
+  // pinned gatewayPort 12000 and setupComplete:false, and both stayed wrong
+  // AFTER the file was repaired. setupComplete:false is what decides whether the
+  // renderer shows the first-run setup wizard.
+  const { dir, configPath } = scratchConfig(baseConfig);
+  try {
+    built.invalidateAppConfigCache();
+    fs.writeFileSync(configPath, '{ "version": 1, "gatewayPort": 41100, "langu', 'utf8');
+
+    const whileBroken = built.readAppConfigCached(configPath);
+    assert.equal(whileBroken.gatewayPort, 12000, 'a broken file still yields defaults for this call');
+
+    // The file becomes readable again. Nothing the app did, so nothing invalidated.
+    fs.writeFileSync(configPath, JSON.stringify(baseConfig, null, 2), 'utf8');
+
+    const after = built.readAppConfigCached(configPath);
+    assert.equal(after.gatewayPort, 41100,
+      'the cached reader kept serving DEFAULTS after config.json became readable again. A parse '
+      + 'failure must not be cached: it is not the file\'s contents, it is the absence of them.');
+    assert.equal(after.setupComplete, true,
+      'setupComplete was pinned false by a transient read failure, which is what drives the '
+      + 'first-run setup wizard');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a config.json holding a NON-OBJECT never throws out of either reader', () => {
+  // JSON.parse('null') succeeds and returns null. The old reader assigned that
+  // straight into its `config` local and then read config.performanceMode off it:
+  // MEASURED, a config.json containing literal `null` threw "Cannot read
+  // properties of null (reading 'performanceMode')" out of readAppConfig. That
+  // reader is the merge base for every write and runs on the startup path, so the
+  // throw was reachable from a truncated or externally mangled file.
+  const { dir, configPath } = scratchConfig(baseConfig);
+  try {
+    for (const contents of ['null', '[1,2]', '5', '"str"', 'true']) {
+      fs.writeFileSync(configPath, contents, 'utf8');
+      built.invalidateAppConfigCache();
+      const fresh = built.readAppConfig(configPath);
+      assert.equal(fresh.gatewayPort, 12000, `readAppConfig must default for ${contents}`);
+      assert.equal(fresh.language, 'en', `readAppConfig must default for ${contents}`);
+      const cached = built.readAppConfigCached(configPath);
+      assert.equal(cached.gatewayPort, 12000, `readAppConfigCached must default for ${contents}`);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('the cached object is DEEPLY frozen, so no caller can poison a later read', () => {
+  // The cached value is handed by reference to every caller. Freezing only the
+  // top level and the perModelSettings MAP left the per-model ENTRIES writable.
+  // MEASURED before the fix: one `entry.enabled = false` silently poisoned every
+  // subsequent cached read while disk still said true.
+  const { dir, configPath } = scratchConfig({
+    ...baseConfig,
+    perModelSettings: { 'z-ai/glm-5.2': { enabled: true, performanceMode: 'day', firstByteTimeoutMs: 300000 } }
+  });
+  try {
+    built.invalidateAppConfigCache();
+    const first = built.readAppConfigCached(configPath);
+    const entry = first.perModelSettings['z-ai/glm-5.2'];
+    assert.equal(entry.enabled, true, 'precondition');
+    assert.ok(Object.isFrozen(entry),
+      'per-model entries must be frozen: they are handed out by reference, so a mutation by any '
+      + 'caller becomes the answer every later cached read gives');
+
+    try { entry.enabled = false; } catch { /* strict mode throws; sloppy mode ignores */ }
+
+    assert.equal(built.readAppConfigCached(configPath).perModelSettings['z-ai/glm-5.2'].enabled, true,
+      'a caller mutated a nested entry of the cached config and poisoned every later read');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

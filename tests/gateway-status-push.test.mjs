@@ -120,6 +120,36 @@ test('a send that throws anyway is still contained', () => {
     + 'itself must be guarded, not just preceded by checks.');
 });
 
+test('the LIVENESS CHECKS THEMSELVES cannot throw out of the broadcaster', () => {
+  // THE GAP A "wrap the send" GUARD LEAVES OPEN. Every liveness check is a call
+  // into a native object that may already be dead, and Electron's destroyed
+  // wrapper throws "Object has been destroyed" on property ACCESS too -- so
+  // `window.webContents` is a throwing expression, not a safe read returning
+  // null. MEASURED against the real built module with only the send wrapped,
+  // four of these five escaped as an uncaughtException:
+  //   webContentsGetterThrows    THREW    windowIsDestroyedThrows   THREW
+  //   contentsIsDestroyedThrows  THREW    notABrowserWindow         THREW
+  //   webContentsNull            contained
+  // Each one reaches process.on('uncaughtException') -> fatalShutdownAndExit ->
+  // process.exit(1), the raw exit that skips the keys.json flush. Losing a push
+  // is free; losing the user's keys is not.
+  const { main } = probed();
+  const shapes = [
+    'webContentsGetterThrows', 'windowIsDestroyedThrows',
+    'contentsIsDestroyedThrows', 'webContentsNull', 'notABrowserWindow'
+  ];
+
+  for (const shape of shapes) {
+    const record = main.cases[shape];
+    assert.ok(record, `the probe did not drive the ${shape} case`);
+    assert.equal(record.threw, null,
+      `sendGatewayStatus threw for the ${shape} window shape: ${record.threw}. A liveness check `
+      + 'is not a safe operation on a destroyed native object, so the checks must sit INSIDE the '
+      + 'try/catch, not in front of it.');
+    assert.equal(record.sends.length, 0, `nothing may be sent for the ${shape} shape`);
+  }
+});
+
 test('the pushed payload carries the status fields and nothing else', () => {
   const { main } = probed();
   const sent = main.payload;
@@ -141,6 +171,43 @@ test('the pushed payload carries the status fields and nothing else', () => {
     'a field the caller attached to the status reached the renderer. The projection is what '
     + 'keeps an accidental secret out of a channel that fires on every transition.');
   assert.equal('secretSmuggled' in sent.payload, false, 'unknown fields must be dropped, not forwarded');
+});
+
+test('a TOKEN-SHAPED string inside message is redacted before it crosses', () => {
+  // The projection drops fields a caller ATTACHES. It says nothing about what a
+  // caller puts INSIDE `message`, which legitimately carries free text from the
+  // gateway child. MEASURED before this was fixed, calling the exported
+  // sendGatewayStatus directly with `message: "...token=nvapi-<64 chars>"`: the
+  // token arrived at webContents.send VERBATIM. In production every status has
+  // been through sanitizeGatewayStatus first, so nothing leaked -- but the
+  // "no secret crosses" contract of an exported function must not rest on the
+  // discipline of its callers, and this repo has already had a raw
+  // JSON.stringify leak both tokens.
+  const { main } = probed();
+  const { token, sent } = main.tokenPayload;
+
+  assert.ok(sent, 'the probe captured no payload for the token-shaped status');
+  const message = String(sent.payload.message);
+  assert.equal(message.includes(token), false,
+    `a token-shaped string survived the push verbatim: ${message.slice(0, 160)}`);
+  assert.doesNotMatch(message, /nvapi-[A-Za-z0-9_-]{20,}/,
+    `an nvapi-shaped credential reached the renderer: ${message.slice(0, 160)}`);
+  assert.match(message, /REDACTED/,
+    'the secret must be replaced by a redaction marker, not silently dropped, so the message '
+    + `stays diagnostic. Got: ${message.slice(0, 160)}`);
+  assert.match(message, /gateway child failed/,
+    'redaction must not destroy the surrounding diagnostic text');
+});
+
+test('an oversized message is capped, and the cap cannot leave a token fragment', () => {
+  const { main } = probed();
+  const { length, containsToken } = main.longPayload;
+
+  assert.ok(length !== null, 'the probe captured no oversized payload');
+  assert.ok(length <= 4000,
+    `the pushed message was ${length} chars. It must be capped like sanitizeGatewayStatus caps it `
+    + '(MAX_OUTPUT_LENGTH 4000): this crosses an IPC boundary on every gateway transition.');
+  assert.equal(containsToken, false, 'a token past the cap must not survive');
 });
 
 test('the preload adds exactly ONE narrowly-typed listener and no invoke channel', () => {

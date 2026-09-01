@@ -277,6 +277,34 @@ function createTrayIcon(state?: string): Electron.NativeImage {
 /** The one main->renderer push channel for gateway status. Send-only, by design. */
 export const GATEWAY_STATUS_CHANNEL = "gateway-status-changed";
 
+/** Mirrors MAX_OUTPUT_LENGTH in gateway-lifecycle.ts, which is not exported. */
+const GATEWAY_STATUS_MESSAGE_CAP = 4_000;
+/** Generous input bound so the redaction regexes can never run on an unbounded string. */
+const GATEWAY_STATUS_MESSAGE_INPUT_BOUND = 16_000;
+
+/**
+ * Redact + cap the one free-text field that crosses the bridge.
+ *
+ * WHY, given the producer already sanitizes: every status reaching the hook today
+ * has been through sanitizeGatewayStatus, so this is a no-op in production. But
+ * sendGatewayStatus is EXPORTED and its contract says no secret crosses, and that
+ * contract was resting entirely on the discipline of its callers. MEASURED by
+ * calling it directly with `message: "child failed: token=nvapi-AAAA…"`: the raw
+ * 70-character token arrived at webContents.send verbatim. The projection drops
+ * fields a caller ATTACHES; it did nothing about what a caller puts in a field
+ * that is meant to be there.
+ *
+ * ORDER: bound the input, redact, then cap. Redacting first is what makes a whole
+ * token match and disappear rather than being sliced into a partial secret; the
+ * leading bound keeps the regexes off an unbounded string (a sibling agent spent
+ * 300 s pushing ~90 MB through them). Anything past the final cap is discarded,
+ * so a token straddling the input bound cannot survive as a fragment.
+ */
+function redactGatewayStatusMessage(message: string): string {
+  return String(redact(String(message).slice(0, GATEWAY_STATUS_MESSAGE_INPUT_BOUND)))
+    .slice(0, GATEWAY_STATUS_MESSAGE_CAP);
+}
+
 /**
  * Push a gateway status change to the renderer.
  *
@@ -305,23 +333,47 @@ export const GATEWAY_STATUS_CHANNEL = "gateway-status-changed";
  * event callback, reach process.on("uncaughtException") -> fatalShutdownAndExit
  * -> process.exit(1), and that raw exit SKIPS before-quit -> cleanupAndQuit ->
  * gatewayLifecycle.stop(), i.e. the ipc shutdown that flushes keys.json. Hence
- * three layers: null check, both liveness checks, and a try/catch around the
- * send for the window that dies between the check and the call.
+ * the ENTIRE body is inside the try/catch, liveness checks included: those checks
+ * are themselves calls into a native object that may already be destroyed, and
+ * `window.webContents` throws on property access for a destroyed window rather
+ * than returning null. Checks first for a clean early return, try/catch around
+ * everything for the shapes a check cannot survive.
  *
  * The window is a PARAMETER, not ensureMainWindow(): a background gateway event
  * must never resurrect a window the user closed, and passing it in is what makes
  * the destroyed-window path testable.
  */
 export function sendGatewayStatus(window: BrowserWindow | null | undefined, status: GatewayStatus): void {
-  if (!window || window.isDestroyed()) return;
-  const contents = window.webContents;
-  if (!contents || contents.isDestroyed()) return;
+  // THE WHOLE BODY IS GUARDED, not just the send. The liveness checks were
+  // outside the try/catch, and every one of them is a call INTO a native object
+  // that may already be gone. Electron's destroyed-object wrapper throws
+  // "Object has been destroyed" on property ACCESS, so `window.webContents` is
+  // itself a throwing expression — not a safe read. MEASURED against the real
+  // built module, four realistic shapes escaped the old guard and would have
+  // become an uncaughtException:
+  //   window.webContents getter throws   -> THREW  (destroyed window, real Electron shape)
+  //   window.isDestroyed() throws        -> THREW
+  //   contents.isDestroyed() throws      -> THREW
+  //   window is not a BrowserWindow      -> THREW  (window.isDestroyed is not a function)
+  // Only `webContents === null` was contained. This is the same HIGH already
+  // found in this codebase: the throw escapes into an Electron event callback,
+  // reaches process.on("uncaughtException") -> fatalShutdownAndExit ->
+  // process.exit(1), and that raw exit SKIPS before-quit -> cleanupAndQuit ->
+  // gatewayLifecycle.stop(), the ipc shutdown that flushes keys.json. Losing one
+  // push costs nothing (the renderer keeps a backup poll); losing keys.json
+  // costs the user their keys.
+  //
+  // The ORDER still matters and is preserved: a destroyed window returns before
+  // webContents is ever touched, so a dead window is detected rather than caught.
   try {
+    if (!window || window.isDestroyed()) return;
+    const contents = window.webContents;
+    if (!contents || contents.isDestroyed()) return;
     contents.send(GATEWAY_STATUS_CHANNEL, {
       state: status.state,
       ...(status.port === undefined ? {} : { port: status.port }),
       ...(status.code === undefined ? {} : { code: status.code }),
-      ...(status.message === undefined ? {} : { message: status.message })
+      ...(status.message === undefined ? {} : { message: redactGatewayStatusMessage(status.message) })
     });
   } catch (error) {
     // The native object can die between the liveness check and the send; there
@@ -618,32 +670,43 @@ void startMainProcess({
     runMigration: async (source) => {
       if (!gatewayRuntime || !secureStore || !secureState || !gatewayLifecycle) throw new Error("MIGRATION_RUNTIME_UNAVAILABLE");
       const acl = createRuntimeAclProtector();
-      const migration = await runExplicitLegacyNvidiaMigration({ runtime: gatewayRuntime, store: secureStore, state: secureState, protectFile: acl.protectFile, source, lifecycle: {
-        startPrepared: async (state, port) => {
-          pendingMigrationState = structuredClone(state);
-          const status = await gatewayLifecycle.startPrepared(withGatewayModelLimits(state), port);
-          if (status.state !== "running") pendingMigrationState = null;
-          return status;
-        },
-        stopPrepared: async () => {
-          const status = await gatewayLifecycle.stopPrepared();
-          pendingMigrationState = null;
-          return status;
-        },
-        commitPreparedState: (state) => {
-          const committed = pendingMigrationState ? { ...state, keys: pendingMigrationState.keys } : state;
-          pendingMigrationState = null;
-          secureState = committed;
-          return committed;
-        }
-      } });
+      // The migration workflow writes config.json DIRECTLY (final-migration-workflow.ts
+      // renames over it at :240 and :261), bypassing writeAppConfig/writeGatewayPort
+      // and so their invalidation. It runs before any window exists, so nothing
+      // should have armed the cache yet — but relying on that ordering would make a
+      // future reordering a silent staleness bug, so drop the cache explicitly.
+      //
+      // In a FINALLY, and this is the part a trailing statement gets wrong: the
+      // workflow performs verification reads AFTER it has renamed the new config
+      // into place and FAILS HARD on a mismatch (MIGRATION_CONFIG_CONCURRENT_MODIFICATION).
+      // On that throw the file is already replaced, so a trailing invalidate never
+      // runs and the cache would outlive the write it was supposed to follow. Same
+      // defect class as the two writers in gateway-runtime.ts.
+      let migration: Awaited<ReturnType<typeof runExplicitLegacyNvidiaMigration>>;
+      try {
+        migration = await runExplicitLegacyNvidiaMigration({ runtime: gatewayRuntime, store: secureStore, state: secureState, protectFile: acl.protectFile, source, lifecycle: {
+          startPrepared: async (state, port) => {
+            pendingMigrationState = structuredClone(state);
+            const status = await gatewayLifecycle.startPrepared(withGatewayModelLimits(state), port);
+            if (status.state !== "running") pendingMigrationState = null;
+            return status;
+          },
+          stopPrepared: async () => {
+            const status = await gatewayLifecycle.stopPrepared();
+            pendingMigrationState = null;
+            return status;
+          },
+          commitPreparedState: (state) => {
+            const committed = pendingMigrationState ? { ...state, keys: pendingMigrationState.keys } : state;
+            pendingMigrationState = null;
+            secureState = committed;
+            return committed;
+          }
+        } });
+      } finally {
+        invalidateAppConfigCache();
+      }
       secureState = migration.state;
-      // The migration workflow writes config.json DIRECTLY (final-migration-workflow.ts),
-      // bypassing writeAppConfig/writeGatewayPort and so their invalidation. It
-      // runs before any window exists, so nothing should have armed the cache
-      // yet — but relying on that ordering would make a future reordering a
-      // silent staleness bug, so drop the cache explicitly here.
-      invalidateAppConfigCache();
       credentials = secureState.credentials && typeof secureState.credentials.gatewayToken === "string" && typeof secureState.credentials.adminToken === "string"
         ? secureState.credentials as { gatewayToken: string; adminToken: string }
         : null;

@@ -131,6 +131,15 @@ export function ensureGatewayRuntime(userDataPath: string, protector: RuntimePro
   if (!fs.existsSync(configPath)) {
     fs.writeFileSync(configPath, JSON.stringify(getDefaultConfig(), null, 2), "utf8");
     protector.protectFile(configPath);
+    // THIS IS THE THIRD WRITER of config.json in this module, and it is the one
+    // easiest to overlook because it only fires when the file is absent. If the
+    // cache is armed and config.json then disappears (a cleanup script, a synced
+    // userData directory, a user deleting it), this rewrites DEFAULTS to disk
+    // while the cached parse keeps serving the old values: MEASURED cache 41100
+    // against disk 12000. Today the single call site runs at startup before any
+    // window exists, but relying on that ordering is exactly what turns a future
+    // reordering into a silent staleness bug.
+    invalidateAppConfigCache();
   }
 
   for (const filePath of [logPath, appLogPath, stdioLogPath]) {
@@ -167,8 +176,10 @@ export function ensureGatewayRuntime(userDataPath: string, protector: RuntimePro
 // paths keep serving the parse they last took. get-runtime-state (and so the
 // Settings view) and the tray language can therefore show a stale value.
 //
-// HOW LONG: until the app itself writes the config (writeAppConfig or
-// writeGatewayPort, both of which invalidate below), or until restart. There is
+// HOW LONG: until the app itself writes the config (writeAppConfig,
+// writeGatewayPort or ensureGatewayRuntime — ALL THREE writers in this module
+// invalidate, each in a finally so a throwing ACL protector cannot skip it), or
+// until restart. There is
 // no timer and no file watcher, so an external edit that is never followed by
 // an app-side write stays unobserved for the rest of the session. Every
 // app-driven change — the language toggle, the performance mode, a port retry,
@@ -196,7 +207,23 @@ export function invalidateAppConfigCache(): void {
  */
 export function readAppConfigCached(configPath: string): AppConfigState {
   if (appConfigCache && appConfigCache.configPath === configPath) return appConfigCache.value;
-  const value = readAppConfig(configPath);
+  // ONE read, then decide whether it is cacheable. readAppConfig() cannot tell a
+  // caller the difference between "the file said port 12000" and "the file could
+  // not be read, so here are the DEFAULTS", because it swallows both into the
+  // same return. Caching the second is not staleness, it is FABRICATION that
+  // outlives its cause: MEASURED, a config.json that is transiently unparseable
+  // (a half-written external edit, a locked file, an antivirus hold) pinned
+  // setupComplete:false and gatewayPort 12000 for the rest of the session, and
+  // the values stayed wrong after the file was repaired. setupComplete:false is
+  // what the renderer uses to decide whether to show the setup wizard.
+  const parsed = parseConfigFile(configPath);
+  const value = normalizeAppConfig(parsed ?? {});
+  if (parsed === null) return value;
+  // DEEP freeze. The per-model ENTRIES are handed out by reference to every
+  // caller; freezing only the map left them writable, and MEASURED a single
+  // `entry.enabled = false` by one caller poisoned every subsequent cached read
+  // while disk still said true.
+  for (const entry of Object.values(value.perModelSettings)) Object.freeze(entry);
   Object.freeze(value.perModelSettings);
   Object.freeze(value.disabledModels);
   Object.freeze(value);
@@ -248,19 +275,47 @@ export function writeGatewayPort(configPath: string, gatewayPort: number, protec
   const temporaryPath = `${configPath}.tmp`;
   fs.writeFileSync(temporaryPath, JSON.stringify(config, null, 2), "utf8");
   protect(temporaryPath);
-  fs.renameSync(temporaryPath, configPath);
-  protect(configPath);
   // This writer does NOT go through writeAppConfig, so it must drop the cache
   // itself: retry-gateway / set-gateway-port land here, and a stale cached parse
   // would make get-runtime-state report the pre-retry port. Invalidating AFTER
   // the rename is deliberate — invalidating first would let a read in between
   // re-cache the OLD contents and pin the staleness permanently.
-  invalidateAppConfigCache();
+  //
+  // FINALLY, not a trailing statement: protect() runs AFTER the rename, so if it
+  // throws the file on disk has ALREADY been replaced and a trailing invalidate
+  // never runs. MEASURED with a protector that throws for configPath: disk said
+  // 41777 while the cached parse still said 41100, for the rest of the session.
+  // The production protector degrades rather than throws, so this is defence
+  // rather than an observed production failure — but the ordering must not be
+  // what protects us. Invalidating when the rename itself failed is harmless:
+  // the next read simply re-parses a file that never changed.
+  try {
+    fs.renameSync(temporaryPath, configPath);
+    protect(configPath);
+  } finally {
+    invalidateAppConfigCache();
+  }
 }
 
-export function readAppConfig(configPath: string): AppConfigState {
-  let config: Record<string, unknown> = {};
-  try { config = JSON.parse(fs.readFileSync(configPath, "utf8").replace(/^\uFEFF/, "")); } catch { /* defaults */ }
+/**
+ * Read + parse config.json, or NULL when it could not be read or is not a JSON
+ * object. The null is the whole point: readAppConfig() returns defaults for an
+ * unreadable file and its caller cannot tell that apart from a file that
+ * genuinely said "port 12000". That is harmless for a one-shot read and is
+ * FABRICATION once cached, so the cached reader needs to know the difference.
+ */
+function parseConfigFile(configPath: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(configPath, "utf8").replace(/^\uFEFF/, ""));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+/** Validate + default every field. Pure: touches no disk, so it cannot fail. */
+function normalizeAppConfig(config: Record<string, unknown>): AppConfigState {
   const gatewayPort = isGatewayConfig(config) ? config.gatewayPort : DEFAULT_GATEWAY_PORT;
   const performanceMode: PerformanceMode =
     config.performanceMode === "night" || config.performanceMode === "auto" || config.performanceMode === "day"
@@ -301,6 +356,15 @@ export function readAppConfig(configPath: string): AppConfigState {
   return { gatewayPort, language, setupComplete: config.setupComplete === true, performanceMode, autoStartGateway, perModelSettings, disabledModels };
 }
 
+/**
+ * FRESH read straight from disk, defaults on any failure. Unchanged behaviour:
+ * an unreadable or non-object config.json yields the same defaults it always
+ * did. This is the reader every WRITER must use as its merge base.
+ */
+export function readAppConfig(configPath: string): AppConfigState {
+  return normalizeAppConfig(parseConfigFile(configPath) ?? {});
+}
+
 export function writeAppConfig(configPath: string, update: Partial<AppConfigState>, protect: (filePath: string) => void = () => {}): AppConfigState {
   // DELIBERATELY the FRESH reader, never readAppConfigCached. This read is the
   // MERGE BASE: everything it returns is written back out below. Serving it from
@@ -318,11 +382,18 @@ export function writeAppConfig(configPath: string, update: Partial<AppConfigStat
   try { existing = JSON.parse(fs.readFileSync(configPath, "utf8").replace(/^\uFEFF/, "")); } catch { /* fresh */ }
   const temporaryPath = `${configPath}.tmp`;
   fs.writeFileSync(temporaryPath, JSON.stringify({ ...existing, version: 1, ...next }, null, 2), "utf8");
-  protect(temporaryPath); fs.renameSync(temporaryPath, configPath); protect(configPath);
+  protect(temporaryPath);
   // Invalidate AFTER the rename: dropping the cache before the file is in place
   // would let an interleaved read re-cache the OLD contents and pin the stale
-  // value for the rest of the session.
-  invalidateAppConfigCache();
+  // value for the rest of the session. In a FINALLY because protect() runs after
+  // the rename and a throw there would skip a trailing invalidate while the new
+  // contents are already on disk — MEASURED as cached "en" against disk "ru".
+  try {
+    fs.renameSync(temporaryPath, configPath);
+    protect(configPath);
+  } finally {
+    invalidateAppConfigCache();
+  }
   return next;
 }
 

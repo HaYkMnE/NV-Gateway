@@ -153,6 +153,28 @@ if (result.main.exportsSender) {
   });
   drive('healthy', healthy());
 
+  // THE SHAPES A LIVENESS CHECK CANNOT SURVIVE. Electron's destroyed-object
+  // wrapper throws "Object has been destroyed" on property ACCESS and on method
+  // CALLS, so every check in the guard is itself a throwing expression against a
+  // dead native object. A guard that only wraps the send leaves all of these
+  // escaping into an Electron event callback -> uncaughtException -> exit past
+  // the keys.json flush. Each of the four below DID escape before this was fixed.
+  drive('webContentsGetterThrows', {
+    isDestroyed: () => false,
+    get webContents() { throw new Error('Object has been destroyed'); }
+  });
+  drive('windowIsDestroyedThrows', {
+    isDestroyed() { throw new Error('Object has been destroyed'); },
+    webContents: { isDestroyed: () => false, send() {} }
+  });
+  drive('contentsIsDestroyedThrows', {
+    isDestroyed: () => false,
+    webContents: { isDestroyed() { throw new Error('Object has been destroyed'); }, send() {} }
+  });
+  drive('webContentsNull', { isDestroyed: () => false, webContents: null });
+  // Not a BrowserWindow at all: the hook hands over whatever `mainWindow` holds.
+  drive('notABrowserWindow', 7);
+
   // Payload fidelity: a status carrying an unexpected extra field must not
   // widen what crosses the bridge.
   const probeWindow = healthy();
@@ -163,6 +185,33 @@ if (result.main.exportsSender) {
     });
   } catch { /* recorded below as a missing send */ }
   result.main.payload = probeWindow.__sends[0] ?? null;
+
+  // A TOKEN-SHAPED STRING in the one field that legitimately carries free text.
+  // The projection drops fields a caller ATTACHES; it says nothing about what a
+  // caller puts INSIDE `message`. sendGatewayStatus is exported, so its "no
+  // secret crosses" contract must not rest on every caller remembering to
+  // sanitize first. Fixture kept small on purpose: a sibling agent burned a
+  // 300 s shell cap pushing ~90 MB through these same regexes.
+  const tokenWindow = healthy();
+  const token = 'nvapi-' + 'A'.repeat(64);
+  try {
+    sendGatewayStatus(tokenWindow, {
+      state: 'error', code: 'START_FAILED', port: 41100,
+      message: `gateway child failed: token=${token} admin=${token}`
+    });
+  } catch { /* recorded below as a missing send */ }
+  result.main.tokenPayload = { token, sent: tokenWindow.__sends[0] ?? null };
+
+  // And an oversized message must be capped, not forwarded whole.
+  const longWindow = healthy();
+  try {
+    sendGatewayStatus(longWindow, { state: 'error', message: 'x'.repeat(40_000) + token });
+  } catch { /* recorded below */ }
+  const longSent = longWindow.__sends[0] ?? null;
+  result.main.longPayload = {
+    length: longSent ? String(longSent.payload.message).length : null,
+    containsToken: longSent ? String(longSent.payload.message).includes(token) : null
+  };
 }
 
 // ── preload side ───────────────────────────────────────────────────────────
