@@ -48,6 +48,11 @@ interface Window {
     };
     onNavigateAbout: (callback: () => void) => () => void;
     onNavigateFeedback: (callback: () => void) => () => void;
+    // Main->renderer PUSH for gateway status (channel 'gateway-status-changed').
+    // Send-only from main: no invoke counterpart exists. Returns an unsubscribe
+    // function; the renderer must unsubscribe on effect cleanup so a remounting
+    // component cannot stack listeners on a channel that fires per transition.
+    onGatewayStatusChanged: (callback: (status: GatewayStatus) => void) => () => void;
   }
 }
 

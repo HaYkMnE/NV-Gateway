@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Outlet, NavLink, useNavigate } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { AlertTriangle, Boxes, KeyRound, Lightbulb, Loader2, Menu, Plug, RefreshCw, ScrollText, Settings, X } from 'lucide-react';
 import { useConfigStore } from '../stores/config';
@@ -114,22 +114,39 @@ export function Layout() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const menuButton = useRef<HTMLButtonElement>(null);
+  const queryClient = useQueryClient();
 
   const statusQuery = useQuery({
     queryKey: ['gateway-status'],
     queryFn: () => window.electronAPI.getGatewayStatus(),
-    refetchInterval: 1000,
+    // Primary delivery is now the main->renderer push on 'gateway-status-changed'
+    // (subscribed below). This poll is only the SAFETY NET: a push is lost
+    // whenever the window is absent or destroyed at the moment of the transition
+    // (sendGatewayStatus is inert then, by design), so a slow backup poll must
+    // remain — but 1 Hz is no longer paying for anything, so it drops to 30 s.
+    refetchInterval: 30000,
     // Default refetchIntervalInBackground (false) follows document.visibilityState,
-    // so the poll pauses when the window is hidden or minimised to tray — the
-    // previous `true` burned ~60 IPC round-trips per minute indefinitely on a
-    // window nobody could see. The status display itself cannot go stale while
-    // hidden BECAUSE it is hidden; on reveal, refetchOnWindowFocus: 'always' and
-    // staleTime: 0 (overriding the global staleTime: 3000 in App.tsx) guarantee
-    // an immediate refetch regardless of whether the window was hidden for <3s,
-    // eliminating up to 1.0s of reveal staleness.
+    // so the poll pauses when the window is hidden or minimised to tray — polling
+    // a window nobody can see burns IPC round-trips for nothing. The status
+    // display itself cannot go stale while hidden BECAUSE it is hidden; on
+    // reveal, refetchOnWindowFocus: 'always' and staleTime: 0 (overriding the
+    // global staleTime: 3000 in App.tsx) guarantee an immediate refetch
+    // regardless of whether the window was hidden for <3s, eliminating up to
+    // 1.0s of reveal staleness (51fb01d; measured 15.5 ms after that fix).
     refetchOnWindowFocus: 'always',
     staleTime: 0,
   });
+
+  // The push half of the channel: main hands every gateway transition to the
+  // renderer, so the tree updates in milliseconds instead of at the next poll
+  // tick. setQueryData — NOT invalidateQueries: the push already carries the
+  // full four-field status, and invalidating would reintroduce one IPC
+  // round-trip per transition (the exact cost this channel exists to remove).
+  // The returned unsubscribe is the effect cleanup, so a remount cannot stack
+  // listeners on a channel that fires on every transition.
+  useEffect(() => window.electronAPI.onGatewayStatusChanged((status) => {
+    queryClient.setQueryData(['gateway-status'], status);
+  }), [queryClient]);
 
   const status: GatewayStatus = useMemo(() => {
     if (statusQuery.data) return statusQuery.data;
