@@ -213,6 +213,27 @@ function boundField(value: unknown, originalUnits: number, max: number, field: s
   // Names the field and the sizes, never the content — assertClipboardText and
   // assertText (feedback-validation.ts:86) hold the same line, because this text
   // can contain a credential the redactor did not recognise.
+  //
+  // A FORGED MARKER IS DETECTABLE BY ARITHMETIC, so it needs no mechanism. Text
+  // ending in something SHAPED like this marker is stored verbatim on a field that
+  // was never cut (measured: a 160-unit stack ending in `[truncated: stack was
+  // 999999 units, cap 4000]` is stored exactly as sent), which could mislead a
+  // human reader. A `truncated` BOOLEAN cannot be the answer — sanitizeReportEntry
+  // keeps a fail-closed allow-list of five fields (report-sanitizer.ts:29) and
+  // would drop a sixth on the way out — but none is needed, because a genuine
+  // marker satisfies a size relation a forgery CANNOT:
+  //
+  //   genuine  =>  value.length === max + `[truncated: <field> was <n> units, cap <max>]`.length
+  //
+  // holds by construction, since the value was cut to exactly `max` before the
+  // marker was appended. A forger has only two moves and the arithmetic refuses
+  // both: stay within the cap and the stored length is <= max, which is strictly
+  // less than max + markerLength, so the relation cannot hold; exceed the cap and
+  // the text is cut at `max`, discarding their trailing marker along with
+  // everything past the cut, and the genuine marker is appended after it. The
+  // trailing marker of a truncated value is therefore always this function's own.
+  // Pinned by tests/error-reporter-rotation-obstructed.test.mjs so it cannot decay
+  // into a comment that used to be true.
   return `${cut}[truncated: ${field} was ${reportedUnits} units, cap ${max}]`;
 }
 
@@ -264,12 +285,31 @@ function readErrors(): Record<string, unknown>[] {
 //
 // Every failure is swallowed: a logger must never throw into its caller, and a
 // failed rotation must still leave the append below to run.
-function rotateIfNeeded(file: string): void {
+//
+// THE FAILURES STAY SWALLOWED; THE FACT OF THEM NO LONGER IS. Swallowing was
+// never the defect — appending REGARDLESS was. When all three generation names
+// are occupied and can be neither unlinked nor renamed onto (an antivirus
+// scanner, a backup tool, an editor, a stale handle), every step here fails, the
+// caller appends anyway, and the 5 MB x 3 cap becomes fiction.
+//
+// MEASURED with the cap lowered to 64 KiB so the same branch is exercised
+// cheaply (tests/error-reporter-rotation-obstructed.test.mjs): with all three
+// generation names occupied, 900 appends grew the active log to 1,904,290 B —
+// 29.06x the cap — and a second identical batch added exactly 1,904,290 B more,
+// reaching 58.11x. Linear in the fault rate, with no ceiling at all.
+//
+// The signal is deliberately the POST-CONDITION rather than a caught error: what
+// the caller needs to know is not which syscall failed but whether the active log
+// is still over its cap now that rotation has been attempted. A partial rotation
+// that frees the active name is a success by that measure, and correctly so.
+//
+// @returns true when the active log is STILL at/over MAX_LOG_SIZE afterwards.
+function rotateIfNeeded(file: string): boolean {
   try {
-    if (fs.statSync(file).size < MAX_LOG_SIZE) return;
+    if (fs.statSync(file).size < MAX_LOG_SIZE) return false;
   } catch {
     // No file yet, or it cannot be stat'ed: nothing to rotate.
-    return;
+    return false;
   }
 
   const baseName = file.replace(/\.log$/, "");
@@ -289,12 +329,138 @@ function rotateIfNeeded(file: string): void {
       // A missing generation is normal before the log has rotated that often.
     }
   }
+
+  // THE POST-CONDITION, not a tally of caught errors. A rotation that fails to
+  // drop the oldest generation but still succeeds in moving the ACTIVE log aside
+  // has done the only job that matters here, and reporting it as obstructed would
+  // suppress appends for no reason. So the question asked is simply: is the active
+  // log still at its cap?
+  //
+  // A successful rotation renames the active log away, so statSync throws ENOENT
+  // and this returns false — rotation worked, the next append starts a new file.
+  try {
+    return fs.statSync(file).size >= MAX_LOG_SIZE;
+  } catch {
+    return false;
+  }
 }
 
+// ---- Suppression state while rotation is obstructed ----
+//
+// THE DISK BUDGET OUTRANKS LOG COMPLETENESS. When rotation cannot proceed and the
+// active log is already at its cap, the choice is between growing without bound
+// and dropping entries. Growing without bound is the worse failure: it is what
+// fills the volume the app, the gateway logs and the user's own data share, and it
+// is unbounded in the one situation where the machine is already unhealthy.
+//
+// THREE SCALARS, NEVER THE CONTENT. The suppressed ENTRIES are not queued for
+// later — that would move an unbounded disk problem into unbounded memory, which
+// is the same defect with a worse failure mode. What is kept is a count and the
+// two wall-clock instants that delimit the gap, so the state is O(1) whether ten
+// entries or ten million were dropped.
+let suppressingAppends = false;
+let suppressedCount = 0;
+let suppressedSince = "";
+let suppressedUntil = "";
+
+/** Record that one entry was dropped. Pure arithmetic — cannot throw. */
+function noteSuppressed(): void {
+  const now = new Date().toISOString();
+  if (suppressedCount === 0) suppressedSince = now;
+  suppressedUntil = now;
+  suppressedCount += 1;
+}
+
+/**
+ * The ONE record that makes the gap visible after rotation recovers.
+ *
+ * TYPE IS THE CATCH-ALL BUCKET, DELIBERATELY. This is not a renderer fault, but
+ * `type` may only be one of four values: sanitizeReportEntry normalises anything
+ * else to "renderer" (report-sanitizer.ts:67), and that module is not this one's
+ * to change. Inventing a fifth value would therefore be silently rewritten to the
+ * same bucket, so it is chosen openly instead, and the TRUE origin is carried in
+ * `source`, which is free text that survives intact. The message names itself, so
+ * a reader is not relying on `type` to tell what this record is.
+ *
+ * NO i18n KEY. `[log-suppressed: …]` is an internal log marker in the same
+ * untranslated style as `[REDACTED]`, `[omitted]` and `[Circular]`, and the locale
+ * files are pinned at 301 keys each.
+ *
+ * IT SKIPS sanitizeEntry AND boundField ON PURPOSE, and that is safe only because
+ * NO CALLER DATA REACHES IT: every part is generated here — an integer counter, two
+ * ISO timestamps from new Date(), and one fixed English sentence. There is no
+ * secret to redact and nothing whose length a caller controls (the whole record is
+ * ~160 units against a 4,000-unit cap). The fields it does set are all inside
+ * sanitizeReportEntry's allow-list, so previewErrors() forwards it unchanged when
+ * the record is later READ back.
+ */
+function suppressionNotice(): Record<string, unknown> {
+  return {
+    timestamp: new Date().toISOString(),
+    type: "renderer",
+    message:
+      `[log-suppressed: ${suppressedCount} entries between ${suppressedSince} and ${suppressedUntil} ` +
+      `were dropped: errors.log was at its ${MAX_LOG_SIZE}-byte cap and rotation was obstructed]`,
+    source: "error-reporter"
+  };
+}
+
+/**
+ * Append one entry, or drop it while rotation is obstructed and the log is full.
+ *
+ * MEASURED DEFECT this replaces (tests/error-reporter-rotation-obstructed.test.mjs,
+ * cap lowered to 64 KiB to exercise the same branch cheaply). With all three
+ * generation names occupied by something that can be neither unlinked nor renamed
+ * onto, rotateIfNeeded failed silently on every call and this function appended
+ * anyway: 900 appends reached 1,904,290 B — 29.06x the cap — and a second
+ * identical batch added exactly 1,904,290 B more, for 58.11x. Perfectly linear,
+ * with nothing on disk or in the log saying anything was wrong.
+ *
+ * THE FIRST ENTRY THROUGH IS ALWAYS WRITTEN, one record past the cap on purpose.
+ * The first error of a storm is normally the diagnostic one — the cause, with the
+ * rest being consequences — so suppression begins with the SECOND entry to meet
+ * the obstruction, not the first. In the ordinary case the storm's first error was
+ * already written long before the cap was reached; this rule covers the case where
+ * the log was ALREADY over cap and obstructed when the storm began (a session that
+ * started that way), where the first error would otherwise be the one lost.
+ */
 function appendEntry(entry: Record<string, unknown>): void {
   const file = errorsLogPath();
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  rotateIfNeeded(file);
+
+  if (rotateIfNeeded(file)) {
+    // Still at/over the cap after attempting rotation: the file cannot be moved
+    // aside, so appending grows it without bound.
+    if (suppressingAppends) {
+      noteSuppressed();
+      return;
+    }
+    // First entry to meet the obstruction — written, then suppression starts.
+    suppressingAppends = true;
+    fs.appendFileSync(file, JSON.stringify(entry) + "\n", "utf8");
+    return;
+  }
+
+  // Rotation is working again (or was never needed). SELF-HEALING, with no
+  // restart: this runs on the very next append after the obstruction clears,
+  // because every append re-attempts rotation.
+  if (suppressingAppends) {
+    suppressingAppends = false;
+    if (suppressedCount > 0) {
+      // Reset BEFORE the write, so a failed append cannot leave the counters
+      // primed to emit the same notice again on the next call.
+      const notice = suppressionNotice();
+      suppressedCount = 0;
+      suppressedSince = "";
+      suppressedUntil = "";
+      try {
+        fs.appendFileSync(file, JSON.stringify(notice) + "\n", "utf8");
+      } catch {
+        // The notice is best-effort; losing it must not also lose the entry below.
+      }
+    }
+  }
+
   fs.appendFileSync(file, JSON.stringify(entry) + "\n", "utf8");
 }
 
