@@ -24,6 +24,94 @@ export const MAX_BACKOFF_MS = 300 * 1000;
 // a key during a rate-limit storm — keeping it at 20s aligns with the "max ~20s
 // between key switches" contract.
 export const MAX_KEY_COOLDOWN_429_MS = 20_000;
+
+// RETRY SCHEDULE for a key parked as quota-exceeded.
+//
+// Original intent of the code this replaces: "credits are gone, stop wasting
+// requests on this key, and only as a LAST RESORT (activeCount === 0) try it
+// again after an hour". Two things made that starve the pool:
+//   1. the last-resort gate meant ONE surviving active key kept every other key
+//      parked forever, collapsing a pool of N keys to 1 (≈40 RPM baseline);
+//   2. the hour was measured from usage.lastUsed, which handleKeyError bumps on
+//      FAILURE — so a retry that 429'd restarted the whole hour, and a fully
+//      quota-exceeded pool retried one key per hour.
+//
+// Replacement: each parked key carries its OWN due time in `backoffUntil` (an
+// already-persisted field), so recovery is independent of how many other keys
+// are active, and a failed retry escalates on a bounded ladder instead of
+// resetting a clock that a failure write keeps pushing forward.
+//
+// 5 min base: short enough that a transient model-wide 429 wave (which is
+// mis-parked as quota by any body-text classifier) heals within one user
+// retry, long enough that a genuinely dead key costs ~12 probe requests/hour.
+export const QUOTA_RETRY_BASE_MS = 5 * 60_000;
+// Ceiling: the same 1 h the original code used. The ladder doubles up to this
+// value and stops, so a failed retry is NEVER scheduled further out than the
+// original single fixed hour — the schedule can only improve on it.
+export const QUOTA_RETRY_MAX_MS = 3_600_000;
+
+/**
+ * Consecutive failed quota retries per key id, in memory only.
+ *
+ * Deliberately NOT persisted: the state projection the main process validates
+ * (state-ownership.ts isChildKeyProjection) is a fixed 5/6-field contract, and
+ * widening it from here would be a cross-boundary change. Losing the ladder on
+ * restart is safe in one direction only — it restarts at the 5 min base, never
+ * at 0 — so a restart loop can cost at most a probe every 5 min, not a hammer.
+ * @type {Map<string, number>}
+ */
+const quotaRetries = new Map();
+
+/** The retry window for the Nth consecutive failure (0-based): 5,10,20,40,60,60… min. */
+function quotaRetryWindowMs(failures) {
+  const scaled = QUOTA_RETRY_BASE_MS * Math.pow(2, Math.max(0, failures));
+  return Math.min(QUOTA_RETRY_MAX_MS, scaled);
+}
+
+/**
+ * Park a key as quota-exceeded and schedule its next retry.
+ * Escalates the ladder on each consecutive failure; a success clears it
+ * (see markKeyUsedAndDebounceSave).
+ */
+function parkQuotaExceeded(key) {
+  const failures = quotaRetries.get(key.id) ?? 0;
+  const windowMs = quotaRetryWindowMs(failures);
+  quotaRetries.set(key.id, failures + 1);
+  key.status = "quota-exceeded";
+  key.backoffUntil = Date.now() + windowMs;
+  warn("Key parked as quota-exceeded", { id: key.id, retryInMs: windowMs, attempt: failures + 1 });
+}
+
+// A 429 body that is a RATE LIMIT, not exhausted credits. Checked FIRST: NVIDIA
+// words a per-model rate limit as "exceeded your quota of 40 requests per
+// minute", so a bare substring test for "quota" misreads it as dead credits and
+// kills a healthy key pool-wide — bypassing the per-(model,key) cooldown design.
+const RATE_LIMIT_SIGNAL = /rate[\s_-]?limit|requests?\s+per\s+(minute|second|hour|day)|\brpm\b|\btpm\b|too\s+many\s+requests|slow\s+down/;
+// Exhausted credits / account-level quota. 429 everywhere, so it IS global.
+// Matches the wordings that carry no "quota" token at all ("credit balance",
+// "free credits used", "insufficient credits"), which the substring test read
+// as a 20 s cooldown and therefore hammered forever.
+const CREDIT_EXHAUSTED_SIGNAL = /insufficient[_\s-]?quota|quota\s+(exceeded|exhausted|reached|limit)|exceeded\s+your\s+quota|out\s+of\s+credits?|no\s+credits?\s+(left|remaining)|credits?\s+(exhausted|depleted|used|remaining)|insufficient\s+(credit|balance|funds)|credit\s+(balance|limit)|free\s+credits?|billing|payment\s+required/;
+
+/**
+ * Is this 429 body a GLOBAL credit/quota exhaustion verdict?
+ *
+ * Order is the whole point: a rate-limit wording wins even when it also
+ * contains the word "quota", so a model-scoped 429 is never misclassified as a
+ * dead key. A body that matches neither is NOT treated as exhaustion — it falls
+ * through to the model-scoped/global cooldown branches, which is the safe
+ * direction for an unknown wording.
+ *
+ * @param {unknown} responseBody
+ * @returns {boolean}
+ */
+export function isQuotaExhaustedBody(responseBody) {
+  if (typeof responseBody !== "string" || responseBody.length === 0) return false;
+  const body = responseBody.toLowerCase();
+  if (RATE_LIMIT_SIGNAL.test(body)) return false;
+  return CREDIT_EXHAUSTED_SIGNAL.test(body);
+}
+
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const STATUSES = new Set(["active", "disabled", "quota-exceeded"]);
 let keys = [];
@@ -116,6 +204,35 @@ export function getSoonestActiveCooldownRemainingSeconds() {
   return Math.max(1, Math.min(20, Math.ceil((minBackoff - now) / 1000)));
 }
 
+/**
+ * Return every quota-exceeded key whose retry window has elapsed to `active`.
+ *
+ * Run as a SWEEP at the top of getNextKey, not as a last-resort branch: the
+ * previous code only looked at quota keys when `activeCount === 0`, so a single
+ * surviving active key kept the whole pool parked and the user was pinned at one
+ * key's ~40 RPM. Reclaiming is a state transition driven ONLY by the key's own
+ * due time, so it is independent of how many other keys are active; the normal
+ * LRU below then decides who serves this request.
+ *
+ * `usage.lastUsed` is deliberately left alone — it is the LRU ordering, and a
+ * key that has been parked for a while SHOULD sort to the front.
+ *
+ * No save here: this is the selection hot path, and the caller's
+ * markKeyUsedAndDebounceSave already debounces a write after the request.
+ *
+ * @param {number} now
+ * @returns {void}
+ */
+function reclaimDueQuotaKeys(now) {
+  for (const key of keys) {
+    if (key.status !== "quota-exceeded") continue;
+    if ((key.backoffUntil || 0) > now) continue;
+    key.status = "active";
+    key.backoffUntil = 0;
+    info("Quota-exceeded key returned for a bounded retry", { id: key.id, attempt: (quotaRetries.get(key.id) ?? 0) + 1 });
+  }
+}
+
 let locked = false;
 /**
  * Select the key that should serve this request.
@@ -138,6 +255,7 @@ export function getNextKey(modelId) {
   if (locked) return null; locked = true;
   try {
     const now = Date.now();
+    reclaimDueQuotaKeys(now);
     if (typeof modelId === "string" && modelId.length > 0) {
       const affine = selectKeyForModel(modelId, keys, { now });
       if (affine) {
@@ -161,20 +279,11 @@ export function getNextKey(modelId) {
       candidate.usage.lastUsed = now;
       return candidate;
     }
-    const activeCount = keys.filter((key) => key.status === "active").length;
-    if (activeCount === 0) {
-      const quotaKeys = keys.filter((key) => key.status === "quota-exceeded").sort((a, b) => a.usage.lastUsed - b.usage.lastUsed);
-      if (quotaKeys.length > 0) {
-        const cooledDownQuota = quotaKeys.filter((key) => now - (key.usage.lastUsed || 0) >= 3600000);
-        const candidate = cooledDownQuota.length > 0 ? cooledDownQuota[0] : null;
-        if (candidate) {
-          candidate.status = "active";
-          candidate.backoffUntil = 0;
-          candidate.usage.lastUsed = now;
-          return candidate;
-        }
-      }
-    }
+    // No last-resort quota revival here any more: reclaimDueQuotaKeys above has
+    // ALREADY returned every quota key whose retry window elapsed, on its own
+    // schedule and regardless of how many keys are active. Anything still parked
+    // at this point is inside its window, and handing it out would be exactly
+    // the "hammer a dead key" failure the schedule exists to prevent.
     return null;
   } finally { locked = false; }
 }
@@ -182,6 +291,9 @@ export function getNextKey(modelId) {
 export function markKeyUsedAndDebounceSave(id, { success, tokens = 0 }) {
   const key = keys.find((item) => item.id === id); if (!key) return;
   key.usage.lastUsed = Date.now(); key.usage[success ? "success" : "fail"] += 1; if (success) key.usage.tokens += tokens;
+  // A served request proves the key works again (credits topped up, or the wave
+  // passed), so the escalation ladder must not keep punishing it.
+  if (success) quotaRetries.delete(id);
   if (!saveTimer) saveTimer = setTimeout(() => { saveTimer = null; saveState(); }, 5000);
 }
 
@@ -214,7 +326,14 @@ export function handleKeyError(id, statusCode, responseBody, retryAfterSeconds, 
   const hasModel = typeof modelId === "string" && modelId.length > 0;
   let backoffMs = retryAfterSeconds ? retryAfterSeconds * 1000 : 0;
   if (statusCode === 401 || statusCode === 403) { key.status = "disabled"; warn("Key disabled due to auth error", { id, statusCode }); }
-  else if (statusCode === 429 && typeof responseBody === "string" && responseBody.toLowerCase().includes("quota")) { key.status = "quota-exceeded"; }
+  // GLOBAL exhaustion is decided by isQuotaExhaustedBody, which resolves the
+  // precedence INTERNALLY: a rate-limit wording wins even when it also contains
+  // the word "quota" ("exceeded your quota of 40 requests per minute"), so this
+  // branch can stay ahead of the model-scoped one without stealing model-scoped
+  // 429s from it. The old `includes("quota")` failed both ways: it parked healthy
+  // keys pool-wide, and it let real exhaustion ("credit balance", "free credits
+  // used") through as a 20 s cooldown that hammered a dead key forever.
+  else if (statusCode === 429 && isQuotaExhaustedBody(responseBody)) { parkQuotaExceeded(key); }
   else if (statusCode === 429 && hasModel) {
     // MODEL-SCOPED: this key stays immediately usable by every other model.
     backoffMs = Math.min(MAX_BACKOFF_MS, Math.max(0, backoffMs || MAX_KEY_COOLDOWN_429_MS));
@@ -274,7 +393,26 @@ export function addKey(value) {
   keys.push(result); saveState(); info("Key added", { id: result.id, keyCount: keys.length }); return result;
 }
 export function removeKey(id) { const before = keys.length; keys = keys.filter((item) => item.id !== id); if (keys.length === before) return false; saveState(); return true; }
-export function setKeyStatus(id, status) { const key = keys.find((item) => item.id === id); if (!key) return false; key.status = status; if (status === "active") key.backoffUntil = 0; saveState(); return true; }
+/**
+ * Admin status transition. VALIDATED against STATUSES: normalize() guards this
+ * on load, but the setter used to write any string through, and an out-of-set
+ * value makes the key invisible to every `status === "active"` filter — a 503
+ * while healthy keys exist. admin-api.mjs already rejects a bad status with 422
+ * (parseStatus), so this closes the non-HTTP callers, not that path.
+ *
+ * @returns {boolean} false for an unknown status or an unknown id.
+ */
+export function setKeyStatus(id, status) {
+  if (!STATUSES.has(status)) { warn("Rejected invalid key status", { id, status: typeof status === "string" ? status : typeof status }); return false; }
+  const key = keys.find((item) => item.id === id); if (!key) return false;
+  key.status = status;
+  if (status === "active") { key.backoffUntil = 0; quotaRetries.delete(id); }
+  // Parking by hand still gets a retry schedule, otherwise the reclaim sweep
+  // would undo the decision on the very next request. Uses the CURRENT ladder
+  // level without escalating it: an admin action is not an upstream failure.
+  else if (status === "quota-exceeded") { key.backoffUntil = Date.now() + quotaRetryWindowMs(quotaRetries.get(id) ?? 0); }
+  saveState(); return true;
+}
 
 // Persist the upstream-accessible model catalog onto a stored key record
 // (in-memory). Populated by the admin validate-on-add and validate-update
