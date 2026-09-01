@@ -103,6 +103,14 @@ const MAX_SOURCE_UNITS = 200;
 // withinRetention, so a note inside the value would make the entry unexpirable.
 const MAX_TIMESTAMP_UNITS = 64;
 
+/**
+ * Every LONE UTF-16 surrogate: a high surrogate not followed by a low, or a low
+ * not preceded by a high. A well-formed pair never matches. Same pattern as
+ * feedback-service.ts:33 — a per-field cut here can split a pair exactly as a
+ * cut there could.
+ */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
 // Sanitization lives in ./report-sanitizer, which builds on ./redaction — the
 // same redactor the app logger uses. The regex-only sanitizer that used to live
 // here could not see gatewayToken / adminToken (random, unprefixed base64url) and
@@ -173,11 +181,39 @@ function sanitizeEntry(entry: Record<string, unknown>): Record<string, unknown> 
  */
 function boundField(value: unknown, originalUnits: number, max: number, field: string): string {
   const text = typeof value === "string" ? value : "";
-  if (text.length <= max && originalUnits <= max) return text;
+  // THE MARKER FOLLOWS THE CUT, NOT THE INPUT SIZE. The condition was
+  // `text.length <= max && originalUnits <= max`, which appended the marker
+  // whenever the CALLER's value was long — even when the value being stored was
+  // not cut at all. MEASURED: `nvapi-` + 4,200 units is one runtime secret, so
+  // redaction collapses it to `[REDACTED]` (10 units) and nothing is lost, yet
+  // the record read `[REDACTED][truncated: message was 4206 units, cap 4000]` —
+  // 55 units claiming 4,196 units of loss that never happened. A diagnostic
+  // record that reports imaginary data loss sends an operator hunting a
+  // truncation that is not there, so the marker is now attached only when this
+  // function actually cuts something.
+  if (text.length <= max) return text;
+  // LONE SURROGATE REPAIR, same substitution and same reason as
+  // encodeFieldForUrl (feedback-service.ts:93). A cut at an arbitrary UTF-16
+  // index lands between the halves of a surrogate pair, MANUFACTURING a lone
+  // surrogate that was not in the input. MEASURED at this cap: 3,999 units then
+  // U+1F600 stored U+D83D at index 3,999 with no low surrogate after it. It does
+  // not break this file (JSON.stringify emits `\ud83d`, and the line re-parses),
+  // but it is invalid text this module invented, and one U+FFFD per broken half
+  // is what a UTF-8 encoder produces anyway. The substitution is 1:1, so the cap
+  // still binds at exactly `max` units.
+  const cut = text.slice(0, max).replace(LONE_SURROGATE, "\uFFFD");
+  // THE SIZE NAMED IS THE ONE THAT EXPLAINS THE CUT. Normally that is the
+  // caller's own figure, which is what an operator wants and the only figure
+  // independent of the slice. But redaction can GROW text (`nvapi-a`, 7 units,
+  // becomes `[REDACTED]`, 10), so a 3,900-unit message of many such tokens
+  // exceeds a 4,000 cap only AFTER sanitizing; quoting 3,900 against a cap of
+  // 4,000 would read as a contradiction in the one record meant to explain
+  // itself. Whichever size actually crossed the cap is reported.
+  const reportedUnits = Math.max(originalUnits, text.length);
   // Names the field and the sizes, never the content — assertClipboardText and
   // assertText (feedback-validation.ts:86) hold the same line, because this text
   // can contain a credential the redactor did not recognise.
-  return `${text.slice(0, max)}[truncated: ${field} was ${originalUnits} units, cap ${max}]`;
+  return `${cut}[truncated: ${field} was ${reportedUnits} units, cap ${max}]`;
 }
 
 // Clamps the report bundle to the worker's serialized-size limit by dropping
@@ -377,15 +413,79 @@ export function previewErrors(): ErrorEntry[] {
   return readErrors().filter(withinRetention).map((entry) => sanitizeEntry(entry) as unknown as ErrorEntry);
 }
 
-export function cleanupOldErrors(): number {
-  const entries = readErrors();
+/**
+ * Expire entries past RETENTION_DAYS in ONE log file, rewriting it in place.
+ *
+ * @param file Path to an active or rotated log.
+ * @returns Count of entries dropped; 0 if the file is absent or unreadable.
+ */
+function expireFile(file: string): number {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch {
+    // Absent or unreadable: nothing to expire, and a logger must not throw.
+    return 0;
+  }
+  const entries: Record<string, unknown>[] = [];
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      entries.push(JSON.parse(trimmed) as Record<string, unknown>);
+    } catch {
+      // Malformed lines are dropped, exactly as readErrors() ignores them.
+    }
+  }
   const kept = entries.filter(withinRetention);
   if (kept.length === entries.length) return 0;
-  const file = errorsLogPath();
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const body = kept.map((entry) => JSON.stringify(entry)).join("\n");
-  fs.writeFileSync(file, kept.length ? body + "\n" : "", "utf8");
+  try {
+    if (kept.length === 0) {
+      // An emptied GENERATION is removed rather than left as a 0-byte file, so a
+      // stale generation does not keep occupying a rotation slot.
+      if (file === errorsLogPath()) fs.writeFileSync(file, "", "utf8");
+      else fs.unlinkSync(file);
+    } else {
+      fs.writeFileSync(file, kept.map((entry) => JSON.stringify(entry)).join("\n") + "\n", "utf8");
+    }
+  } catch {
+    return 0;
+  }
   return entries.length - kept.length;
+}
+
+export function cleanupOldErrors(): number {
+  const file = errorsLogPath();
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+  } catch {
+    // Directory creation is best-effort.
+  }
+  let removed = expireFile(file);
+
+  // ROTATED GENERATIONS ARE SWEPT TOO, which is the point of this loop.
+  //
+  // Rotation alone turned the 10-day retention this module DOCUMENTS (see the
+  // file header) into a size bound for anything that had rotated out: cleanup
+  // rewrote the ACTIVE log only, so an entry pushed into errors.N.log was never
+  // reached by the clock again. MEASURED with the cap lowered to 64 KiB so the
+  // same code path is exercised cheaply: 40 entries stamped 400 days old were
+  // rotated out, cleanupOldErrors() reported 0 reclaimed, and all 40 were still
+  // on disk afterwards. That is strictly WORSE than before the cap existed —
+  // there the same entries sat in the active log and the next init() reclaimed
+  // them — so stale data outlived its retention because of a change made to
+  // bound the file.
+  //
+  // The cost objection does not survive measurement either: reading and parsing
+  // three FULL 5 MiB generations takes 98 ms, once, and only from init(). The
+  // read path (getErrorCount / previewErrors / sendErrors) is deliberately left
+  // reading the active log only, so nothing pulls 20 MB in to build a 64 KB
+  // report — expiry and reporting simply do not need the same scope.
+  const baseName = file.replace(/\.log$/, "");
+  for (let i = 1; i <= MAX_ROTATED_LOGS; i += 1) {
+    removed += expireFile(`${baseName}.${i}.log`);
+  }
+  return removed;
 }
 
 export async function sendErrors(): Promise<ErrorReportResult> {
