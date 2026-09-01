@@ -51,6 +51,41 @@ export const RELEASES_TOKEN_SECRET = 'NVGW_RELEASES_TOKEN';
 export const RELEASE_WORKFLOW_FILE = '.github/workflows/release.yml';
 
 /**
+ * The post-packaging guard whose wiring this script also has to police.
+ *
+ * Why it is policed HERE rather than only from `npm test`, measured:
+ *   .github/workflows/test.yml:3-8     on: push (branches: [main]), pull_request, workflow_dispatch
+ *   .github/workflows/release.yml:3-7  on: push (tags: ['v*.*.*']), workflow_dispatch
+ * A tag ref does not match a `branches:` filter, so pushing v1.2.3 runs the
+ * release pipeline and NOTHING else. tests/baked-update-feed-guard.test.mjs —
+ * the file that proves this guard is wired in after packaging and before both
+ * uploads — therefore does not run at the one moment its subject can do harm.
+ * Without the checks below, the baked-feed guard could be deleted, commented out,
+ * made conditional, `|| true`-ed or reordered after the upload, and a tag push
+ * would publish a build that cannot auto-update with every step green.
+ */
+export const BAKED_FEED_GUARD_SCRIPT = 'scripts/verify-baked-update-feed.mjs';
+
+/**
+ * Actions REVIEWED as unable to create a GitHub release. Every OTHER `uses:` in
+ * a release job counts as publish-capable and must therefore be ordered after
+ * the baked-feed guard.
+ *
+ * Fail-CLOSED on purpose, and the same polarity (and list) as
+ * tests/baked-update-feed-guard.test.mjs: recognising publishers by pattern
+ * while enforcing an allowlist means any publisher outside the pattern gets no
+ * enforcement at all. upload-artifact/download-artifact/cache write to the
+ * workflow run's own store, which electron-updater never reads.
+ */
+const REVIEWED_NON_PUBLISHING_ACTIONS = Object.freeze([
+  'actions/checkout@',
+  'actions/setup-node@',
+  'actions/upload-artifact@',
+  'actions/download-artifact@',
+  'actions/cache@'
+]);
+
+/**
  * Decide where the release must go and whether this job can get it there.
  *
  * @param {Record<string, string | undefined>} env
@@ -428,6 +463,115 @@ function validateWorkflowWiring(root) {
   const strict = input('fail_on_unmatched_files');
   if (!strict || unwrapExpression(strict.value).toLowerCase() !== 'true') {
     return fail('the feed upload no longer sets fail_on_unmatched_files: true, so a renamed or missing artifact would publish a release that looks complete and updates nobody');
+  }
+
+  // ── The POST-PACKAGING baked-feed guard.
+  //
+  //    Policed here, and not only from `npm test`, because a tag push runs THIS
+  //    WORKFLOW AND NOTHING ELSE (see BAKED_FEED_GUARD_SCRIPT above): test.yml
+  //    filters on `branches:`, which a tag ref never matches. Every check below
+  //    therefore has a counterpart in tests/baked-update-feed-guard.test.mjs that
+  //    simply is not present at release time.
+  const failBaked = (reason) => ({
+    ok: false,
+    error: `${RELEASE_WORKFLOW_FILE} no longer lets the baked-update-feed guard gate this release: ${reason}. Restore \`node ${BAKED_FEED_GUARD_SCRIPT}\` as an unconditional step that runs AFTER packaging and BEFORE every upload, or a build that cannot auto-update becomes a published release.`
+  });
+
+  const bakedPattern = /scripts[/\\]verify-baked-update-feed\.mjs/;
+
+  /**
+   * The command lines of a step's `run`, whether written inline or as a block
+   * scalar. Both spellings are legitimate, and only reading both can tell one
+   * command from two (a trailing `exit 0` reports success after a failure).
+   */
+  const runBodyOf = (step, run) => {
+    const inline = unquote(run.value);
+    if (inline !== '' && !/^[|>][+-]?\d*$/.test(inline)) return [inline];
+    const bodyIndent = indentOf(step.lines[run.at]);
+    return step.lines
+      .slice(run.at + 1, run.blockEnd)
+      .filter((line) => indentOf(line) > bodyIndent)
+      .map((line) => line.trim());
+  };
+
+  const bakedSteps = steps.filter((step) => {
+    const run = keyOf(step, 'run');
+    return Boolean(run) && bakedPattern.test(runBodyOf(step, run).join('\n'));
+  });
+  if (bakedSteps.length === 0) {
+    return failBaked(`it no longer runs ${BAKED_FEED_GUARD_SCRIPT}, so nothing checks that resources/app-update.yml was baked at all`);
+  }
+  const baked = bakedSteps[0];
+
+  // `steps.` scope, packaging output on disk and upload ordering are all per-job,
+  // so a baked-feed guard outside the packaging job gates nothing.
+  if (baked.job !== guard.job) {
+    return failBaked(`it runs in job "${baked.job}" while the release is packaged and uploaded in job "${guard.job}", where it can neither see that job's packaged output nor come before its uploads`);
+  }
+
+  const bakedIf = keyOf(baked, 'if');
+  if (bakedIf) {
+    return failBaked(`the step carries \`if: ${bakedIf.value.trim()}\`; on any run where that is false the guard is skipped and an unverified feed is published`);
+  }
+  const bakedSoft = keyOf(baked, 'continue-on-error');
+  if (bakedSoft && unwrapExpression(bakedSoft.value).toLowerCase() !== 'false') {
+    return failBaked(`the step sets continue-on-error: ${bakedSoft.value.trim()}, which lets a missing or misdirected feed report success`);
+  }
+
+  // The run must be ONE command invoking the script, with nothing able to swallow
+  // its exit code. Arguments stay allowed: forbidding them would block legitimate
+  // maintenance (`--verbose`) without closing any hole.
+  const bakedRun = keyOf(baked, 'run');
+  const bakedLines = runBodyOf(baked, bakedRun)
+    .filter((line) => line.length > 0 && !line.startsWith('#'));
+  if (bakedLines.length !== 1) {
+    return failBaked(`its run must be a SINGLE command — ${bakedLines.length} command lines can swallow its exit code (a trailing \`exit 0\` reports success after a failure)`);
+  }
+  const [bakedCommand] = bakedLines;
+  if (/[&|;`$()<>]/.test(bakedCommand)) {
+    return failBaked(`its run must not use shell chaining or substitution (found in \`${bakedCommand}\`) — \`|| true\` and friends swallow its exit code`);
+  }
+  if (!/^node\s+scripts[/\\]verify-baked-update-feed\.mjs(?:\s|$)/.test(bakedCommand)) {
+    return failBaked(`it must be invoked as \`node ${BAKED_FEED_GUARD_SCRIPT}\` (optionally with arguments), found \`${bakedCommand}\``);
+  }
+
+  // ── Ordering inside the packaging job: after packaging, before every publish.
+  const jobSteps = steps.filter((step) => step.job === guard.job);
+  const bakedIndex = jobSteps.indexOf(baked);
+  const packagedAt = jobSteps.findIndex((step) => {
+    const run = keyOf(step, 'run');
+    return Boolean(run) && runBodyOf(step, run).some((line) => line.includes('build:release'));
+  });
+  if (packagedAt < 0) {
+    return failBaked(`job "${guard.job}" no longer runs \`npm run build:release\`, so there is no packaged output for the guard to inspect`);
+  }
+  if (bakedIndex < packagedAt) {
+    return failBaked('it must run AFTER packaging — resources/app-update.yml does not exist before electron-builder writes it');
+  }
+
+  // Fail-CLOSED: anything that is not a reviewed non-publishing action counts as
+  // able to publish, so an unfamiliar action cannot quietly upload ahead of the
+  // guard. `gh release` and a REST release/asset POST publish just as well.
+  const publishCapableAt = jobSteps
+    .map((step, index) => ({ step, index }))
+    .filter(({ step }) => {
+      const uses = keyOf(step, 'uses');
+      if (uses) {
+        const target = unquote(uses.value);
+        return !REVIEWED_NON_PUBLISHING_ACTIONS.some((prefix) => target.startsWith(prefix));
+      }
+      const run = keyOf(step, 'run');
+      if (!run) return false;
+      const body = runBodyOf(step, run).join('\n');
+      return /\bgh\s+release\b/.test(body) || /\bgh\s+api\b[^\n]*releases?\b/.test(body);
+    });
+  const earlyPublish = publishCapableAt.find(({ index }) => index < bakedIndex);
+  if (earlyPublish) {
+    // A step is not required to carry either key, so the label falls back to the
+    // position rather than throwing — a crash here would report the wrong reason.
+    const named = keyOf(earlyPublish.step, 'name') ?? keyOf(earlyPublish.step, 'uses');
+    const label = named ? unquote(named.value) : `step #${earlyPublish.index}`;
+    return failBaked(`it must run BEFORE any upload, but "${label}" can publish ahead of it — a build whose feed was never verified would already be released`);
   }
 
   // ── A job-level continue-on-error would let the guard fail and the release

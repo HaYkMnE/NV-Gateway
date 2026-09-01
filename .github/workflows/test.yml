@@ -7,6 +7,16 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Least privilege, stated explicitly. Both jobs below only read the repository,
+# install dependencies, run tests and package with `--dir`: neither creates a
+# release, pushes a commit, nor touches an issue or a PR. Without this block the
+# workflow inherits the REPOSITORY DEFAULT, which on this repo can hand the
+# GITHUB_TOKEN write access to contents, issues and pull requests for every
+# `npm ci` / `npm test` run — and a release workflow already exists to publish,
+# so nothing here needs it.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Test on ${{ matrix.os }} (Node ${{ matrix.node-version }})
@@ -22,11 +32,15 @@ jobs:
         node-version: [20.x]
 
     steps:
+      # Pinned to commit SHAs, not tags: a tag is a movable pointer, so whoever
+      # controls the action's repository can repoint v4 at new code that then runs
+      # here. The trailing comment records the tag each SHA came from so Dependabot
+      # (.github/dependabot.yml tracks github-actions) can still offer bumps.
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ matrix.node-version }}
           cache: 'npm'
@@ -60,11 +74,15 @@ jobs:
         node-version: [20.x]
 
     steps:
+      # Pinned to commit SHAs, not tags: a tag is a movable pointer, so whoever
+      # controls the action's repository can repoint v4 at new code that then runs
+      # here. The trailing comment records the tag each SHA came from so Dependabot
+      # (.github/dependabot.yml tracks github-actions) can still offer bumps.
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ matrix.node-version }}
           cache: 'npm'

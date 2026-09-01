@@ -19,11 +19,19 @@ jobs:
     name: Build & Package Windows Distribution
     runs-on: windows-latest
     steps:
+      # Third-party actions are pinned to a COMMIT SHA, not a tag. A tag is a
+      # movable pointer: whoever controls the action's repository can repoint v4
+      # at new code, and that code would run here with this job's GITHUB_TOKEN
+      # (contents: write) and, below, with the release PAT in its environment. A
+      # SHA is immutable, so a compromised or rewritten tag cannot change what
+      # executes. The trailing comment records the tag each SHA was resolved from
+      # so Dependabot (.github/dependabot.yml tracks github-actions) can still
+      # offer readable bumps.
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Node.js 20.x
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20.x
           cache: 'npm'
@@ -51,10 +59,32 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # No GH_TOKEN here, deliberately. This step runs electron-builder and its
+      # whole transitive dependency tree plus the afterPack hook, so any credential
+      # in its environment is readable by all of that code — and GITHUB_TOKEN
+      # carries `contents: write` on this repository (see permissions: above).
+      #
+      # It is not needed, read out of the dependency rather than assumed:
+      #   * `--publish never` sets isPublish = false
+      #     (app-builder-lib/out/publish/PublishManager.js:63), so nothing is
+      #     uploaded from this step and createPublisher/scheduleUpload — the only
+      #     paths that construct GitHubPublisher, which is what actually reads
+      #     GH_TOKEN (electron-publish/out/gitHubPublisher.js:22-28) — never run.
+      #   * The token-sniffing fallback at PublishManager.js:338 sits behind
+      #     `if (publishers == null)`. electron-builder.yml:92-95 declares the
+      #     publish block explicitly, so publishers is never null and that branch
+      #     is unreachable.
+      #   * Baking app-update.yml goes through getAppUpdatePublishConfiguration
+      #     (:193-210) -> getResolvedPublishConfig (:383), which for provider
+      #     github with owner and repo already set resolves at :414-427 without
+      #     reading any token.
+      #
+      # If that analysis were ever wrong, electron-builder throws
+      # InvalidConfigurationError("GitHub Personal Access Token is not set") and
+      # the release fails LOUDLY — it cannot degrade into a silent bad package.
       - name: Build and Package Release Artifacts
         env:
           NVGW_GH_OWNER: ${{ github.repository_owner }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           npm run build:release
 
@@ -113,7 +143,7 @@ jobs:
       # PAT: the default GITHUB_TOKEN is scoped to this repository and cannot create a
       # release in another one. The guard has already failed the job if it is missing.
       - name: Publish to the update feed repository
-        uses: softprops/action-gh-release@v2.6.2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
           repository: ${{ steps.release-target.outputs.feed_repository }}
@@ -142,7 +172,7 @@ jobs:
       # this repo, and a stale copy sitting next to a real feed only invites confusion
       # about which one is authoritative.
       - name: Publish to this repository for the README download links
-        uses: softprops/action-gh-release@v2.6.2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
