@@ -287,7 +287,36 @@ test('explicit router records a fixed lifecycle initialization failure code and 
 test('audit write failures are non-throwing and do not reject the command workflow', async () => {
   const { createMigrationPhaseAudit } = await import(built('migration-phase-audit.js'));
   const { runApplicationStartup } = await import(built('explicit-legacy-migration-startup.js'));
-  const audit = createMigrationPhaseAudit({ filePath: 'NUL\\invalid\\migration-phase.jsonl' });
+
+  // The target must be a path whose write REALLY fails, and it must be absolute
+  // and inside the sandbox.
+  //
+  // This case used to pass the RELATIVE path 'NUL\\invalid\\migration-phase.jsonl',
+  // which proved nothing and polluted the repo. MEASURED on Windows: `NUL` only
+  // resolves to the null device as the FINAL path component. As a directory
+  // component it is an ordinary name, so the audit's
+  // `fs.mkdirSync(path.dirname(filePath), { recursive: true })` CREATED a real
+  // directory named NUL in the repo root (relative path => resolved against
+  // process.cwd(), i.e. the repo), and the write then SUCCEEDED:
+  //
+  //   NUL\invalid\migration-phase.jsonl   mkdir=ok  open=ok  append=ok   6 bytes landed
+  //   in<valid\migration-phase.jsonl      mkdir=ENOENT
+  //   <regular file>\migration-phase.jsonl mkdir=EEXIST
+  //
+  // So this test asserted "write failures are non-throwing" while exercising the
+  // SUCCESS path, and every run appended to repo-root NUL\invalid (225 records /
+  // 26,214 bytes had accumulated). A file used as a directory is a real failure
+  // on every platform, and staying under the temp sandbox keeps the repo clean.
+  const directory = temporaryDirectory('nvgw-migration-phase-write-failure-');
+  const blocker = path.join(directory, 'blocker');
+  fs.writeFileSync(blocker, 'not a directory', 'utf8');
+  const unwritableTarget = path.join(blocker, 'migration-phase.jsonl');
+  assert.equal(path.isAbsolute(unwritableTarget), true,
+    'the audit target must be absolute: a relative path is resolved against the repo and pollutes it');
+  assert.throws(() => fs.mkdirSync(path.dirname(unwritableTarget), { recursive: true }),
+    'the chosen target must genuinely fail to be created, otherwise this test proves nothing');
+
+  const audit = createMigrationPhaseAudit({ filePath: unwritableTarget });
   const result = await runApplicationStartup({
     explicitLegacyMigration: true,
     validateLegacySource: () => ({ fake: true }),
