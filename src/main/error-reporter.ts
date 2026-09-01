@@ -30,6 +30,79 @@ const SEND_TIMEOUT_MS = 15000;
 const RETENTION_DAYS = 10;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
+// Size cap for errors.log, DELIBERATELY the same scheme and the same numbers as
+// app-logger.ts:5-6 (5 MB x 3) rather than a second scheme invented here.
+//
+// WHY IT WAS NEEDED. Retention was the ONLY bound on this file, and it is
+// evaluated in exactly two places: on READ (withinRetention, which filters what
+// is counted and previewed but never shrinks the file) and in cleanupOldErrors(),
+// whose single call site is init(). So a session that never restarts never
+// reclaims anything: no init(), no cleanup, no cap.
+//
+// MEASURED before this cap existed, with one fault repeating in a single session
+// (tests/error-reporter-bounds.test.mjs): 1,400 entries carrying an 8,000-unit
+// stack wrote 11,359,890 bytes to one file at 8,114 bytes per entry, with zero
+// rotated files. That is 2.2x the 5 MB the app logger caps at, still climbing,
+// and the projection is linear in the fault rate: a loop logging a handful of
+// times a second fills a disk in a long-running session.
+//
+// TWO CONSEQUENCES, STATED RATHER THAN HIDDEN, both inherited from the app-logger
+// scheme this deliberately matches:
+//
+//   * readErrors() reads the ACTIVE log only, so once a generation rotates out its
+//     entries stop being counted by getErrorCount(), previewed, or sent. That is
+//     the point of a cap — the alternative is an unbounded read of up to 20 MB into
+//     memory to build a 64 KB report — but it does mean a fault storm can now push
+//     older still-in-retention entries out of the report. Before this change they
+//     were retained; before this change the file was also unbounded.
+//   * cleanupOldErrors() rewrites the active log only, so rotated generations are
+//     bounded by SIZE (3 x 5 MB) rather than by the 10-day clock. Retention on the
+//     active log is unchanged, which is the behaviour the counters and the preview
+//     actually read.
+const MAX_LOG_SIZE = 5 * 1024 * 1024;
+const MAX_ROTATED_LOGS = 3;
+
+// Per-field caps for a stored error record, in UTF-16 CODE UNITS.
+//
+// WHY THIS MODULE STATES ITS OWN BOUND. Until now the only thing limiting these
+// fields was `redaction.ts:83` ending `.slice(0, 16_384)` — a truncation that
+// exists for REDACTION reasons, in a module this one does not own and which has
+// no stake in how big a log record may be. MEASURED before this cap existed:
+// `logError({ message: 'a'.repeat(100000) })` stored exactly 16,384 units, the
+// slice bound to the character, with nothing in the record indicating that 83,616
+// units had been dropped. Raise or remove that slice and this path is unbounded
+// again, silently. `feedback-validation.ts` was made independent of the same slice
+// for the same reason (see its header); this is the remaining caller that was not.
+//
+// 4,000 MATCHES THAT PRECEDENT rather than inventing a second scheme: the feedback
+// paths bound their fields so the worst case is 3,998 units against the same
+// 16,384 threshold. 4,000 units holds a full diagnostic message and roughly 40-50
+// stack frames, so nothing diagnostically useful is lost, and it sits at a quarter
+// of the slice so this module's bound is what binds.
+//
+// TRUNCATION IS VISIBLE, NOT SILENT. The record says what was dropped and how big
+// the input was. It cannot say so in a NEW FIELD: sanitizeReportEntry keeps a
+// fail-closed ALLOW-LIST of fields (report-sanitizer.ts:29) and drops everything
+// else, so a `truncated` flag would be discarded on the way out. The note goes in
+// the value, in the same untranslated-marker style as `[REDACTED]`, `[omitted]`
+// and `[Circular]`, so it adds no user-facing string and no i18n key.
+//
+// THE SIZE IS NAMED, THE CONTENT IS NEVER ECHOED — same discipline as
+// assertClipboardText (index.ts:715) and assertText (feedback-validation.ts:86):
+// an error message can carry an NVIDIA key or the gateway token.
+const MAX_MESSAGE_UNITS = 4000;
+const MAX_STACK_UNITS = 4000;
+// `source` is a short origin discriminator — the call sites in this file pass
+// "main", and the renderer passes a view name. It is still renderer-supplied
+// free text, so it needs its own bound or it inherits the slice exactly as the
+// other fields did.
+const MAX_SOURCE_UNITS = 200;
+// A `timestamp` this module accepts is one Date.parse understands, and every such
+// spelling is far shorter than this; the cap only stops an unparsed-but-long value
+// from being stored. No marker is appended to this field — it is PARSED by
+// withinRetention, so a note inside the value would make the entry unexpirable.
+const MAX_TIMESTAMP_UNITS = 64;
+
 // Sanitization lives in ./report-sanitizer, which builds on ./redaction — the
 // same redactor the app logger uses. The regex-only sanitizer that used to live
 // here could not see gatewayToken / adminToken (random, unprefixed base64url) and
@@ -74,6 +147,39 @@ function sanitizeEntry(entry: Record<string, unknown>): Record<string, unknown> 
   return sanitizeReportEntry(entry);
 }
 
+/**
+ * Bound one already-sanitized field and record the loss inside the value.
+ *
+ * ORDER MATTERS, AND IT IS SANITIZE-THEN-BOUND. Cutting first would be a
+ * security regression, not merely a cosmetic difference: `redact()` removes
+ * registered runtime secrets by EXACT MATCH (redaction.ts:83), so a cut landing
+ * inside the gateway or admin token would leave a PREFIX of that token, which no
+ * longer matches, is no longer removed, and is written to disk verbatim. Bounding
+ * the redacted text cannot resurrect a secret, because every secret is already
+ * `[REDACTED]` by then.
+ *
+ * THE SIZE REPORTED IS THE ORIGINAL INPUT'S, not the sanitized string's, for two
+ * reasons. It is the number an operator actually wants ("the renderer sent us
+ * 100,000 units"), and it is invariant: redaction both shrinks text (a token
+ * becomes `[REDACTED]`) and grows it (`nvapi-a`, 7 units, becomes `[REDACTED]`,
+ * 10), so quoting the post-redaction size would make the recorded figure depend on
+ * the very slice this bound exists to be independent of.
+ *
+ * @param value Sanitized field value.
+ * @param originalUnits Length in UTF-16 units of the value as the caller supplied it.
+ * @param max Cap for this field.
+ * @param field Field name, used in the marker. The VALUE is never echoed.
+ * @returns The value unchanged, or a truncated value carrying a size marker.
+ */
+function boundField(value: unknown, originalUnits: number, max: number, field: string): string {
+  const text = typeof value === "string" ? value : "";
+  if (text.length <= max && originalUnits <= max) return text;
+  // Names the field and the sizes, never the content — assertClipboardText and
+  // assertText (feedback-validation.ts:86) hold the same line, because this text
+  // can contain a credential the redactor did not recognise.
+  return `${text.slice(0, max)}[truncated: ${field} was ${originalUnits} units, cap ${max}]`;
+}
+
 // Clamps the report bundle to the worker's serialized-size limit by dropping
 // the oldest entries first.  Mutates the report in place; `count` is kept
 // consistent with the retained entries.  A single entry larger than the
@@ -107,9 +213,52 @@ function readErrors(): Record<string, unknown>[] {
   return out;
 }
 
+// Rotate errors.log once it reaches MAX_LOG_SIZE, keeping MAX_ROTATED_LOGS
+// generations. Same algorithm as app-logger.ts:19-41 — oldest generation removed
+// first, then each generation shifted up from the highest down so nothing is
+// overwritten — with two deliberate differences:
+//
+//   * the extension is `.log`, not `.jsonl`, so the basename is stripped with a
+//     `\.log$` rule. Copying app-logger's `\.jsonl$` rule verbatim would have
+//     produced `errors.log.1.jsonl`.
+//   * no protectFile/ACL hook. app-logger re-applies its ACL to each rotated
+//     file because initAppLogger is handed a protector; this module has never
+//     had one (appendEntry only ever did mkdirSync + appendFileSync), and wiring
+//     one in is a separate concern from bounding the size.
+//
+// Every failure is swallowed: a logger must never throw into its caller, and a
+// failed rotation must still leave the append below to run.
+function rotateIfNeeded(file: string): void {
+  try {
+    if (fs.statSync(file).size < MAX_LOG_SIZE) return;
+  } catch {
+    // No file yet, or it cannot be stat'ed: nothing to rotate.
+    return;
+  }
+
+  const baseName = file.replace(/\.log$/, "");
+  try {
+    fs.unlinkSync(`${baseName}.${MAX_ROTATED_LOGS}.log`);
+  } catch {
+    // The oldest generation may not exist yet.
+  }
+
+  // Highest generation first so a rename never clobbers a file still needed.
+  // i === 1 moves the active log itself; i > 1 moves generation i-1 up to i.
+  for (let i = MAX_ROTATED_LOGS; i >= 1; i -= 1) {
+    const from = i === 1 ? file : `${baseName}.${i - 1}.log`;
+    try {
+      fs.renameSync(from, `${baseName}.${i}.log`);
+    } catch {
+      // A missing generation is normal before the log has rotated that often.
+    }
+  }
+}
+
 function appendEntry(entry: Record<string, unknown>): void {
   const file = errorsLogPath();
   fs.mkdirSync(path.dirname(file), { recursive: true });
+  rotateIfNeeded(file);
   fs.appendFileSync(file, JSON.stringify(entry) + "\n", "utf8");
 }
 
@@ -169,13 +318,50 @@ export function init(): void {
 
 export function logError(entry: Partial<ErrorEntry> & { message?: string }): void {
   const source = entry && typeof entry === "object" ? entry : {};
+
+  // ONE READ PER FIELD, into a local. The original UTF-16 length is captured here,
+  // BEFORE sanitization, for two reasons: it is the size an operator actually wants
+  // to see, and it is the only figure independent of redaction, which both shrinks
+  // text (a token becomes `[REDACTED]`) and grows it (`nvapi-a` -> `[REDACTED]`).
+  // Reading once also means the value that is measured is by construction the value
+  // that is stored — the lesson snapshotFeedbackData records in feedback-validation.ts.
+  const readTimestamp = source.timestamp;
+  const readType = source.type;
+  const readMessage = source.message;
+  const readStack = source.stack;
+  const readSource = source.source;
+
+  const rawMessage = typeof readMessage === "string" ? readMessage : String(readMessage ?? "");
+  const rawStack = typeof readStack === "string" ? readStack : "";
+  const rawSource = typeof readSource === "string" ? readSource : "";
+
   const record = sanitizeEntry({
-    timestamp: source.timestamp || new Date().toISOString(),
-    type: source.type || "renderer",
-    message: typeof source.message === "string" ? source.message : String(source.message ?? ""),
-    ...(typeof source.stack === "string" && source.stack ? { stack: source.stack } : {}),
-    ...(typeof source.source === "string" && source.source ? { source: source.source } : {})
+    timestamp: readTimestamp || new Date().toISOString(),
+    type: readType || "renderer",
+    message: rawMessage,
+    ...(rawStack ? { stack: rawStack } : {}),
+    ...(rawSource ? { source: rawSource } : {})
   });
+
+  // BOUND AFTER SANITIZING — see boundField for why that order is a security
+  // property and not a preference. Each field is given its own pre-sanitization
+  // size, so the marker names what the caller actually sent rather than whatever
+  // survived the redactor.
+  record.message = boundField(record.message, rawMessage.length, MAX_MESSAGE_UNITS, "message");
+  if (typeof record.stack === "string") {
+    record.stack = boundField(record.stack, rawStack.length, MAX_STACK_UNITS, "stack");
+  }
+  if (typeof record.source === "string") {
+    record.source = boundField(record.source, rawSource.length, MAX_SOURCE_UNITS, "source");
+  }
+  // Bounded WITHOUT a marker, unlike the fields above: withinRetention PARSES this
+  // value, and appending a note would make the entry unparseable and therefore
+  // unexpirable. An over-long timestamp is garbage input; cutting it makes it fail
+  // Date.parse, so the entry is simply not counted and is reclaimed at cleanup.
+  if (typeof record.timestamp === "string" && record.timestamp.length > MAX_TIMESTAMP_UNITS) {
+    record.timestamp = record.timestamp.slice(0, MAX_TIMESTAMP_UNITS);
+  }
+
   try {
     appendEntry(record);
   } catch {
