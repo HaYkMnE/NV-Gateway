@@ -81,7 +81,7 @@ const scratchDirs = [];
  * failure mode that let a test in this repo measure the SUCCESS path of a write
  * for six review rounds.
  */
-function harness() {
+function harness({ failFirstNotice = false, hostileNotice = false } = {}) {
   fs.mkdirSync(scratchBase, { recursive: true });
   const dir = fs.mkdtempSync(join(scratchBase, 'nv-error-rotation-'));
   scratchDirs.push(dir);
@@ -104,6 +104,51 @@ function harness() {
       before = js;
       js = js.replace(/const MAX_LOG_SIZE = [^;]+;/, `const MAX_LOG_SIZE = ${TEST_CAP};`);
       assert.notEqual(js, before, 'cap-lowering patch did not apply: this file would measure nothing');
+
+      if (failFirstNotice) {
+        // Make the RECOVERY NOTICE's own append fail once, on demand, leaving
+        // every other append healthy. The flag is read at call time so the test
+        // controls exactly which write fails.
+        before = js;
+        js = js.replace(
+          /fs\.appendFileSync\(file, JSON\.stringify\(notice\) \+ "\\n", "utf8"\);/,
+          'if (globalThis.__nvFailNotice) { globalThis.__nvFailNotice = false; ' +
+            'throw Object.assign(new Error("EPERM: injected notice failure"), { code: "EPERM" }); } ' +
+            'fs.appendFileSync(file, JSON.stringify(notice) + "\\n", "utf8");'
+        );
+        assert.notEqual(js, before, 'notice-failure patch did not apply: this file would measure nothing');
+      }
+
+      if (hostileNotice) {
+        // Simulate the PLAUSIBLE NEAR-FUTURE EDIT: someone names the log path in
+        // the recovery message (the obvious next request from an operator) and
+        // adds a field. Neither is caller data today, which is the whole point:
+        // the record must be sanitized because the CONTENT of this message is not
+        // an invariant, and a path carries the local account name.
+        // ANCHORED ON CODE-ONLY TEXT, and that is a correction made after this very
+        // test passed for the wrong reason. The anchor was `[log-suppressed: `,
+        // whose FIRST occurrence in the transpiled output is inside the doc comment
+        // above suppressionNotice (transpileModule keeps comments), so the payload
+        // was injected into a COMMENT, the `notEqual` guard below was satisfied by
+        // the comment changing, and the two leak assertions then passed vacuously —
+        // they would have stayed green with the bypass fully restored. `${suppressedCount}`
+        // appears only in the executable template.
+        before = js;
+        js = js.replace(
+          '`[log-suppressed: ${suppressedCount}',
+          '`C:\\\\Users\\\\victim\\\\AppData\\\\errors.log nvapi-DEADBEEFCAFE0123456789 [log-suppressed: ${suppressedCount}'
+        );
+        assert.notEqual(js, before, 'hostile-message patch did not apply');
+        // Belt and braces: the payload must be in CODE, not merely somewhere in the
+        // file. Without this, a future anchor drift repeats the vacuous pass above.
+        assert.ok(
+          /message:\s*`C:\\\\Users\\\\victim/.test(js),
+          'hostile payload did not land in the message expression: this test would measure nothing'
+        );
+        before = js;
+        js = js.replace('source: "error-reporter"', 'source: "error-reporter", forgedExtra: "must-be-dropped"');
+        assert.notEqual(js, before, 'hostile-field patch did not apply');
+      }
     }
     fs.writeFileSync(join(outDir, `${name}.js`), js, 'utf8');
   }
@@ -383,6 +428,102 @@ test('MARKER FORGERY: a forged truncation marker is distinguishable by ARITHMETI
   assert.ok(forgedStored.length <= CAP, 'the forged field was not truncated, so it must fit the cap');
   assert.equal(relationHolds(forgedStored, 'stack'), false, 'a forged marker must NOT satisfy the size relation');
   assert.equal(relationHolds(genuineStored, 'stack'), true, 'a genuine marker MUST satisfy the size relation');
+});
+
+// ---------------------------------------------------------------------------
+// HARDENING, added by an independent 1:1 review of 457d77a. Each test below
+// corresponds to a measured way the ORIGINAL six tests stayed green while a
+// property the commit message claims was absent or wrong.
+// ---------------------------------------------------------------------------
+
+test('HARDENING: the recovery notice is SANITIZED and BOUNDED like every other record', () => {
+  // MEASURED GAP: suppressionNotice() bypassed sanitizeEntry and boundField,
+  // justified as safe because no caller data reaches it. That is true of today's
+  // code and is not an invariant of the record. Routing it through costs NOTHING
+  // — sanitizeReportEntry left the real notice byte-identical, 179 units in and
+  // 179 out, and at ~170 units against a 4,000 cap boundField returns it
+  // untouched — so the bypass bought nothing while leaving the leak available.
+  //
+  // The patch below is the plausible near-future edit: name the log PATH in the
+  // message, which is the obvious next thing an operator asks for. MEASURED with
+  // the bypass in place, the record reached disk as
+  // `C:\Users\victim\AppData\errors.log nvapi-DEADBEEFCAFE0123456789 [log-suppressed: ...]`
+  // — local ACCOUNT NAME and an nvapi key stored verbatim — and an extra field on
+  // the object was written out too. None of the six original tests inspects the
+  // notice for either, so the bypass could be restored with the suite fully green.
+  const h = harness({ hostileNotice: true });
+  seedOverCap(h);
+  const clear = obstructRotation(h);
+  h.reporter.logError({ type: 'gateway', message: 'opener', stack: 'x'.repeat(2_000), source: 'measurement' });
+  storm(h.reporter, 4, 'dropped');
+  clear();
+  h.reporter.logError({ type: 'gateway', message: 'after-recovery', stack: 'x'.repeat(2_000), source: 'measurement' });
+
+  const notice = entries(h.logFile).find((entry) => /log-suppressed/.test(String(entry.message)));
+  assert.ok(notice, 'the recovery notice must still be emitted');
+  const raw = JSON.stringify(notice);
+
+  console.log(`HARDENING notice: ${JSON.stringify(String(notice.message).slice(0, 96))}`);
+
+  assert.ok(!raw.includes('victim'), `the local account name reached disk: ${raw}`);
+  assert.ok(!raw.includes('nvapi-DEADBEEFCAFE0123456789'), `an nvapi key reached disk verbatim: ${raw}`);
+  assert.ok(String(notice.message).includes('C:\\Users\\***'), 'the user path must be masked, proving maskUserPaths ran');
+  assert.ok(String(notice.message).includes('[REDACTED]'), 'the key must be redacted, proving redact() ran');
+  // The allow-list must apply to this record too, not only to caller entries.
+  assert.ok(!('forgedExtra' in notice), 'a non-allow-listed field on the notice must be dropped');
+  // Still the ONE record, still naming the count and the period.
+  assert.equal(entries(h.logFile).filter((e) => /log-suppressed/.test(String(e.message))).length, 1);
+  assert.ok(/log-suppressed: 4 entries/.test(String(notice.message)), `the count must survive sanitizing: ${notice.message}`);
+  assert.ok(String(notice.message).length <= 4_000 + 64, 'the notice must be bounded like any other field');
+});
+
+test('HARDENING: a FAILED recovery-notice write does not lose the count', () => {
+  // MEASURED DEFECT in 457d77a: the counters were reset BEFORE the notice append,
+  // reasoning that a failed write must not leave them primed to emit twice. With
+  // an EPERM injected on the notice append ONLY, 5 suppressed entries produced 0
+  // recovery records, and three further fully healthy appends produced 0 as well.
+  // The count was gone for good and the operator had no signal whatsoever that
+  // anything had been dropped — the silent gap this commit exists to eliminate,
+  // reintroduced by its own error path. The write that failed is exactly the write
+  // to retry: nothing reached disk, so a later attempt is not a duplicate.
+  const h = harness({ failFirstNotice: true });
+  seedOverCap(h);
+  const clear = obstructRotation(h);
+  h.reporter.logError({ type: 'gateway', message: 'opener', stack: 'x'.repeat(2_000), source: 'measurement' });
+  const dropped = 5;
+  storm(h.reporter, dropped, 'dropped');
+  clear();
+
+  globalThis.__nvFailNotice = true;
+  h.reporter.logError({ type: 'gateway', message: 'recovery-attempt-1', stack: 'x'.repeat(2_000), source: 'measurement' });
+  const afterFailure = entries(h.logFile).filter((entry) => /log-suppressed/.test(String(entry.message))).length;
+
+  // Everything healthy from here on.
+  h.reporter.logError({ type: 'gateway', message: 'recovery-attempt-2', stack: 'x'.repeat(2_000), source: 'measurement' });
+  const notices = entries(h.logFile).filter((entry) => /log-suppressed/.test(String(entry.message)));
+
+  console.log(
+    `NOTICE-RETRY measured: notices after the failed write=${afterFailure}, ` +
+    `after one further healthy append=${notices.length}, message=${JSON.stringify(notices[0]?.message ?? null)}`
+  );
+
+  assert.equal(afterFailure, 0, 'the injected failure must actually have blocked the write');
+  assert.equal(notices.length, 1, 'the count must be retried and reported exactly once, not lost and not doubled');
+  assert.ok(
+    notices[0].message.includes(String(dropped)),
+    `the retried notice must still name all ${dropped} dropped entries: ${notices[0].message}`
+  );
+  // The entry that accompanied the failed notice must not have been lost with it.
+  assert.ok(entries(h.logFile).some((e) => e.message === 'recovery-attempt-1'), 'the accompanying entry must still be written');
+
+  // And once reported, it must NOT be reported again.
+  h.reporter.logError({ type: 'gateway', message: 'third', stack: 'x'.repeat(2_000), source: 'measurement' });
+  assert.equal(
+    entries(h.logFile).filter((entry) => /log-suppressed/.test(String(entry.message))).length,
+    1,
+    'the notice must not be re-emitted once it has been written'
+  );
+  delete globalThis.__nvFailNotice;
 });
 
 test.after(() => {

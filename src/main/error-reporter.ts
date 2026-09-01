@@ -386,16 +386,38 @@ function noteSuppressed(): void {
  * untranslated style as `[REDACTED]`, `[omitted]` and `[Circular]`, and the locale
  * files are pinned at 301 keys each.
  *
- * IT SKIPS sanitizeEntry AND boundField ON PURPOSE, and that is safe only because
- * NO CALLER DATA REACHES IT: every part is generated here — an integer counter, two
- * ISO timestamps from new Date(), and one fixed English sentence. There is no
- * secret to redact and nothing whose length a caller controls (the whole record is
- * ~160 units against a 4,000-unit cap). The fields it does set are all inside
- * sanitizeReportEntry's allow-list, so previewErrors() forwards it unchanged when
- * the record is later READ back.
+ * IT IS SANITIZED AND BOUNDED LIKE EVERY OTHER RECORD, in that order, and it did
+ * NOT USED TO BE. The argument for skipping both was that no caller data reaches
+ * this record: every part is generated here, an integer counter, two ISO timestamps
+ * from new Date(), and one fixed English sentence, so there is no secret to redact
+ * and nothing whose length a caller controls. That argument is true TODAY and it is
+ * still the wrong place to rely on it, for two measured reasons.
+ *
+ * MEASURED, cost of routing it through: NONE. sanitizeReportEntry leaves this
+ * record byte-identical (179-unit message in, 179 out, whole object deep-equal),
+ * and at ~170 units against a 4,000-unit cap boundField returns it untouched with
+ * no marker. So the bypass bought nothing and the defence is free.
+ *
+ * MEASURED, cost of keeping the bypass: a plausible near-future edit leaks. With
+ * the log PATH interpolated into the message, which is the obvious next thing an
+ * operator asks for, the record reached disk as
+ * `C:\Users\victim\AppData\errors.log nvapi-DEADBEEFCAFE [log-suppressed: ...]`:
+ * the local ACCOUNT NAME and an nvapi key stored verbatim, and an extra field on
+ * the object survived to disk as well. Through this path the same edit stores
+ * `C:\Users\***\`, `[REDACTED]`, and the extra field is dropped by the allow-list.
+ * A path that skips the sanitizer is how secrets leak; "nobody interpolates caller
+ * text here today" is a property of today's code, not an invariant of this record.
+ *
+ * SANITIZE THEN BOUND, never the reverse, for the reason boundField states: redact()
+ * removes runtime secrets by EXACT match, so a cut landing inside a token leaves an
+ * unmatched prefix that is written out verbatim.
+ *
+ * The fields set here are all inside sanitizeReportEntry's allow-list, so the record
+ * survives this pass intact and previewErrors() forwards it unchanged when it is
+ * later READ back.
  */
 function suppressionNotice(): Record<string, unknown> {
-  return {
+  const raw = {
     timestamp: new Date().toISOString(),
     type: "renderer",
     message:
@@ -403,6 +425,12 @@ function suppressionNotice(): Record<string, unknown> {
       `were dropped: errors.log was at its ${MAX_LOG_SIZE}-byte cap and rotation was obstructed]`,
     source: "error-reporter"
   };
+  const record = sanitizeEntry(raw);
+  record.message = boundField(record.message, raw.message.length, MAX_MESSAGE_UNITS, "message");
+  if (typeof record.source === "string") {
+    record.source = boundField(record.source, raw.source.length, MAX_SOURCE_UNITS, "source");
+  }
+  return record;
 }
 
 /**
@@ -444,20 +472,38 @@ function appendEntry(entry: Record<string, unknown>): void {
   // Rotation is working again (or was never needed). SELF-HEALING, with no
   // restart: this runs on the very next append after the obstruction clears,
   // because every append re-attempts rotation.
-  if (suppressingAppends) {
-    suppressingAppends = false;
-    if (suppressedCount > 0) {
-      // Reset BEFORE the write, so a failed append cannot leave the counters
-      // primed to emit the same notice again on the next call.
-      const notice = suppressionNotice();
+  suppressingAppends = false;
+
+  // THE GAP IS REPORTED WHEN THERE IS ONE, not merely when this call is the one
+  // that observed the recovery. The condition used to be nested inside `if
+  // (suppressingAppends)`, which is what made the counters unreachable after a
+  // failed write (see below); asking `is there an unreported gap` instead is the
+  // actual invariant and it holds on every healthy append.
+  if (suppressedCount > 0) {
+    const notice = suppressionNotice();
+    // THE COUNTERS ARE CLEARED ONLY ON A SUCCESSFUL WRITE, and that is a
+    // correction. They used to be reset BEFORE the append, reasoning that a
+    // failed write must not leave them primed to emit the same notice twice.
+    // MEASURED consequence, with an EPERM injected on the notice append only:
+    // 5 suppressed entries produced 0 recovery records, and three further healthy
+    // appends produced 0 as well — the count was gone for good and the operator
+    // had no signal at all that anything had been dropped. The write that failed
+    // is precisely the write that must be retried: nothing reached disk, so a
+    // later attempt is not a duplicate.
+    //
+    // The one imperfect case is stated rather than hidden: appendFileSync can
+    // write some bytes and then fail (ENOSPC mid-write), so a retry can leave a
+    // half-written line ahead of the good record. That costs nothing here —
+    // readErrors() and expireFile() both skip unparseable lines by design — and a
+    // truncated fragment is a far smaller loss than a silently missing gap report.
+    try {
+      fs.appendFileSync(file, JSON.stringify(notice) + "\n", "utf8");
       suppressedCount = 0;
       suppressedSince = "";
       suppressedUntil = "";
-      try {
-        fs.appendFileSync(file, JSON.stringify(notice) + "\n", "utf8");
-      } catch {
-        // The notice is best-effort; losing it must not also lose the entry below.
-      }
+    } catch {
+      // Kept for the next append to retry. `suppressedSince` is preserved with
+      // it, so the gap keeps its true start rather than restarting the clock.
     }
   }
 
