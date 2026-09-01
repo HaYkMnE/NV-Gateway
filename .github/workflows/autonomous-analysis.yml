@@ -14,8 +14,16 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ vars.AUTONOMOUS_LOOP_ENABLED == 'true' }}
     steps:
+      # Pinned to a commit SHA, not a tag: a tag is a movable pointer, so whoever
+      # controls the action's repository can repoint v4 at new code that then runs
+      # here with this job's contents:write + issues:write GITHUB_TOKEN. This
+      # workflow is currently disabled_manually AND gated on
+      # vars.AUTONOMOUS_LOOP_ENABLED, but a movable tag on a disabled workflow is
+      # still a supply-chain hole the day someone enables it. The trailing comment
+      # records the tag the SHA came from so Dependabot (.github/dependabot.yml
+      # tracks github-actions) can still offer bumps.
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Run Telemetry Collector
         run: |

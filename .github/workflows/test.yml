@@ -114,36 +114,18 @@ jobs:
             Tee-Object -FilePath packaged-tests.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # Was inline PowerShell that grepped for "# SKIP" and "# fail 0". That was a
+      # TEXTUAL guard and it had a hole: node:test can also neutralise a test with
+      # t.todo() / { todo: true }, which TAP reports as `ok N - <name> # TODO` — read
+      # as a clean pass by a SKIP-only check — while a test that THROWS under todo
+      # prints `not ok` yet still leaves `# fail 0` and exit code 0. Measured on
+      # Node v20.20.2 and v22.22.2 alike. The logic now lives in a script with its
+      # own regression test (tests/assert-tap-proof.test.mjs) covering that bypass,
+      # and it fails CLOSED if the TAP summary cannot be parsed at all.
       - name: Prove the packaged assertions EXECUTED (not skipped)
         shell: pwsh
         run: |
-          $lines = Get-Content packaged-tests.log
-          $failed = $false
-
-          # These two are gated by t.skip / skip:, so a skip is visible in TAP as
-          # "# SKIP" on the ok line. Presence alone is not enough — absence of SKIP
-          # is the actual proof.
-          foreach ($name in @(
-            'the packaged engine lives INSIDE app.asar',
-            'packaged credential smoke statically audits the existing unpacked output when present'
-          )) {
-            $line = $lines | Where-Object { $_ -match '^ok \d+ - ' -and $_.Contains($name) } | Select-Object -First 1
-            if (-not $line) { Write-Host "MISSING : $name"; $failed = $true }
-            elseif ($line -match '# SKIP') { Write-Host "SKIPPED : $line"; $failed = $true }
-            else { Write-Host "EXECUTED: $line" }
-          }
-
-          # final-migration's packaged-layout test is gated by an early RETURN, which
-          # still prints a plain "ok" — indistinguishable from a real pass in TAP. It
-          # emits this marker only after its assertions have run.
-          $marker = $lines | Where-Object { $_ -match 'PACKAGED_LAYOUT_VERIFIED' } | Select-Object -First 1
-          if (-not $marker) { Write-Host 'MISSING : PACKAGED_LAYOUT_VERIFIED marker'; $failed = $true }
-          else { Write-Host "EXECUTED: $($marker.Trim())" }
-
-          if (-not ($lines | Where-Object { $_ -match '^# fail 0$' })) {
-            Write-Host 'MISSING : "# fail 0" — the packaged test run reported failures'
-            $failed = $true
-          }
-
-          if ($failed) { Write-Host 'PACKAGED_ASSERTIONS_NOT_PROVEN'; exit 1 }
-          Write-Host 'ALL_PACKAGED_ASSERTIONS_EXECUTED'
+          node scripts/assert-tap-proof.mjs packaged-tests.log `
+            --require-ok='the packaged engine lives INSIDE app.asar' `
+            --require-ok='packaged credential smoke statically audits the existing unpacked output when present' `
+            --require-marker=PACKAGED_LAYOUT_VERIFIED

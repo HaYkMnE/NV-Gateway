@@ -4,13 +4,36 @@ on:
   issues:
     types: [opened]
 
+# Least privilege, stated explicitly. Without this block the workflow inherits the
+# REPOSITORY DEFAULT, and that default is measured, not assumed:
+#   GET /repos/HaYkMnE/NV-Gateway/actions/permissions/workflow
+#   -> {"default_workflow_permissions":"write","can_approve_pull_request_reviews":true}
+# So every step here — including a third-party action asked to open a pull request —
+# would receive a GITHUB_TOKEN with write access to contents, issues and pull
+# requests, and the ability to approve PRs. This was the only workflow in the repo
+# with no permissions block; the other six all declare one.
+#
+# `contents: read` is sufficient: checkout needs it, the two guard steps only read
+# the working tree, and the steps that genuinely need more auth carry their own
+# credential (secrets.JULES_GITHUB_PAT for the duplicate-PR check,
+# secrets.JULES_DEVELOPER_API_KEY for the agent) rather than GITHUB_TOKEN. Narrowing
+# this changes nothing about whether the workflow runs — it stays disabled.
+permissions:
+  contents: read
+
 jobs:
   develop:
     runs-on: ubuntu-latest
     if: ${{ vars.AUTONOMOUS_LOOP_ENABLED == 'true' && (github.event.issue.author_association == 'OWNER' || github.event.issue.author_association == 'MEMBER' || github.event.issue.author_association == 'COLLABORATOR') }}
     steps:
+      # Pinned to a commit SHA, not a tag: a tag is a movable pointer, so whoever
+      # controls the action's repository can repoint v4 at new code that then runs
+      # here alongside a step holding two separate credentials. Disabled today, but
+      # a movable tag on a disabled workflow is still a hole the day someone
+      # enables it. The trailing comment records the tag the SHA came from so
+      # Dependabot can still offer bumps.
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Guard — Reject Jules/ directory case violation
         run: |
@@ -52,7 +75,10 @@ jobs:
 
       - name: Run Developer Agent
         if: ${{ steps.dup_check.outputs.skip != 'true' }}
-        uses: google-labs-code/jules-action@v1.0.0
+        # Third-party action, so the SHA pin matters most here: this step receives
+        # secrets.JULES_DEVELOPER_API_KEY in its environment and is asked to open a
+        # pull request.
+        uses: google-labs-code/jules-action@bff7875eaa123cac6742b7cfc51005b95ba4d566 # v1.0.0
         with:
           prompt: 'Read .jules/roles/developer.md and act as the Developer. Read issue #${{ github.event.issue.number }}. CRITICAL: Do NOT create a directory named "Jules/" — use ".jules/" (lowercase, dot-prefixed) only. Do NOT commit review metadata files (result.json, *.verdict.json) to the repo. Write regression tests, implement the fix, and create a Pull Request with your changes. Do not merge it. Provide exact-SHA evidence.'
           jules_api_key: ${{ secrets.JULES_DEVELOPER_API_KEY }}

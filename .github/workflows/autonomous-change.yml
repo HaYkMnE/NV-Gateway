@@ -16,11 +16,17 @@ jobs:
     runs-on: windows-latest
     if: ${{ vars.AUTONOMOUS_LOOP_ENABLED == 'true' }}
     steps:
+      # Pinned to commit SHAs, not tags: a tag is a movable pointer, so whoever
+      # controls the action's repository can repoint v4 at new code that then runs
+      # here. Disabled today, but a movable tag on a disabled workflow is still a
+      # supply-chain hole the day someone enables it. The trailing comment records
+      # the tag each SHA came from so Dependabot (.github/dependabot.yml tracks
+      # github-actions) can still offer bumps.
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
 
@@ -43,7 +49,9 @@ jobs:
     if: always() && vars.AUTONOMOUS_LOOP_ENABLED == 'true' && github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - name: Bug Hunter Evaluation
-        uses: google-labs-code/jules-action@v1.0.0
+        # Third-party action, so the SHA pin matters most here: this step receives
+        # secrets.JULES_BUG_HUNTER_API_KEY and a GITHUB_TOKEN in its environment.
+        uses: google-labs-code/jules-action@bff7875eaa123cac6742b7cfc51005b95ba4d566 # v1.0.0
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
