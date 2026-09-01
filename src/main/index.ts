@@ -8,7 +8,7 @@ import { createAutoUpdateService, getUpdateMenuText, type AutoUpdateService, typ
 import { initAppLogger, logAppEvent } from "./app-logger";
 import { GatewayLifecycle, type GatewayStatus } from "./gateway-lifecycle";
 import { createFatalShutdown } from "./fatal-shutdown";
-import { ensureGatewayRuntime, readAppConfig, readGatewayPort, writeAppConfig, writeGatewayPort, type AppLanguage, type GatewayRuntimePaths } from "./gateway-runtime";
+import { ensureGatewayRuntime, invalidateAppConfigCache, readAppConfig, readAppConfigCached, readGatewayPort, writeAppConfig, writeGatewayPort, type AppLanguage, type GatewayRuntimePaths } from "./gateway-runtime";
 import { checkPorts, findFreePort } from "./port-scanner";
 import { configureSingleInstance } from "./single-instance";
 import { validateIpcSender, validators } from "./ipc-security";
@@ -179,7 +179,21 @@ function initializeGatewayLifecycle(): GatewayLifecycle {
     spawnChild: spawn,
     stdioLogPath: gatewayRuntime.stdioLogPath,
     workingDirectory: app.getPath("userData"),
-    onStatusChange: updateTray,
+    // One hook, two consumers. updateTray stays exactly as it was; the renderer
+    // push is added beside it so the renderer can stop polling at 1 Hz.
+    //
+    // `mainWindow` raw, NOT ensureMainWindow(): a background gateway transition
+    // (stop, retry, child error, quit) must never RESURRECT a window the user
+    // closed. sendGatewayStatus is inert when the window is absent or destroyed.
+    //
+    // This is a TRANSITION hook, not a per-request path: every setStatus() call
+    // site in gateway-lifecycle.ts is a real state change (start/stop/retry/
+    // child error), so this adds no work per renderer request and nothing on a
+    // timer. It must stay that way.
+    onStatusChange: (status: GatewayStatus) => {
+      updateTray(status);
+      sendGatewayStatus(mainWindow, status);
+    },
     onLifecycleEvent: (event: string, data: Record<string, unknown>) => {
       logAppEvent("info", event, data);
       // Forward gateway lifecycle errors to the structured error reporter so
@@ -260,6 +274,64 @@ function createTrayIcon(state?: string): Electron.NativeImage {
   return trayIcons(state) as Electron.NativeImage;
 }
 
+/** The one main->renderer push channel for gateway status. Send-only, by design. */
+export const GATEWAY_STATUS_CHANNEL = "gateway-status-changed";
+
+/**
+ * Push a gateway status change to the renderer.
+ *
+ * WHY THIS EXISTS: gatewayLifecycle already told main about every transition
+ * (onStatusChange) and main told nobody but the tray, so the renderer polled
+ * `get-gateway-status` at 1 Hz forever just to notice a state it could have been
+ * handed. This is that push.
+ *
+ * SEND-ONLY. There is deliberately no ipcMain.handle/on counterpart: an inbound
+ * edge would be a new attack surface needing validateIpcSender like every invoke
+ * channel here, and would let a renderer forge status transitions. Because
+ * nothing arrives FROM the renderer, secure()/validateIpcSender do not apply —
+ * the equivalent discipline for an outbound channel is (a) one fixed
+ * destination, this window's webContents, never a broadcast to all windows, and
+ * (b) an explicit payload projection instead of a spread.
+ *
+ * NO SECRET CROSSES. The projection copies exactly the four GatewayStatus fields
+ * and drops anything else a caller may have attached. `message` has already been
+ * through redact() + length-capped in sanitizeGatewayStatus (gateway-lifecycle.ts),
+ * which is what keeps the gateway/admin tokens out of it; a raw spread here would
+ * forward whatever a future caller adds, and this repo has already had a raw
+ * JSON.stringify leak both tokens verbatim.
+ *
+ * MUST NOT THROW. A status change fires exactly when a window may be gone —
+ * stop, retry, child error, quit. A throw here would escape into an Electron
+ * event callback, reach process.on("uncaughtException") -> fatalShutdownAndExit
+ * -> process.exit(1), and that raw exit SKIPS before-quit -> cleanupAndQuit ->
+ * gatewayLifecycle.stop(), i.e. the ipc shutdown that flushes keys.json. Hence
+ * three layers: null check, both liveness checks, and a try/catch around the
+ * send for the window that dies between the check and the call.
+ *
+ * The window is a PARAMETER, not ensureMainWindow(): a background gateway event
+ * must never resurrect a window the user closed, and passing it in is what makes
+ * the destroyed-window path testable.
+ */
+export function sendGatewayStatus(window: BrowserWindow | null | undefined, status: GatewayStatus): void {
+  if (!window || window.isDestroyed()) return;
+  const contents = window.webContents;
+  if (!contents || contents.isDestroyed()) return;
+  try {
+    contents.send(GATEWAY_STATUS_CHANNEL, {
+      state: status.state,
+      ...(status.port === undefined ? {} : { port: status.port }),
+      ...(status.code === undefined ? {} : { code: status.code }),
+      ...(status.message === undefined ? {} : { message: status.message })
+    });
+  } catch (error) {
+    // The native object can die between the liveness check and the send; there
+    // is no atomic way to do this in Electron. Losing one push is harmless
+    // because the renderer keeps a slow backup poll; crashing the main process
+    // past the keys.json flush would not be.
+    logAppEvent("warn", "gateway_status_push_failed", { message: error instanceof Error ? error.message : String(error) });
+  }
+}
+
 // Returns a window that is safe to call, rebuilding it if it was destroyed.
 //
 // `mainWindow?.show()` guards NULL but NOT a DESTROYED native object. MEASURED in
@@ -297,7 +369,11 @@ function revealMainWindow(): void {
 // field through set-app-config, so both stay in sync.
 function currentLanguage(): AppLanguage {
   try {
-    return gatewayRuntime ? readAppConfig(gatewayRuntime.configPath).language : "en";
+    // Cached: updateTray() calls this, and updateTray() runs on every gateway
+    // status change and every updater status change. A synchronous readFileSync
+    // here is exactly what turned 5,000 download ticks into 5.3 s of blocked
+    // main thread (fea558f). See readAppConfigCached for the staleness tradeoff.
+    return gatewayRuntime ? readAppConfigCached(gatewayRuntime.configPath).language : "en";
   } catch {
     return "en";
   }
@@ -562,6 +638,12 @@ void startMainProcess({
         }
       } });
       secureState = migration.state;
+      // The migration workflow writes config.json DIRECTLY (final-migration-workflow.ts),
+      // bypassing writeAppConfig/writeGatewayPort and so their invalidation. It
+      // runs before any window exists, so nothing should have armed the cache
+      // yet — but relying on that ordering would make a future reordering a
+      // silent staleness bug, so drop the cache explicitly here.
+      invalidateAppConfigCache();
       credentials = secureState.credentials && typeof secureState.credentials.gatewayToken === "string" && typeof secureState.credentials.adminToken === "string"
         ? secureState.credentials as { gatewayToken: string; adminToken: string }
         : null;
@@ -781,7 +863,13 @@ ipcMain.handle("get-runtime-state", wrapIpcHandler("get-runtime-state", secure((
   // autoLaunch comes from the cache: this handler runs on every renderer refresh
   // and app.getLoginItemSettings() leaks a kernel `Key` handle per call whenever
   // the Run value exists. See the note above getAutoLaunchCached().
-  return { ...readAppConfig(gatewayRuntime.configPath), status: gatewayLifecycle?.getStatus() ?? { state: "stopped" }, version: app.getVersion(), autoLaunch: getAutoLaunchCached() };
+  //
+  // The config is cached for the same reason: this is a POLLED channel, and
+  // readAppConfig is a synchronous readFileSync + JSON.parse — MEASURED at
+  // 1.5348 ms/call on this machine — that blocked the main thread on every
+  // single request. See readAppConfigCached in gateway-runtime.ts for the
+  // accepted staleness tradeoff on an EXTERNAL edit to config.json.
+  return { ...readAppConfigCached(gatewayRuntime.configPath), status: gatewayLifecycle?.getStatus() ?? { state: "stopped" }, version: app.getVersion(), autoLaunch: getAutoLaunchCached() };
 })));
 ipcMain.handle("set-app-config", wrapIpcHandler("set-app-config", secure((_event, update: { language?: string; setupComplete?: boolean; performanceMode?: string; autoStartGateway?: boolean }) => {
   const result = updateAppConfig(update as AppConfigUpdate);

@@ -1,4 +1,14 @@
 import { contextBridge, ipcRenderer } from 'electron'
+// Type-only, so it is ERASED at compile time and adds no runtime coupling
+// between the sandboxed preload and the main bundle. It keeps the pushed payload
+// shape tied to the single source of truth instead of drifting from a duplicate.
+import type { GatewayStatus } from '../main/gateway-lifecycle'
+
+// Must match GATEWAY_STATUS_CHANNEL in src/main/index.ts. The agreement is
+// verified behaviourally, not by eye: tests/gateway-status-push.test.mjs takes
+// the channel from what MAIN actually sends and asserts THIS listener receives
+// on it, so a rename on either side fails the suite.
+const GATEWAY_STATUS_CHANNEL = 'gateway-status-changed'
 
 function invokeAdmin(channel: string, ...args: unknown[]): Promise<unknown> {
   return ipcRenderer.invoke(channel, ...args).then((result: unknown) => {
@@ -79,5 +89,21 @@ contextBridge.exposeInMainWorld('electronAPI', {
     const listener = () => callback();
     ipcRenderer.on('navigate-feedback', listener);
     return () => { ipcRenderer.removeListener('navigate-feedback', listener); };
+  },
+  // Main->renderer PUSH for gateway status. Read-only from the renderer's side:
+  // there is no invoke counterpart, so this cannot be used to trigger or forge a
+  // status change, only to hear about one.
+  //
+  // The IpcRendererEvent is deliberately NOT forwarded — exactly as the two
+  // onNavigate* bridges above drop it. `event.sender` is a live IPC handle, and
+  // handing it to renderer code would widen the bridge far past one status
+  // object. The callback receives the status and nothing else.
+  //
+  // Returns an unsubscribe function so a remounting component cannot stack
+  // listeners on a channel that fires on every gateway transition.
+  onGatewayStatusChanged: (callback: (status: GatewayStatus) => void) => {
+    const listener = (_event: unknown, status: GatewayStatus) => callback(status);
+    ipcRenderer.on(GATEWAY_STATUS_CHANNEL, listener);
+    return () => { ipcRenderer.removeListener(GATEWAY_STATUS_CHANNEL, listener); };
   }
 })
