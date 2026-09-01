@@ -123,10 +123,12 @@ export function Layout() {
     // so the poll pauses when the window is hidden or minimised to tray — the
     // previous `true` burned ~60 IPC round-trips per minute indefinitely on a
     // window nobody could see. The status display itself cannot go stale while
-    // hidden BECAUSE it is hidden; on reveal, refetchOnWindowFocus (overriding
-    // the global false in App.tsx) picks up any change immediately, and the
-    // resumed 1s interval is the standing safety net.
-    refetchOnWindowFocus: true,
+    // hidden BECAUSE it is hidden; on reveal, refetchOnWindowFocus: 'always' and
+    // staleTime: 0 (overriding the global staleTime: 3000 in App.tsx) guarantee
+    // an immediate refetch regardless of whether the window was hidden for <3s,
+    // eliminating up to 1.0s of reveal staleness.
+    refetchOnWindowFocus: 'always',
+    staleTime: 0,
   });
 
   const status: GatewayStatus = useMemo(() => {
