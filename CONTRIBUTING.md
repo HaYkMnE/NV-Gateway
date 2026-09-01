@@ -38,7 +38,7 @@ npm run dev
 
 ### Running Tests
 ```bash
-# Run full automated test suite (511+ tests)
+# Run full automated test suite (must pass with zero failures)
 npm test
 
 # Run individual test files
@@ -75,13 +75,15 @@ To ensure repository stability, security, and cleanliness:
    - Run `node scripts/shipping-credential-scan.mjs` before committing.
 4. **Verification Evidence**:
    - Include exact commit SHAs and command execution outputs in your PR description.
-   - Confirm that all 511 tests pass with zero failures or skipped suites.
+   - Confirm that the full test suite passes with zero failures (`npm test`).
 
 ---
 
-## 4. Jules Autonomous AI Development Pipeline
+## 4. Jules Autonomous AI Development Pipeline (Architecture Specification — Disabled)
 
-In addition to human contributions, this repository supports a 4-agent autonomous development lifecycle powered by Jules AI agents:
+> **Note:** The Jules autonomous loop is currently disabled in repository settings and was never connected to live production pipelines. The architecture below is preserved for design and specification reference.
+
+In addition to human contributions, this repository specifies a 4-agent autonomous development lifecycle designed for Jules AI agents:
 
 - **1. Log Analyst**: Continuously scans telemetry and the codebase to identify technical debt, bugs, and performance optimization opportunities, opening actionable GitHub Issues with JSON handoffs.
 - **2. Developer Agent**: Automatically picks up analyst issues, writes regression tests, implements minimal surgical code changes, and submits PRs.
@@ -92,7 +94,7 @@ In addition to human contributions, this repository supports a 4-agent autonomou
 ### Evidence Gate & PR Review Criteria
 Whether submitted by human developers or AI agents, all Pull Requests must satisfy:
 1. **Zero Secret Leakage**: Passed `scripts/shipping-credential-scan.mjs`.
-2. **100% Test Suite Green**: All 511+ automated unit and integration tests passing.
+2. **100% Test Suite Green**: The full automated test suite must pass with zero failures.
 3. **Exact Commit SHA Evidence**: Clear trace of commit SHA and reproduction verification.
 4. **Architectural Isolation**: Strict preservation of process boundaries between Electron Main, Gateway, and Renderer.
 

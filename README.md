@@ -20,7 +20,7 @@
 [![Electron](https://img.shields.io/badge/Electron-31-47848F?style=for-the-badge&logo=electron&logoColor=white)](https://electronjs.org/)
 [![Anthropic Compatible](https://img.shields.io/badge/Anthropic-Messages%20API%20%2F%20Claude%20Code-D97706?style=for-the-badge&logo=anthropic&logoColor=white)](https://docs.anthropic.com)
 [![NVIDIA NIM](https://img.shields.io/badge/NVIDIA-NGC%20%2F%20NIM-76B900?style=for-the-badge&logo=nvidia&logoColor=white)](https://build.nvidia.com)
-[![Tests](https://img.shields.io/badge/Tests-515%2F515%20PASSED-brightgreen?style=for-the-badge&logo=checkmarx&logoColor=white)](tests/)
+[![Tests](https://img.shields.io/badge/Tests-passing-brightgreen?style=for-the-badge&logo=githubactions&logoColor=white)](tests/)
 
 </div>
 
@@ -297,6 +297,26 @@ Set Provider to `OpenAI` with:
 
 ---
 
+## Troubleshooting
+
+### Windows SmartScreen ("Unknown Publisher")
+When running the installer, Windows may show a prompt stating "Windows protected your PC" or "Unknown Publisher". This warning appears because NV-Gateway is not signed with a commercial Extended Validation (EV) code-signing certificate. There is no certificate, and none will be purchased. The installer is safe and contains no malware. To proceed:
+1. Click **More info** on the SmartScreen prompt.
+2. Click **Run anyway**.
+
+### Antivirus Alerts
+Some antivirus scanners may flag the executable or block background components for the same reason (absence of a commercial code-signing certificate). If your antivirus software flags NV-Gateway:
+1. Verify that you downloaded the file from the official [GitHub Releases](https://github.com/HaYkMnE/NV-Gateway/releases) page.
+2. Add an exception or allow the application in your antivirus settings.
+
+### Windows 11 System Tray Icon
+On Windows 11, new system tray icons are placed in the hidden overflow flyout behind the upward arrow (`^`) near the taskbar clock. The application cannot move itself to the visible taskbar due to Windows restrictions.
+1. Click the **`^`** arrow next to the clock in the Windows taskbar.
+2. Locate the NV-Gateway icon.
+3. Drag the icon out of the flyout and onto the visible taskbar.
+
+---
+
 ## API Endpoints Reference
 
 NV-Gateway binds two paired loopback ports (`P` and `P+1`, default `12004` and `12005`):
@@ -338,7 +358,7 @@ All runtime state is stored in `%APPDATA%\NV-Gateway\`:
 
 ## Verification & Testing
 
-NV-Gateway maintains a strict zero-regression testing standard with **515 automated tests** covering runtime security, ACL protection, ASAR scans, key failover, and protocol translation:
+NV-Gateway maintains a strict zero-regression testing standard. The full automated test suite (currently 914 tests across unit, integration, and security checks) covers runtime security, ACL protection, ASAR scans, key failover, and protocol translation, and must pass with zero failures:
 
 ```bash
 # Run full suite
@@ -379,7 +399,7 @@ If NV-Gateway empowers your workflow, support ongoing development:
 
 ## Contributing
 
-We welcome contributions! Please review [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md) before submitting pull requests. All contributions must pass the 515-test suite and adhere to strict credential-redaction policies.
+We welcome contributions! Please review [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md) before submitting pull requests. All contributions must pass the full automated test suite with zero failures and adhere to strict credential-redaction policies.
 
 ---
 

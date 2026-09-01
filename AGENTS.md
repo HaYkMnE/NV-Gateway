@@ -52,7 +52,7 @@ The NV-Gateway system is split across three distinct operational layers:
 
 ## 3. Level-1 Testing & Quality Standards
 
-Every modification must preserve 100% pass rate across the full test suite (**511/511 tests passing**).
+Every modification must preserve a 100% pass rate across the full test suite (all tests passing, zero failures). Run `npm test` to verify.
 
 ### Verification Commands:
 ```bash
@@ -74,7 +74,9 @@ npm run package:audit
 
 ---
 
-## 4. Jules Autonomous 4-Agent Pipeline & Architecture
+## 4. Jules Autonomous 4-Agent Pipeline & Architecture (Architecture Specification — Disabled)
+
+> **Note:** The Jules autonomous loop is currently disabled in repository settings and was never connected to live production pipelines. The workflow definitions, role descriptions, and schema specifications below are preserved for architectural and design reference only. Do not attempt to enable or repair the autonomous loop in code.
 
 This repository is equipped with a complete, closed-loop autonomous software engineering pipeline powered by Google Labs Jules agents (using Gemini 3.1 Pro):
 
