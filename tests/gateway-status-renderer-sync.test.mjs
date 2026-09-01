@@ -324,3 +324,84 @@ test('a window focus refetches immediately even with data 0 ms old (the 51fb01d 
     client.clear();
   }
 });
+
+// ── 5. Hardened: Effect dependencies must be pinned to [queryClient] ────────
+test('the subscribing effect has pinned [queryClient] dependencies to prevent subscription thrashing', () => {
+  const fake = makeFakeGatewayApi();
+  const { captured, client } = executeLayout(fake);
+
+  // Find the effect that subscribes
+  let subEffect = null;
+  for (const eff of captured.effects) {
+    const cleanup = eff.cb();
+    if (typeof cleanup === 'function') {
+      subEffect = eff;
+      cleanup();
+      break;
+    }
+  }
+
+  assert.ok(subEffect, 'must find the subscription effect');
+  assert.ok(Array.isArray(subEffect.deps), 'subscribing effect MUST have a dependency array (omitting causes per-render re-subscribes)');
+  assert.equal(subEffect.deps.length, 1, `subscribing effect deps must have exactly 1 item ([queryClient]), got ${subEffect.deps.length}`);
+  assert.equal(subEffect.deps[0], client, 'subscribing effect dep must be the queryClient instance');
+});
+
+// ── 6. Hardened: Multi-mount cycle does not leak listeners ───────────────────
+test('sequential mount and unmount cycles do not accumulate listeners (0 leak guarantee)', () => {
+  const fake = makeFakeGatewayApi();
+  const cleanups = [];
+
+  for (let i = 0; i < 5; i++) {
+    const { captured } = executeLayout(fake);
+    for (const eff of captured.effects) {
+      const c = eff.cb();
+      if (typeof c === 'function') cleanups.push(c);
+    }
+    assert.equal(fake.listenerCount(), i + 1, `after ${i + 1} active mounts, expected ${i + 1} listeners`);
+  }
+
+  // Teardown all
+  while (cleanups.length > 0) {
+    const c = cleanups.pop();
+    c();
+  }
+  assert.equal(fake.listenerCount(), 0, 'after all unmounts, exactly 0 listeners remain in preload');
+});
+
+// ── 7. Hardened: Malformed/hostile pushed payloads do not throw or break cache ──
+test('pushed payloads with missing fields or abnormal values update cache safely', async () => {
+  const fake = makeFakeGatewayApi();
+  const { captured, client } = executeLayout(fake);
+  const options = captured.queryOptions[0];
+
+  const observer = new QueryObserver(client, options);
+  const off = observer.subscribe(() => {});
+  const cleanups = captured.effects.map(({ cb }) => cb());
+
+  try {
+    await tick();
+
+    const testPayloads = [
+      { state: 'stopped' },
+      { state: 'starting' },
+      { state: 'unknown_custom_state' },
+      { state: 'error' },
+      { state: 'error', code: 'PORT_IN_USE', port: 8080, message: 'occupied' },
+      { state: 'running', port: 41191 },
+    ];
+
+    for (const payload of testPayloads) {
+      fake.emit(payload);
+      await tick();
+      assert.deepEqual(client.getQueryData(['gateway-status']), payload);
+      assert.deepEqual(observer.getCurrentResult().data, payload);
+    }
+  } finally {
+    for (const c of cleanups) if (typeof c === 'function') c();
+    off();
+    observer.destroy();
+    client.clear();
+  }
+});
+
