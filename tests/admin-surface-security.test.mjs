@@ -8,7 +8,9 @@
 // RED-first proofs (each fails against the pre-fix admin-api.mjs on the stated
 // line and passes after):
 //   * mask test   — admin-api.mjs `k.key.substring(0, 8) + '...' + substring(len-4)`
-//                   reveals the WHOLE key when length <= 12 (windows tile/overlap).
+//                   reveals the WHOLE key when length <= 12 (windows tile/overlap);
+//                   13-15 chars leave only 1-3 hidden (brute-forceable), so the
+//                   partial mask requires >= 4 hidden chars (length >= 16).
 //   * origin test — no Origin check existed before classification/auth; a
 //                   browser-driven request with a valid token was processed.
 //   * sanitize-then-bound helper — did not exist; bound-first order leaves a
@@ -124,6 +126,28 @@ test('GET /admin/keys keeps the first8...last4 mask for real-length keys (no UI 
   } finally { await stopAdmin(server); }
 });
 
+test('GET /admin/keys boundary: 13-15 char keys are masked in full (only 1-3 chars would stay hidden)', async () => {
+  // Verifier hardening: the commit masked <=12 (the tiling bound). At 13-15 the
+  // windows no longer tile but leave just 1-3 characters unknown — brute-forceable
+  // against the upstream oracle if a masked list leaks. The mask must stay full
+  // until >=4 characters remain hidden (length >= 16); the partial format is
+  // unchanged at 16+ (UI compatibility for real nvapi- keys preserved).
+  const record = (id, key) => ({ id, key, status: 'active', backoffUntil: 0, usage: { success: 0, fail: 0, tokens: 0, lastUsed: 0 }, accessibleModels: [] });
+  const k13 = 'M'.repeat(13); const k14 = 'N'.repeat(14); const k15 = 'O'.repeat(15); const k16 = 'P'.repeat(16);
+  assert.equal(k13.length, 13); assert.equal(k14.length, 14); assert.equal(k15.length, 15); assert.equal(k16.length, 16);
+  const server = await startAdmin({ listKeys: () => [record(UUID_A, k13), record(UUID_B, k14), record(UUID_C, k15), record('1b4e28ba-2fa1-11d2-883f-0016d3cca428', k16)] });
+  try {
+    const res = await request(server.address().port, '/admin/keys');
+    assert.equal(res.statusCode, 200);
+    const byId = new Map(JSON.parse(res.body).keys.map((k) => [k.id, k.key]));
+    assert.equal(byId.get(UUID_A), '***', '13 chars: 1 hidden char is brute-forceable, mask in full');
+    assert.equal(byId.get(UUID_B), '***', '14 chars: 2 hidden chars, mask in full');
+    assert.equal(byId.get(UUID_C), '***', '15 chars: 3 hidden chars, mask in full');
+    assert.equal(byId.get('1b4e28ba-2fa1-11d2-883f-0016d3cca428'), 'PPPPPPPP...PPPP', '16 chars: 4 hidden, first8...last4 resumes');
+    for (const key of [k13, k14, k15, k16]) assert.equal(res.body.includes(key), false, `${key.length}-char key leaked into body`);
+  } finally { await stopAdmin(server); }
+});
+
 // ─── FIX 2 (cross-origin): admin API must refuse browser-driven requests ─────
 
 test('admin API rejects any request carrying an Origin header, even with a valid token', async () => {
@@ -165,6 +189,14 @@ test('catalog-sync failure detail redacts secrets before bounding (order-proof)'
     setRuntimeSecrets([runtimeSecret]);
     const ordered = adminApi.sanitizeFailureDetail(new Error(`${'E'.repeat(250)}${runtimeSecret}`));
     assert.equal(ordered.includes('ZZRUNTIME'), false, 'bound-then-redact would leak a truncated runtime secret');
+    // Order-proof, not just content-proof: under the broken bound-FIRST order the
+    // 256-cut keeps the secret's first 6 chars ("ZZRUNT") — a fragment that no
+    // longer exact-matches the runtime secret and survives redaction. The
+    // full-secret assertion above cannot see that fragment; only a PREFIX check
+    // distinguishes redact-then-bound from bound-then-redact. (Verifier mutation
+    // M3: with the assertion below absent, `redact(raw.slice(0,256))` stayed GREEN.)
+    assert.equal(ordered.includes(runtimeSecret.substring(0, 6)), false,
+      'no PREFIX of the runtime secret may survive — redact must run before bounding');
     assert.ok(ordered.length <= 256, `detail must be bounded to 256 (got ${ordered.length})`);
 
     // Case B: nvapi-/Bearer patterns in an upstream message are redacted.

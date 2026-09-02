@@ -94,11 +94,15 @@ export function classifyCanonicalAdminRequest(method, requestTarget) {
 
 // Mask a stored key for display. The first8/last4 windows overlap (or exactly
 // tile) for keys of 12 chars or fewer, publishing the WHOLE key in the list
-// response; short keys are therefore masked in full. Non-strings (a corrupt
-// state record) are masked rather than thrown over.
+// response; at 13-15 chars they no longer tile but leave only 1-3 characters
+// hidden — trivially brute-forceable against the public upstream oracle if a
+// masked list ever leaks (screenshot, shared screen, compromised renderer).
+// Keys are therefore masked in full unless at least 4 characters stay hidden
+// (length >= 16). Non-strings (a corrupt state record) are masked rather than
+// thrown over.
 function maskKeyMaterial(key) {
     if (typeof key !== 'string' || key.length === 0) return '[REDACTED]';
-    if (key.length <= 12) return '***';
+    if (key.length <= 15) return '***';
     return key.substring(0, 8) + '...' + key.substring(key.length - 4);
 }
 
