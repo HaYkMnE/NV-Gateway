@@ -188,8 +188,11 @@ function readPerModelFailoverOverrides(configPath) {
     try {
         stat = fs.statSync(configPath);
     } catch {
-        // Transit FS error: keep last-known records (or null on cold start).
-        return perModelFailoverCache.records;
+        // Transit FS error: keep last-known records (or null on cold start) —
+        // but only when they were cached for THIS config path. The cache key on
+        // the fast path below includes configPath; honouring it here too stops
+        // a read against config B from being answered with config A's records.
+        return perModelFailoverCache.configPath === configPath ? perModelFailoverCache.records : null;
     }
     if (perModelFailoverCache.records
         && perModelFailoverCache.configPath === configPath
