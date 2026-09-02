@@ -5,7 +5,7 @@ import { handleAdminRequest } from "./admin-api.mjs";
 import { getNextKey, getKeys, handleKeyError, markKeyUsedAndDebounceSave, initializeState, getSoonestActiveCooldownRemainingSeconds, getModelEligibleKeyCount, getRetryAfterSecondsForModel } from "./rotation.mjs";
 import { info, warn, error, flushLogs } from "./logger.mjs";
 import { sanitizeProxyHeaders, capResponseHeaders } from "./proxy-headers.mjs";
-import { createUpstreamSocketTimeouts, resolveGatewayTimeouts, resolveRetryFirstByteTimeoutMs } from "./upstream-timeouts.mjs";
+import { createUpstreamSocketTimeouts, resolveRetryFirstByteTimeoutMs } from "./upstream-timeouts.mjs";
 import { getModelLimits, getDisabledModels, setModelLimits } from "./model-limits.mjs";
 import { getCapabilityMetadata } from "./capability-registry.mjs";
 import { classifyUpstreamResponse, isPoolWideCapableStatus, isSuccessfulStatus, parseRetryAfter, RATE_LIMIT_STATUS, resolveMaxFailoverAttempts, resolvePoolWideFailureStatus, resolveRateLimitMaxAttempts, shouldEarlyStopOnRateLimit } from "./failover-policy.mjs";
@@ -24,18 +24,45 @@ const NVIDIA_API = "integrate.api.nvidia.com";
 let LOCAL_TOKEN;
 let ADMIN_TOKEN;
 const CORS_ALLOWLIST = parseCorsAllowlist(process.env.GATEWAY_CORS_ALLOWLIST);
-const { firstByteTimeoutMs, idleTimeoutMs, maxStreamDurationMs } = resolveGatewayTimeouts();
-// Retried failover attempts (attempt > 1 after a 429/5xx) use a shorter
-// first-byte window so a hung / slow-to-429 upstream cannot stall each key
-// switch for the full 5-min fresh default. min() keeps it <= firstByte AND
-// <= DEFAULT_RETRY_FIRST_BYTE_TIMEOUT_MS (env-overridable). The first attempt
-// keeps the full fresh-request window so a legitimately slow NVIDIA response
-// is still tolerated on a fresh request.
-const retryFirstByteTimeoutMs = resolveRetryFirstByteTimeoutMs(firstByteTimeoutMs);
+// Upstream request timeouts are OWNED by the performance-mode resolver below:
+// the selected profile (day/night/auto) supplies the base values and explicit
+// GATEWAY_* env vars override them per knob inside resolve(). They are resolved
+// PER REQUEST (see resolveRequestTimeouts) so an "auto" transition applies to
+// the next request and cannot shift mid-request across failover attempts.
+// (resolveGatewayTimeouts in upstream-timeouts.mjs is the env-only parser kept
+// for its own unit tests; the runtime request path no longer consults it.)
 
 // Performance-mode resolver (global day/night/auto profile + env overrides).
-// Supplies the configured maxFailoverAttempts bound the failover loops honor.
-const performanceMode = createPerformanceModeResolver();
+// Supplies the per-request upstream timeouts and the configured
+// maxFailoverAttempts bound the failover loops honor; real request outcomes
+// feed it via observe() (see recordOutcome) so "auto" can actually transition.
+const performanceMode = createPerformanceModeResolver({
+    // Log effective-profile transitions so an "auto" decision is auditable from
+    // the gateway log (the payload carries the evidence window that drove it).
+    onEffectiveChange: (state) => info("performance_mode_transition", state)
+});
+
+// Resolve THIS request's upstream timeout profile from the performance-mode
+// resolver (profile base + GATEWAY_* env overrides, per knob). Called once per
+// request by the failover loop so every attempt of one request uses the same
+// budget; proxyRequest falls back to a fresh resolution only for a stand-alone
+// caller that did not pass timeouts in opts.
+// Retried failover attempts (attempt > 1 after a 429/5xx) use a shorter
+// first-byte window so a hung / slow-to-429 upstream cannot stall each key
+// switch for the full fresh-request budget. min() in
+// resolveRetryFirstByteTimeoutMs keeps it <= firstByte AND <=
+// GATEWAY_RETRY_FIRST_BYTE_TIMEOUT_MS (default 30s). The first attempt keeps
+// the full fresh-request window so a legitimately slow NVIDIA response is still
+// tolerated on a fresh request.
+function resolveRequestTimeouts() {
+    const profile = performanceMode.resolve();
+    return {
+        firstByteTimeoutMs: profile.firstByteTimeoutMs,
+        idleTimeoutMs: profile.idleTimeoutMs,
+        maxStreamDurationMs: profile.maxStreamDurationMs,
+        retryFirstByteTimeoutMs: resolveRetryFirstByteTimeoutMs(profile.firstByteTimeoutMs)
+    };
+}
 // In production the gateway child receives GATEWAY_CONFIG_PATH (config always
 // exists via ensureGatewayRuntime); in tests/dev it is unset, so no configured
 // bound is present and the failover loops fall back to covering the active pool.
@@ -145,6 +172,10 @@ function proxyRequestWithFailover(req, res, bodyBuffer, isStream, onKeyIdChange,
         const activeCount = getKeys().filter((k) => k.status === "active").length;
         const requestedModelId = typeof opts.model === "string" ? opts.model : undefined;
         const maxAttempts = resolveMaxFailoverAttempts(process.env, activeCount, resolveConfiguredMaxFailoverAttempts(requestedModelId));
+        // Per-request upstream timeout profile (day/night/auto + GATEWAY_* env
+        // overrides), resolved once so a mid-request "auto" transition can never
+        // change the budget between failover attempts of THIS request.
+        const requestTimeouts = resolveRequestTimeouts();
         // Status code seen on every retryable UPSTREAM HTTP failure, in order.
         // Used to detect a pool-wide failure (all keys returning the same real
         // upstream status) at the exhaustion point so the upstream status is
@@ -270,7 +301,9 @@ function proxyRequestWithFailover(req, res, bodyBuffer, isStream, onKeyIdChange,
                     });
                     tryNext();
                 }
-            }, attempt > 1 ? { ...opts, firstByteTimeoutMs: retryFirstByteTimeoutMs } : opts);
+            }, attempt > 1
+                ? { ...opts, ...requestTimeouts, firstByteTimeoutMs: requestTimeouts.retryFirstByteTimeoutMs }
+                : { ...opts, ...requestTimeouts });
         };
 
         tryNext();
@@ -536,6 +569,9 @@ function proxyRequest(req, res, targetKey, bodyBuffer, isStream, onResult, opts 
     const recordOutcome = (outcome) => {
         if (terminalOutcome) return false;
         terminalOutcome = outcome;
+        // Feed the performance-mode "auto" evidence window with this real,
+        // terminal upstream outcome (completed / first_byte_timeout / ...).
+        performanceMode.observe(outcome);
         info("request_outcome", { id: targetKey.id, outcome });
         return true;
     };
@@ -554,9 +590,11 @@ function proxyRequest(req, res, targetKey, bodyBuffer, isStream, onResult, opts 
         if (recordOutcome(outcome)) accountOutcome(outcome, tokens);
     };
 
+    // The failover loop passes the per-request timeouts in opts; only a
+    // stand-alone caller would fall back to a fresh resolution here.
     const upstreamTimeouts = createUpstreamSocketTimeouts({
-        firstByteTimeoutMs: opts.firstByteTimeoutMs ?? firstByteTimeoutMs,
-        idleTimeoutMs,
+        firstByteTimeoutMs: opts.firstByteTimeoutMs ?? resolveRequestTimeouts().firstByteTimeoutMs,
+        idleTimeoutMs: opts.idleTimeoutMs ?? resolveRequestTimeouts().idleTimeoutMs,
         onTimeout: () => {
             if (!firstByteReceived) {
                 intentionalUpstreamAbort = true;
@@ -729,7 +767,7 @@ function proxyRequest(req, res, targetKey, bodyBuffer, isStream, onResult, opts 
                     finishOutcome("max_stream_duration");
                     res.destroy(new Error("Max stream duration exceeded"));
                 }
-            }, maxStreamDurationMs);
+            }, opts.maxStreamDurationMs ?? resolveRequestTimeouts().maxStreamDurationMs);
 
             if (isAnthropic) {
                 // Anthropic streaming facade: translate the upstream OpenAI SSE
