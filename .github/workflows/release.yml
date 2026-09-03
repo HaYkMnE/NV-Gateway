@@ -143,7 +143,7 @@ jobs:
       # PAT: the default GITHUB_TOKEN is scoped to this repository and cannot create a
       # release in another one. The guard has already failed the job if it is missing.
       - name: Publish to the update feed repository
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
           repository: ${{ steps.release-target.outputs.feed_repository }}
@@ -172,7 +172,7 @@ jobs:
       # this repo, and a stale copy sitting next to a real feed only invites confusion
       # about which one is authoritative.
       - name: Publish to this repository for the README download links
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
