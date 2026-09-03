@@ -418,13 +418,20 @@ export function translateAnthropicRequest(body) {
     } else if (body.thinking.type === 'disabled') {
       if (reasoningCap.supported) {
         const controlKey = reasoningCap.controlKey;
+        // Honesty invariant: an explicit user disable MUST leave a trace — a
+        // real upstream field, or a warning when no field can express "off".
+        // A body forwarded with neither misleads the user: upstream applies its
+        // own default (thinking ON) while the request reads as "disabled".
+        let disableEmitted = false;
         if (controlKey === 'reasoning_effort') {
           if (reasoningCap.modes && reasoningCap.modes.includes('none')) {
             openaiBody.reasoning_effort = 'none';
+            disableEmitted = true;
           }
         } else if (controlKey && controlKey.startsWith('chat_template_kwargs.')) {
           if (!openaiBody.chat_template_kwargs) openaiBody.chat_template_kwargs = {};
           openaiBody.chat_template_kwargs[controlKey.split('.')[1]] = reasoningCap.disableValue !== undefined ? reasoningCap.disableValue : false;
+          disableEmitted = true;
         }
         // Alternate control, mirroring the enabled path above: it must run
         // whatever the primary controlKey turned out to be. A probed entry can
@@ -438,8 +445,23 @@ export function translateAnthropicRequest(body) {
           if (altKey && altKey.startsWith('chat_template_kwargs.')) {
             if (!openaiBody.chat_template_kwargs) openaiBody.chat_template_kwargs = {};
             openaiBody.chat_template_kwargs[altKey.split('.')[1]] = reasoningCap.alternateControl.disableValue !== undefined ? reasoningCap.alternateControl.disableValue : false;
+            disableEmitted = true;
           }
         }
+        if (!disableEmitted) {
+          // Never synthesize a control the family does not declare (a guessed
+          // key would fail upstream validation OR, worse, be accepted as an
+          // unvalidated no-op while claiming success). Warn instead and let the
+          // request proceed with thinking untouched.
+          warnings.push('thinking cannot be disabled for this model: no "none" reasoning mode and no alternate disable control are known, so the setting had no effect and the model may still reason');
+        }
+      } else if (!familyKnown) {
+        // Unknown family: the "enabled" sibling above warns when translating
+        // optimistically; an explicit DISABLE deserves the same honesty. We
+        // know of no control, we emit none (inventing one was rejected at the
+        // top of this block), and the body goes upstream untouched — the user
+        // must hear that their "off" had no effect.
+        warnings.push('thinking cannot be disabled for this model: its family is unknown to the capability registry and no disable control is known, so the setting had no effect and the model may still reason');
       }
     }
   }
