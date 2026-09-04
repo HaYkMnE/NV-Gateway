@@ -363,3 +363,36 @@ test('Dashboard Save button disables while the add-key mutation is in-flight', (
   assert.match(saveBtn, /disabled=\{[^}]*\.isPending[^}]*\}/,
     'the Save button must set disabled={*Mutation.isPending} (or the equivalent add-key pending ref) so double-submit is prevented');
 });
+
+// ── Defect 11: Sidebar blink loop — "lines that appear and disappear" ────────
+//   Root cause: the desktop sidebar is a vertical-only scroll pane declared as
+//   `overflow-y-auto`. When only ONE overflow axis is set, CSS computes the
+//   other (x) as `auto`, so any 1 CSS px of horizontal overflow paints a real
+//   horizontal scrollbar. The pet thought-cloud is `position:absolute;
+//   left:50%; transform: translateX(-50%)` and animates scale continuously;
+//   at fractional device scale (125%/150% DPI) sub-pixel rounding makes the
+//   cloud's measured width oscillate by 1px. Verified live (packaged app, CDP,
+//   DSF 1.25): `.thought-cloud-container` flipped scrollWidth-clientWidth
+//   between 0 and 1 dozens of times per minute, every flip repainted the
+//   sidebar scrollbar strips. Once the horizontal scrollbar appears it eats
+//   17px of height, flipping the vertical scrollbar on; that shrinks the
+//   client width by 17px, re-centers the cloud, and the horizontal scrollbar
+//   disappears — a self-sustaining blink loop the user sees as lines/strips
+//   that "appear, disappear, sometimes blink" along the pane edges.
+//   Fix: pin overflow-x: hidden on the vertical-only sidebar pane (the same
+//   pair Dashboard's list already uses: overflow-y-auto + overflow-x-hidden).
+test('Layout sidebar scroll pane pins overflow-x to hidden so 1px sub-pixel wobble cannot paint a blinking horizontal scrollbar', () => {
+  const layout = read('src/renderer/components/Layout.tsx');
+  const aside = layout.match(/<aside className="hidden md:flex([^"]*)"/);
+  assert.ok(aside, 'Layout must render the desktop sidebar <aside>');
+  const cls = aside[1];
+  assert.match(cls, /w-\[250px\]/, 'sidebar keeps its 250px width');
+  assert.match(cls, /overflow-y-auto/, 'sidebar must keep vertical scrolling for overflow content');
+  assert.match(cls, /overflow-x-hidden/,
+    'sidebar must pin overflow-x-hidden: with only overflow-y set, x computes to auto and the pet thought-cloud 1px sub-pixel wobble paints a blinking h-scrollbar strip along the pane bottom edge (CSS spec: visible computes to auto when the other axis is not)');
+  // The Dashboard list container already demonstrates the intended pairing;
+  // this test also guards that precedent stays in place.
+  const dashboard = read('src/renderer/views/Dashboard.tsx');
+  assert.match(dashboard, /overflow-y-auto overflow-x-hidden/,
+    'Dashboard list pane keeps the overflow-y-auto + overflow-x-hidden precedent');
+});

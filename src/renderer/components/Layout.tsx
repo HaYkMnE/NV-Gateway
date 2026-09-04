@@ -210,7 +210,7 @@ export function Layout() {
 
   return (
     <div className="flex h-full min-w-0 overflow-hidden">
-      <aside className="hidden md:flex w-[250px] shrink-0 bg-bg border-r border-border flex-col overflow-y-auto">
+      <aside className="hidden md:flex w-[250px] shrink-0 bg-bg border-r border-border flex-col overflow-y-auto overflow-x-hidden">
         <div className="p-5 pb-2">
           <div className="flex items-center gap-3 mb-4">
             <Logo className="w-9 h-9" />
