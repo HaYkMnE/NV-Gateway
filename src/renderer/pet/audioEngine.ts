@@ -1007,7 +1007,7 @@ class PetAudioEngine {
         sf.frequency.setValueAtTime(2400 * kJit, tk);
         sf.Q.value = 3.0;
         sg.gain.setValueAtTime(0.0001, tk);
-        sg.gain.linearRampToValueAtTime(isSpace ? 0.74 : 0.68, tk + 0.002);
+        sg.gain.linearRampToValueAtTime(isSpace ? 0.60 : 0.68, tk + 0.002);
         sg.gain.exponentialRampToValueAtTime(0.0001, tk + (isSpace ? 0.015 : 0.008));
         noise.connect(sf); sf.connect(sg); sg.connect(out);
         noise.start(tk); noise.stop(tk + 0.02);
@@ -1021,7 +1021,7 @@ class PetAudioEngine {
       thud.frequency.setValueAtTime(thudF * kJit, tk);
       thud.frequency.exponentialRampToValueAtTime(thudF * 0.4 * kJit, tk + (isSpace ? 0.045 : 0.022));
       tg.gain.setValueAtTime(0.0001, tk);
-      tg.gain.linearRampToValueAtTime(isSpace ? 0.6 : 0.48, tk + 0.003);
+      tg.gain.linearRampToValueAtTime(isSpace ? 0.5 : 0.48, tk + 0.003);
       tg.gain.exponentialRampToValueAtTime(0.0001, tk + (isSpace ? 0.055 : 0.028));
       thud.connect(tg); tg.connect(out);
       thud.start(tk); thud.stop(tk + 0.06);
@@ -1216,7 +1216,7 @@ class PetAudioEngine {
       chime.type = 'triangle';
       chime.frequency.setValueAtTime(1567.98 * pMod, t + 0.012);
       cg.gain.setValueAtTime(0.0001, t + 0.012);
-      cg.gain.linearRampToValueAtTime(0.85, t + 0.016);
+      cg.gain.linearRampToValueAtTime(0.60, t + 0.016);
       cg.gain.exponentialRampToValueAtTime(0.0001, t + 0.32);
       chime.connect(cg); cg.connect(out);
       chime.start(t + 0.012); chime.stop(t + 0.35);
@@ -1437,7 +1437,7 @@ class PetAudioEngine {
 
   playMascotBugHunter(variantIndex?: number): number {
     const vIdx = this.pickVariant('playMascotBugHunter', variantIndex);
-    const v = this.createVoice({ duration: 0.5, volume: 0.70 });
+    const v = this.createVoice({ duration: 0.5, volume: 0.53 });
     if (!v) return -1;
     const { out, t, voice } = v;
     const pMod = this.jitter(0.04);
@@ -1538,7 +1538,7 @@ class PetAudioEngine {
       ring.type = 'sine';
       ring.frequency.setValueAtTime(2200 * pMod, t + 0.03);
       rg.gain.setValueAtTime(0.0001, t + 0.03);
-      rg.gain.linearRampToValueAtTime(0.55, t + 0.036);
+      rg.gain.linearRampToValueAtTime(0.50, t + 0.036);
       rg.gain.exponentialRampToValueAtTime(0.0001, t + 0.28);
       ring.connect(rg); rg.connect(out);
       ring.start(t + 0.03); ring.stop(t + 0.3);
@@ -1550,7 +1550,7 @@ class PetAudioEngine {
       punch.type = 'sine';
       punch.frequency.setValueAtTime(160 * pMod, t);
       punch.frequency.exponentialRampToValueAtTime(50 * pMod, t + 0.06);
-      pg.gain.setValueAtTime(0.70, t);
+      pg.gain.setValueAtTime(0.57, t);
       pg.gain.exponentialRampToValueAtTime(0.0001, t + 0.08);
       punch.connect(pg); pg.connect(out);
       punch.start(t); punch.stop(t + 0.09);
@@ -1561,7 +1561,7 @@ class PetAudioEngine {
       clang.type = 'triangle';
       clang.frequency.setValueAtTime(1450 * pMod, t + 0.01);
       cg.gain.setValueAtTime(0.0001, t + 0.01);
-      cg.gain.linearRampToValueAtTime(0.75, t + 0.015);
+      cg.gain.linearRampToValueAtTime(0.52, t + 0.015);
       cg.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
       clang.connect(cg); cg.connect(out);
       clang.start(t + 0.01); clang.stop(t + 0.25);
@@ -1783,7 +1783,7 @@ class PetAudioEngine {
       pulse.frequency.setValueAtTime(440 * pMod, t);
       pulse.frequency.exponentialRampToValueAtTime(880 * pMod, t + 0.08);
       g.gain.setValueAtTime(0.0001, t);
-      g.gain.linearRampToValueAtTime(0.68, t + 0.005);
+      g.gain.linearRampToValueAtTime(0.48, t + 0.005);
       g.gain.exponentialRampToValueAtTime(0.0001, t + 0.48);
       pulse.connect(g); g.connect(out);
       pulse.start(t); pulse.stop(t + 0.50);
@@ -1918,7 +1918,7 @@ class PetAudioEngine {
         f.type = 'lowpass';
         f.frequency.setValueAtTime(1400, t);
         g.gain.setValueAtTime(0.0001, t);
-        g.gain.linearRampToValueAtTime(1.10 / chord.length, t + 0.015);
+        g.gain.linearRampToValueAtTime(0.75 / chord.length, t + 0.015);
         g.gain.exponentialRampToValueAtTime(0.0001, t + 0.55);
         osc.connect(f); f.connect(g); g.connect(out);
         osc.start(t); osc.stop(t + 0.6);
@@ -2068,7 +2068,7 @@ class PetAudioEngine {
         f.type = 'lowpass';
         f.frequency.setValueAtTime(1400, tn);
         g.gain.setValueAtTime(0.0001, tn);
-        g.gain.linearRampToValueAtTime(0.865 / freqs.length, tn + 0.08);
+        g.gain.linearRampToValueAtTime(0.76 / freqs.length, tn + 0.08);
         g.gain.exponentialRampToValueAtTime(0.0001, tn + 1.28);
         osc.connect(f); f.connect(g); g.connect(out);
         osc.start(tn); osc.stop(tn + 1.31);
@@ -2084,7 +2084,7 @@ class PetAudioEngine {
    */
   playHackerCursorTick(variantIndex?: number): number {
     const vIdx = this.pickVariant('playHackerCursorTick', variantIndex);
-    const v = this.createVoice({ duration: 0.5, volume: 0.30 });
+    const v = this.createVoice({ duration: 0.5, volume: 0.285 });
     if (!v) return -1;
     const { out, t, voice } = v;
     const pMod = this.jitter(0.02);
@@ -2179,7 +2179,7 @@ class PetAudioEngine {
       sf.type = 'lowpass';
       sf.frequency.setValueAtTime(380, t);
       sg.gain.setValueAtTime(0.0001, t);
-      sg.gain.linearRampToValueAtTime(0.80, t + 0.01);
+      sg.gain.linearRampToValueAtTime(0.42, t + 0.01);
       sg.gain.exponentialRampToValueAtTime(0.0001, t + 0.14);
       seek.connect(sf); sf.connect(sg); sg.connect(out);
       seek.start(t); seek.stop(t + 0.15);
@@ -2193,7 +2193,7 @@ class PetAudioEngine {
         ff.frequency.setValueAtTime(1400 * pMod, t);
         ff.Q.value = 2.0;
         fg.gain.setValueAtTime(0.0001, t);
-        fg.gain.linearRampToValueAtTime(0.86, t + 0.015);
+        fg.gain.linearRampToValueAtTime(0.45, t + 0.015);
         fg.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
         friction.connect(ff); ff.connect(fg); fg.connect(out);
         friction.start(t); friction.stop(t + 0.13);
@@ -2207,7 +2207,7 @@ class PetAudioEngine {
       cap.frequency.setValueAtTime(800 * pMod, t);
       cap.frequency.exponentialRampToValueAtTime(1800 * pMod, t + 0.22);
       cg.gain.setValueAtTime(0.0001, t);
-      cg.gain.linearRampToValueAtTime(0.42, t + 0.04);
+      cg.gain.linearRampToValueAtTime(0.40, t + 0.04);
       cg.gain.exponentialRampToValueAtTime(0.0001, t + 0.26);
       cap.connect(cg); cg.connect(out);
       cap.start(t); cap.stop(t + 0.28);
@@ -2219,7 +2219,7 @@ class PetAudioEngine {
       motor.type = 'triangle';
       motor.frequency.setValueAtTime(65 * pMod, t);
       mg.gain.setValueAtTime(0.0001, t);
-      mg.gain.linearRampToValueAtTime(0.45, t + 0.02);
+      mg.gain.linearRampToValueAtTime(0.41, t + 0.02);
       mg.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
       motor.connect(mg); mg.connect(out);
       motor.start(t); motor.stop(t + 0.2);
@@ -2306,7 +2306,7 @@ class PetAudioEngine {
 
   playEasterEggDisk(variantIndex?: number): number {
     const vIdx = this.pickVariant('playEasterEggDisk', variantIndex);
-    const v = this.createVoice({ duration: 0.7, volume: 0.75 });
+    const v = this.createVoice({ duration: 0.7, volume: 0.60 });
     if (!v) return -1;
     const { out, t, voice } = v;
     const pMod = this.jitter(0.03);
@@ -2373,7 +2373,7 @@ class PetAudioEngine {
       osc.type = 'sine';
       osc.frequency.setValueAtTime(1760.0 * this.jitter(0.01), t);
       g.gain.setValueAtTime(0.0001, t);
-      g.gain.linearRampToValueAtTime(0.75, t + 0.004);
+      g.gain.linearRampToValueAtTime(0.46, t + 0.004);
       g.gain.exponentialRampToValueAtTime(0.0001, t + 0.4);
       osc.connect(g); g.connect(out);
       osc.start(t); osc.stop(t + 0.42);
@@ -2408,7 +2408,7 @@ class PetAudioEngine {
         f.type = 'lowpass';
         f.frequency.setValueAtTime(800, t);
         g.gain.setValueAtTime(0.0001, t);
-        g.gain.linearRampToValueAtTime(0.70 / chord.length, t + 0.015);
+        g.gain.linearRampToValueAtTime(0.62 / chord.length, t + 0.015);
         g.gain.exponentialRampToValueAtTime(0.0001, t + 0.35);
         osc.connect(f); f.connect(g); g.connect(out);
         osc.start(t); osc.stop(t + 0.38);
