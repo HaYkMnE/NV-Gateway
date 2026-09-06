@@ -5,6 +5,7 @@ import { AlertTriangle, Lightbulb, Send, X } from 'lucide-react';
 import { api, queryKeys } from '../lib/api';
 import { CLIPBOARD_TEXT_MAX, classifyDataState, isOversizedForClipboard, safeError } from '../lib/frontend-state';
 import { classifyScrollEvent, createLogsQueryPolicy, isNearBottom, shouldCancelAutoScroll } from '../lib/frontend-behavior';
+import { formatLogLine } from '../lib/logs-format';
 import { useGatewayLifecycle } from '../lib/gateway-lifecycle';
 import { useModal } from '../lib/modal-context';
 
@@ -59,10 +60,14 @@ export function Logs() {
   // every row's strings) referentially stable across unchanged polls, so a
   // poll/state-driven re-render of this view then costs ~zero row work instead
   // of 2N formatLog calls + N element diffs for N rows.
+  //
+  // The formatter itself lives in ../lib/logs-format — extracted so it can be
+  // unit-tested against real gateway records (the repo has no jsdom, so this
+  // component cannot be rendered in a test).
   const lines = useMemo<LogLine[]>(
     () =>
       logs.map((log, index) => {
-        const text = formatLog(log);
+        const text = formatLogLine(log);
         return {
           key: log.id ? String(log.id) : `${log.timestamp ?? log.time ?? ''}-${index}-${log.message ?? ''}`,
           text,
@@ -383,23 +388,6 @@ const LogRow = memo(function LogRow({ label, cls, text }: { label: string; cls: 
     </li>
   );
 });
-
-function formatLog(log: Log): string {
-  return [
-    log.timestamp ?? log.time,
-    log.level && `[${String(log.level).toUpperCase()}]`,
-    log.method,
-    log.path,
-    log.status,
-    log.duration !== undefined && `${log.duration}ms`,
-    log.outcome,
-    log.model,
-    log.message,
-  ]
-    .filter((value) => value !== undefined && value !== '')
-    .map(String)
-    .join(' ');
-}
 
 function levelClass(level?: string) {
   const value = level?.toLowerCase();
