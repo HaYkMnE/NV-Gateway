@@ -352,7 +352,7 @@ export function createModelsHandlers(options: ModelsIpcOptions) {
     if (typeof enabled !== "boolean") throw new Error("Invalid enabled flag.");
 
     const configPath = options.getConfigPath();
-    const current = readAppConfig(configPath);
+    let current = readAppConfig(configPath);
 
     if (!lastKnownCatalog) {
       try {
@@ -366,6 +366,12 @@ export function createModelsHandlers(options: ModelsIpcOptions) {
       } catch {
         // Dispatch failed or timed out — fallback gracefully
       }
+      // Race fix: the snapshot above predates the dispatch await (up to the
+      // admin socket timeout, seconds). A concurrent update-model-settings /
+      // toggle-model write landing during that await was silently overwritten
+      // because writeAppConfig merges {...freshRead, ...staleFullMaps}. Re-read
+      // AFTER the await and base the merge on the fresh state.
+      current = readAppConfig(configPath);
     }
 
     let disabledModels: string[];
