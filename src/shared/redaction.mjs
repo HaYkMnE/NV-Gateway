@@ -52,7 +52,8 @@ function splitTrailingProsePunctuation(candidate) {
 
 function redactString(value) {
   let result = redactEmbeddedUrls(redactEncodedEmbeddedUrls(value.replace(SECRET_TEXT, (match, prefix) => prefix ? `${prefix}[REDACTED]` : '[REDACTED]')));
-  return runtimeSecrets.reduce((redacted, secret) => redacted.split(secret).join('[REDACTED]'), result);
+  // Meta bound (parity with src/main/redaction.ts): strings capped at 16_384 chars.
+  return runtimeSecrets.reduce((redacted, secret) => redacted.split(secret).join('[REDACTED]'), result).slice(0, 16_384);
 }
 
 export function redact(value, seen = new WeakSet()) {
@@ -60,8 +61,9 @@ export function redact(value, seen = new WeakSet()) {
   if (value === null || typeof value !== 'object') return value;
   if (seen.has(value)) return '[Circular]';
   seen.add(value);
-  if (Array.isArray(value)) return value.map((item) => redact(item, seen));
-  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, SENSITIVE.test(key) ? '[REDACTED]' : redact(item, seen)]));
+  // Meta bound (parity with src/main/redaction.ts): collections capped at 1000 entries.
+  if (Array.isArray(value)) return value.slice(0, 1000).map((item) => redact(item, seen));
+  return Object.fromEntries(Object.entries(value).slice(0, 1000).map(([key, item]) => [key, SENSITIVE.test(key) ? '[REDACTED]' : redact(item, seen)]));
 }
 
 export function pathnameOnly(value) {
