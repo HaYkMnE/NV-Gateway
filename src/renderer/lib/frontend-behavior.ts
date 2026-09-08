@@ -47,6 +47,28 @@ export function classifyScrollEvent(prevTop: number, nextTop: number, programmat
 export function selectRecommendedPort(input: { changeMode: boolean; currentPort: number; currentPairAvailable: boolean | null; recommendedPort: number | null }): string { return !input.changeMode && input.recommendedPort !== null && input.currentPairAvailable !== true ? String(input.recommendedPort) : String(input.currentPort); }
 export function reduceMenu(open: boolean, action: { type: 'toggle' | 'close' | 'escape' }): boolean { return action.type === 'toggle' ? !open : false; }
 
+// Focus-trap primitives for modal dialogs (FeedbackModal, AboutDialog). THE
+// single shared implementation used by use-dialog-focus.ts: duplicating this
+// logic per dialog would let the traps drift apart.
+export const FOCUSABLE_SELECTOR = "button, [href], input, select, textarea, [tabindex]:not([tabindex=\"-1\"])";
+
+/**
+ * Pure Tab/Shift+Tab decision for a focus trap. Given the dialog's focusable
+ * children and the currently focused element, returns the element focus must
+ * be moved to — or null when the in-dialog move is safe for the browser to
+ * perform natively. Wraps at the edges, pulls stray (outside-the-dialog) focus
+ * back inside, and returns null for an empty dialog (container fallback is
+ * the caller's concern).
+ */
+export function nextFocusTarget<T>(focusables: readonly T[], current: T | null, shiftKey: boolean): T | null {
+  if (focusables.length === 0) return null;
+  const index = current === null ? -1 : focusables.indexOf(current);
+  if (index < 0) return shiftKey ? focusables[focusables.length - 1] : focusables[0];
+  if (!shiftKey && index === focusables.length - 1) return focusables[0];
+  if (shiftKey && index === 0) return focusables[focusables.length - 1];
+  return null;
+}
+
 /**
  * Inlined mirror of isGatewayUnavailable (frontend-state.ts).
  *

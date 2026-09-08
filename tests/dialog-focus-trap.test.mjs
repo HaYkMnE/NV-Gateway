@@ -1,0 +1,121 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+// Regression tests for DEFECT 1 (confirmed by the width-audit): the app-level
+// dialogs (FeedbackModal, AboutDialog) open with NO focus management — focus
+// stays on the opener, Tab escapes into the page behind, and closing drops
+// focus into the void. Minimum contract pinned here:
+//   1. ONE shared hook/helper implementation (not duplicated logic),
+//   2. on open focus moves INTO the dialog (first focusable, container fallback),
+//   3. Tab/Shift+Tab are trapped within the dialog subtree,
+//   4. on close (button/Esc/backdrop — all unmount paths) focus returns to the
+//      element that opened the dialog.
+// Style follows frontend-defects.test.mjs / p1-frontend.test.mjs: the trap's
+// decision logic is pinned as a PURE helper exercised through the built
+// behavior bundle (DOM-free, real assertions), while React/DOM wiring (which
+// this node:test environment cannot render — there is no JSDOM and the repo
+// has no React testing library) is pinned at the source level. Live-only
+// behavior is marked in the report, not claimed here.
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const read = (relative) => fs.readFileSync(path.join(root, relative), 'utf8');
+
+// ── 1. Pure focus-trap decision helper (the one non-trivial piece) ───────────
+test('nextFocusTarget wraps Tab inside the dialog subtree and pulls stray focus back in', async () => {
+  const helpers = await import('../build/src/renderer/lib/frontend-behavior.js');
+  assert.equal(typeof helpers.nextFocusTarget, 'function',
+    'a pure nextFocusTarget helper must exist in frontend-behavior.js so ONE implementation is shared by both dialogs');
+  assert.equal(typeof helpers.FOCUSABLE_SELECTOR, 'string',
+    'the focusable-element selector must be a shared constant');
+  assert.match(helpers.FOCUSABLE_SELECTOR, /button/, 'selector must cover buttons');
+  assert.match(helpers.FOCUSABLE_SELECTOR, /input/, 'selector must cover inputs');
+  assert.match(helpers.FOCUSABLE_SELECTOR, /tabindex/, 'selector must honor [tabindex]');
+
+  // Stable stub elements (the helper is element-agnostic — pure array math).
+  const [a, b, c] = ['a', 'b', 'c'];
+  const list = [a, b, c];
+  // Forward Tab in the middle of the dialog: nothing to wrap — let the browser move.
+  assert.equal(helpers.nextFocusTarget(list, b, false), null,
+    'a mid-dialog Tab must return null so the browser handles the move');
+  // Forward Tab on the LAST focusable wraps to the first (this is the trap).
+  assert.equal(helpers.nextFocusTarget(list, c, false), a,
+    'Tab from the last focusable must wrap to the first instead of escaping the dialog');
+  // Backward Tab on the FIRST focusable wraps to the last.
+  assert.equal(helpers.nextFocusTarget(list, a, true), c,
+    'Shift+Tab from the first focusable must wrap to the last');
+  // Backward Tab in the middle: browser handles it.
+  assert.equal(helpers.nextFocusTarget(list, b, true), null);
+  // Focus outside the dialog entirely (e.g. still on the page behind): pull it in.
+  assert.equal(helpers.nextFocusTarget(list, null, false), a,
+    'Tab with focus outside the dialog must be pulled to the first focusable');
+  assert.equal(helpers.nextFocusTarget(list, null, true), c,
+    'Shift+Tab with focus outside must be pulled to the last focusable');
+  // A dialog with nothing focusable falls back to the container itself.
+  assert.equal(helpers.nextFocusTarget([], a, false), null);
+});
+
+// ── 2. ONE shared hook, DOM-wired, used by both dialogs ──────────────────────
+test('a single shared useDialogFocus hook implements open-focus, Tab trap and close-restore', () => {
+  const hook = read('src/renderer/lib/use-dialog-focus.ts');
+  // Remembers the opener BEFORE moving focus.
+  assert.match(hook, /const opener = document\.activeElement/,
+    'the hook must capture document.activeElement as the opener on open');
+  // Moves focus INTO the dialog: first focusable, dialog container as fallback.
+  assert.match(hook, /querySelectorAll?<HTMLElement>\(FOCUSABLE_SELECTOR\)/,
+    'the hook must query the dialog subtree with the shared FOCUSABLE_SELECTOR');
+  assert.match(hook, /\?\? dialog\)\.focus\(\)/,
+    'when the dialog has no focusable child the container itself must receive focus');
+  assert.match(hook, /\.focus\(\)/, 'an explicit focus() call must happen on open');
+  // Traps Tab via the shared pure helper and only suppresses the browser default
+  // when the helper says the move would escape the dialog.
+  assert.match(hook, /event\.key !== 'Tab'/, 'the keydown handler must react only to Tab/Shift+Tab');
+  assert.match(hook, /nextFocusTarget\(/, 'the handler must delegate to the ONE shared pure helper');
+  assert.match(hook, /event\.preventDefault\(\);?\s*\n?\s*target\.focus\(\)/,
+    'on a wrap the default must be prevented and the wrapped target focused');
+  // Cleanup runs for EVERY close path (X button, Esc, backdrop, unmount) because
+  // all of them flip isOpen/unmount the dialog — focus must return to the opener.
+  assert.match(hook, /return \(\) => \{[\s\S]*removeEventListener[\s\S]*\};?\s*\}, \[dialogRef, isOpen\]\);/,
+    'the effect cleanup must remove the keydown listener and restore focus');
+  assert.match(hook, /opener\.focus\(\)/, 'cleanup must refocus the opener');
+  assert.match(hook, /document\.contains\(opener\)/,
+    'cleanup must not refocus a detached opener (defensive guard)');
+});
+
+// ── 3. FeedbackModal: wired to the hook, dialog container focusable ─────────
+test('FeedbackModal uses the shared hook (dialogRef is no longer a dead ref)', () => {
+  const modal = read('src/renderer/components/FeedbackModal.tsx');
+  assert.match(modal, /import \{ useDialogFocus \} from '\.\.\/lib\/use-dialog-focus'/,
+    'FeedbackModal must import the shared hook');
+  assert.match(modal, /useDialogFocus\(dialogRef, isOpen\)/,
+    'FeedbackModal must activate the hook with its existing dialogRef (no layout/style changes)');
+  // The container must be programmatically focusable for the empty-subtree fallback.
+  assert.match(modal, /ref=\{dialogRef\}\s*\n\s*role="dialog"\s*\n\s*aria-modal="true"\s*\n\s*tabIndex=\{-1\}/,
+    'the role=dialog container must keep ref/aria-modal and gain tabIndex={-1} (focus fallback only)');
+  // The defect root: dialogRef existed but was never focused. The hook now owns focus.
+  assert.doesNotMatch(modal, /dialogRef\.current/,
+    'focus handling must live in the shared hook, not re-implemented in the component');
+});
+
+// ── 4. AboutDialog: gains the ref it never had, wired to the same hook ─────
+test('AboutDialog uses the same shared hook with a newly created dialog ref', () => {
+  const dialog = read('src/renderer/components/AboutDialog.tsx');
+  assert.match(dialog, /import \{ useDialogFocus \} from '\.\.\/lib\/use-dialog-focus'/,
+    'AboutDialog must import the shared hook (ONE implementation reused, not duplicated)');
+  assert.match(dialog, /const dialogRef = useRef<HTMLDivElement>\(null\)/,
+    'AboutDialog must create the dialog ref it previously lacked');
+  assert.match(dialog, /useDialogFocus\(dialogRef, isOpen\)/,
+    'AboutDialog must activate the hook');
+  assert.match(dialog, /ref=\{dialogRef\}\s*\n\s*role="dialog"\s*\n\s*aria-modal="true"\s*\n\s*tabIndex=\{-1\}/,
+    'the role=dialog container must gain ref + tabIndex={-1} without layout/style changes');
+});
+
+// ── 5. Anti-duplication guard ────────────────────────────────────────────────
+test('focus management exists exactly once in the renderer (no duplicated trap logic)', () => {
+  const files = fs.readdirSync(path.join(root, 'src/renderer/lib'))
+    .filter((f) => /^use-dialog-focus/.test(f));
+  assert.deepEqual(files, ['use-dialog-focus.ts'],
+    'there must be exactly one dialog-focus module in src/renderer/lib');
+});

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { X } from 'lucide-react';
+import { useDialogFocus } from '../lib/use-dialog-focus';
 
 const TITLE_MAX = 100;
 const DESCRIPTION_MAX = 2000;
@@ -24,6 +25,10 @@ export function FeedbackModal({ isOpen, onClose }: FeedbackModalProps) {
   const [submitting, setSubmitting] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
+
+  // Focus-in-on-open, Tab trapping and focus-restore-on-close all live in the
+  // ONE shared hook — the dialogRef is handed over, not used directly here.
+  useDialogFocus(dialogRef, isOpen);
 
   // Reset form when opening
   useEffect(() => {
@@ -118,6 +123,7 @@ export function FeedbackModal({ isOpen, onClose }: FeedbackModalProps) {
         ref={dialogRef}
         role="dialog"
         aria-modal="true"
+        tabIndex={-1}
         aria-label={t('feedback_title')}
         onMouseDown={(e) => e.stopPropagation()}
         className="bg-bg border border-border p-6 max-w-lg w-full max-h-[90vh] overflow-y-auto"

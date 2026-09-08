@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { X } from 'lucide-react';
+import { useDialogFocus } from '../lib/use-dialog-focus';
 
 interface AboutDialogProps {
   isOpen: boolean;
@@ -11,6 +12,10 @@ export function AboutDialog({ isOpen, onClose }: AboutDialogProps) {
   const { t } = useTranslation();
   const [info, setInfo] = useState<AboutInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+
+  // Same shared focus management as FeedbackModal — no per-dialog wiring.
+  useDialogFocus(dialogRef, isOpen);
 
   // Fetch about info when opened
   useEffect(() => {
@@ -54,8 +59,10 @@ export function AboutDialog({ isOpen, onClose }: AboutDialogProps) {
   return (
     <div className="fixed inset-0 z-50 bg-black/60 grid place-items-center p-4" onMouseDown={onClose}>
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
+        tabIndex={-1}
         aria-label={t('about_title')}
         onMouseDown={(e) => e.stopPropagation()}
         className="bg-bg border border-border p-6 max-w-md w-full"
