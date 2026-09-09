@@ -107,12 +107,12 @@ test('config.ts: applyStoredLanguage early-returns on the resolved language and 
   assert.match(config, /i18n\.on\('languageChanged', \(language\) => \{ document\.documentElement\.lang = language; \}\)/,
     'the languageChanged -> document.documentElement.lang wiring must be preserved (real language switches must still update <html lang>)');
 
-  // No new user-visible strings are needed by this fix: the 301-key per-locale
-  // invariant pinned by feedback-save-path-visible/logs-copy-failure-detail
-  // must be untouched.
+  // No new user-visible strings are needed by this fix: the per-locale key
+  // parity invariant pinned by feedback-save-path-visible/logs-copy-failure-detail
+  // must be untouched (302 keys/locale since the Models label-chip key).
   const { en, ru } = loadTsModule('src/renderer/i18n/resources.ts');
-  assert.equal(Object.keys(en).length, 301, 'en must still carry exactly 301 keys');
-  assert.equal(Object.keys(ru).length, 301, 'ru must still carry exactly 301 keys');
+  assert.equal(Object.keys(en).length, 302, 'en must still carry exactly 302 keys');
+  assert.equal(Object.keys(ru).length, 302, 'ru must still carry exactly 302 keys');
 });
 
 // ── 3. Executable: the guard breaks the emission edge on the real i18n instance ──

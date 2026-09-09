@@ -141,7 +141,7 @@ function ModelsSection() {
                   <option value="night">{t('mode_night')}</option>
                   <option value="auto">{t('mode_auto')}</option>
                 </select>
-                <label className="flex items-center gap-2 text-sm text-textMuted">
+                <label className="flex items-center gap-2 text-sm text-textMuted py-1.5">
                   <input
                     type="checkbox"
                     role="switch"

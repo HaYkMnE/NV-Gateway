@@ -3,7 +3,8 @@ import { FOCUSABLE_SELECTOR, nextFocusTarget } from './frontend-behavior';
 
 /**
  * Shared focus management for app-level modal dialogs (FeedbackModal,
- * AboutDialog). ONE implementation so both dialogs behave identically:
+ * AboutDialog, DonationModal — including the donation dialog's enlarged-QR
+ * overlay). ONE implementation so both dialogs behave identically:
  *  1. on open, focus moves INTO the dialog (first focusable child, with the
  *     dialog container — which must carry tabIndex={-1} — as the fallback for
  *     a focusable-free subtree);

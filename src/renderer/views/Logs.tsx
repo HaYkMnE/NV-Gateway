@@ -233,7 +233,7 @@ export function Logs() {
           <button onClick={() => setPaused(!paused)} className="border border-border px-3 py-2">
             {t(paused ? 'resume' : 'pause')}
           </button>
-          <label className="flex items-center gap-2 border border-border px-3">
+          <label className="flex items-center gap-2 border border-border px-3 py-2">
             <input type="checkbox" checked={autoScroll} onChange={(event) => setAutoScroll(event.target.checked)} />
             {t('auto_scroll')}
           </label>

@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { X } from 'lucide-react';
 import QRCode from 'qrcode';
 import { petAudio } from './audioEngine';
+import { useDialogFocus } from '../lib/use-dialog-focus';
 import './donation-modal.css';
 
 /**
@@ -285,6 +286,20 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
   const [qrRow, setQrRow] = useState<DonationRow | null>(null);
   const [bubble, setBubble] = useState<string | null>(null);
   const bubbleTimerRef = useRef<number | null>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const qrDialogRef = useRef<HTMLDivElement>(null);
+
+  // Focus-in-on-open, Tab trapping and focus-restore-on-close all come from the
+  // ONE shared hook (same as FeedbackModal/AboutDialog). This component renders
+  // TWO role="dialog" containers — the main panel and the enlarged-QR overlay
+  // stacked above it — and each gets its own hook instance. The main trap is
+  // suspended while the overlay is open: with both document-level Tab handlers
+  // live, a Tab meant for the overlay would be yanked into the main dialog
+  // behind it. On overlay close the main hook re-activates, moving focus back
+  // into the main dialog; on the final modal close focus returns to the pet
+  // widget launch button that opened it.
+  useDialogFocus(dialogRef, open && qrRow === null);
+  useDialogFocus(qrDialogRef, qrRow !== null);
 
   // Reset transient UI state each time the modal opens.
   useEffect(() => {
@@ -391,8 +406,10 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
       
       {/* ===================== Main modal ===================== */}
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
+        tabIndex={-1}
         aria-label={t('pet_donation_title')}
         onMouseDown={onClose}
         className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 p-4 backdrop-blur-sm font-sans"
@@ -534,8 +551,10 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
       {/* ============ Enlarged QR scan overlay ============ */}
       {qrRow && (
         <div
+          ref={qrDialogRef}
           role="dialog"
           aria-modal="true"
+          tabIndex={-1}
           aria-label={t('pet_qr_overlay_aria', { label: qrRow.label })}
           onMouseDown={() => setQrRow(null)}
           className="fixed inset-0 z-[60] flex items-center justify-center bg-black/90 p-4 backdrop-blur-sm font-sans"

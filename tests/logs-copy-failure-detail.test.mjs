@@ -42,8 +42,9 @@ const LOCALE_NAMES = ['en', 'ru', 'zh', 'es', 'hi', 'fr', 'ar'];
 // solution and neither may be edited.
 //   * tests/clipboard-write-via-main.test.mjs:133 pins the exact literal
 //     announce(t('copy_failed')) in Logs.
-//   * tests/feedback-save-path-visible.test.mjs:68,77 pins every locale at
-//     EXACTLY 301 keys, so a brand-new i18n key would break a passing test.
+//   * tests/feedback-save-path-visible.test.mjs pins every locale's key count
+//     (302 after the later Models label-chip localization), so a brand-new
+//     i18n key would break a passing test unless that pin is knowingly moved.
 // The fix therefore composes the already-localized keys clipboard_failed,
 // feedback_charCount ("{{count}}/{{max}} characters") and unknown_error, and
 // classification lives in a pure, directly testable helper.
@@ -133,16 +134,18 @@ test('every string the failure message composes exists in all 7 locales', () => 
   }
 });
 
-test('the fix adds no new i18n key, so every locale stays key-complete at 301', () => {
-  // Composing existing localized strings keeps the sibling contract intact
-  // (tests/feedback-save-path-visible.test.mjs pins exactly 301) and avoids
-  // shipping machine-translated English.
+test('this fix adds no i18n key of its own; every locale stays key-complete at 302', () => {
+  // Composing existing localized strings kept this fix key-free. The count is
+  // 301 + 1 for the later Models label-chip fix (models_label_usecase_text_gen)
+  // — tests/frontend-defects.test.mjs owns that key; this file only keeps the
+  // sibling parity guard in sync (the original "no new key" discipline stands:
+  // composing here avoided shipping machine-translated English).
   const exports_ = loadTypeScriptExports('src/renderer/i18n/resources.ts');
   const enKeys = Object.keys(exports_.en);
-  assert.equal(enKeys.length, 301, 'EN must stay at 301 keys');
+  assert.equal(enKeys.length, 302, 'EN must hold 302 keys');
   for (const locale of LOCALE_NAMES) {
     const keys = Object.keys(exports_[locale]);
-    assert.equal(keys.length, 301, `${locale} must hold 301 keys`);
+    assert.equal(keys.length, 302, `${locale} must hold 302 keys`);
     assert.deepEqual(enKeys.filter((k) => !keys.includes(k)), [], `${locale} is missing keys`);
   }
 });

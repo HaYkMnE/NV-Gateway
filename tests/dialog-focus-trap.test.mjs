@@ -5,7 +5,8 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 // Regression tests for DEFECT 1 (confirmed by the width-audit): the app-level
-// dialogs (FeedbackModal, AboutDialog) open with NO focus management — focus
+// dialogs (FeedbackModal, AboutDialog — and, per the later UI audit, the pet
+// DonationModal) open with NO focus management — focus
 // stays on the opener, Tab escapes into the page behind, and closing drops
 // focus into the void. Minimum contract pinned here:
 //   1. ONE shared hook/helper implementation (not duplicated logic),
@@ -118,4 +119,37 @@ test('focus management exists exactly once in the renderer (no duplicated trap l
     .filter((f) => /^use-dialog-focus/.test(f));
   assert.deepEqual(files, ['use-dialog-focus.ts'],
     'there must be exactly one dialog-focus module in src/renderer/lib');
+});
+
+// ── 6. DonationModal: same defect class, fixed through the SAME hook ─────────
+//   src/renderer/pet/DonationModal.tsx had an Esc handler but never used
+//   useDialogFocus: opening the donation dialog left focus on the pet widget
+//   launch button, Tab escaped to the page, and closing dropped focus into the
+//   void. The dialog actually renders TWO role="dialog" containers — the main
+//   panel and the enlarged-QR scan overlay that stacks above it. Both must go
+//   through the ONE shared hook, and the two traps must not fight: while the
+//   overlay is open the main dialog's trap is suspended (otherwise a Tab meant
+//   for the overlay would be yanked back into the main dialog behind it,
+//   because document-level handlers of both hooks would both react).
+test('DonationModal wires the shared useDialogFocus hook to its main dialog and the QR overlay, without the two traps fighting', () => {
+  const modal = read('src/renderer/pet/DonationModal.tsx');
+  assert.match(modal, /import \{ useDialogFocus \} from '\.\.\/lib\/use-dialog-focus'/,
+    'DonationModal must import the ONE shared hook (no local re-implementation)');
+  assert.match(modal, /const dialogRef = useRef<HTMLDivElement>\(null\)/,
+    'DonationModal must create the main-dialog ref (it previously had none)');
+  assert.match(modal, /const qrDialogRef = useRef<HTMLDivElement>\(null\)/,
+    'the enlarged-QR overlay (a second role="dialog") needs its own ref');
+  assert.match(modal, /useDialogFocus\(dialogRef, open && qrRow === null\)/,
+    'the main dialog trap must be suspended while the QR overlay is open, otherwise the two document-level Tab handlers fight over the same keypress');
+  assert.match(modal, /useDialogFocus\(qrDialogRef, qrRow !== null\)/,
+    'the QR overlay must get the same focus-in/trap/restore treatment while open');
+  // Both dialog containers must be programmatically focusable for the
+  // empty-subtree fallback, exactly like FeedbackModal/AboutDialog.
+  assert.match(modal, /ref=\{dialogRef\}\s*\n\s*role="dialog"\s*\n\s*aria-modal="true"\s*\n\s*tabIndex=\{-1\}/,
+    'the main role=dialog container must carry ref + tabIndex={-1} (focus fallback only, no layout change)');
+  assert.match(modal, /ref=\{qrDialogRef\}\s*\n\s*role="dialog"\s*\n\s*aria-modal="true"\s*\n\s*tabIndex=\{-1\}/,
+    'the QR overlay role=dialog container must carry ref + tabIndex={-1} the same way');
+  // The existing Esc layering (overlay closes first, then the modal) must be kept.
+  assert.match(modal, /if \(qrRow\) setQrRow\(null\);\s*\n\s*else onClose\(\);/,
+    'the Esc layering (overlay first, then the modal) must be preserved');
 });

@@ -92,6 +92,32 @@ function nameOf(id: string): string {
 }
 
 /**
+ * Known NGC label values -> i18n key of the human-readable chip text.
+ *
+ * recordToMetadata() pushes string-valued NGC label entries verbatim
+ * (nvidia-catalog-sync.mjs:271-291), and NGC emits some of them as namespaced
+ * backend keys ("usecase:endpoint:usecase_text_gen", "cloudPartnerType:endpoint:…",
+ * "nimType:…", "playgroundType:…"). Rendering those raw in the filter chips is
+ * meaningless to a user, so the values we KNOW map to localized display text.
+ * The map keys are the bare VALUE token — the part after the last ':' — so the
+ * same value is recognized whether it arrives namespaced or bare.
+ */
+const KNOWN_LABEL_I18N_KEYS: Readonly<Record<string, string>> = {
+  usecase_text_gen: 'models_label_usecase_text_gen',
+};
+
+/**
+ * The i18n key of the human-readable chip text for a label, or null when the
+ * label is not a known mapping — the caller MUST then render the raw label so
+ * an unknown label never silently disappears.
+ */
+export function modelLabelI18nKey(label: string): string | null {
+  if (typeof label !== 'string') return null;
+  const value = label.includes(':') ? label.slice(label.lastIndexOf(':') + 1) : label;
+  return KNOWN_LABEL_I18N_KEYS[value] ?? null;
+}
+
+/**
  * Every distinct label carried by the given models, deduped and sorted. The chip
  * row is built from this, so it can never advertise a label that would match
  * nothing.

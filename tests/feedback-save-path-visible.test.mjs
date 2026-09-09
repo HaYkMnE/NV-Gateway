@@ -69,12 +69,14 @@ test('every locale stays key-complete and the key count grew by exactly one', ()
   // Lineage: 292 baseline, +1 for this defect's feedback_savedTo = 293, then +8
   // for the Models filter controls (models_filter_* — popularity label/any/
   // threshold, labels label, the two narrowing toggles, reset, result count)
-  // = 301. This number is a snapshot of the CURRENT key set; the assertions that
+  // = 301, then +1 for the humanized Models label chip
+  // (models_label_usecase_text_gen) = 302. This number is a snapshot of the
+  // CURRENT key set; the assertions that
   // actually protect the 7-locale contract are the key-completeness ones below
   // (no missing keys, no keys EN does not define), which remain exactly as
   // strict as before.
-  assert.equal(enKeys.length, 301,
-    'EN key count: 292 baseline + 1 (feedback_savedTo) + 8 (models_filter_*)');
+  assert.equal(enKeys.length, 302,
+    'EN key count: 292 baseline + 1 (feedback_savedTo) + 8 (models_filter_*) + 1 (models_label_usecase_text_gen)');
 
   for (const locale of LOCALE_NAMES) {
     const localeKeys = Object.keys(exports[locale]);
@@ -82,7 +84,7 @@ test('every locale stays key-complete and the key count grew by exactly one', ()
     const extra = localeKeys.filter((key) => !enKeys.includes(key));
     assert.deepEqual(missing, [], `${locale} is missing keys: ${missing.join(', ')}`);
     assert.deepEqual(extra, [], `${locale} has keys EN does not define: ${extra.join(', ')}`);
-    assert.equal(localeKeys.length, 301, `${locale} must hold 301 keys`);
+    assert.equal(localeKeys.length, 302, `${locale} must hold 302 keys`);
   }
 });
 

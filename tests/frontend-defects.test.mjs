@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import vm from 'node:vm';
+import typescript from 'typescript';
 
 // Regression tests for the five confirmed frontend defects. One failing test
 // was written per defect BEFORE the fix (TDD); the matching fix makes it pass.
@@ -12,6 +14,20 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (relative) => fs.readFileSync(path.join(root, relative), 'utf8');
+
+const LOCALE_NAMES = ['en', 'ru', 'zh', 'es', 'hi', 'fr', 'ar'];
+
+// Same loader tests/feedback-save-path-visible.test.mjs uses: transpile the TS
+// to CommonJS and run it in a bare context (sandbox sees only { Error, exports,
+// module }), so the modules loaded through it MUST stay import-free.
+function loadTypeScriptExports(relative) {
+  const compiled = typescript.transpileModule(read(relative), {
+    compilerOptions: { module: typescript.ModuleKind.CommonJS, target: typescript.ScriptTarget.ES2020 }
+  });
+  const module = { exports: {} };
+  vm.runInNewContext(compiled.outputText, { Error, exports: module.exports, module }, { filename: relative });
+  return module.exports;
+}
 
 // ── Defect 1: Settings view clips bottom controls (unreachable < 600px) ──────
 test('Settings outer container scrolls so bottom controls stay reachable at the 600px minimum height', () => {
@@ -395,4 +411,119 @@ test('Layout sidebar scroll pane pins overflow-x to hidden so 1px sub-pixel wobb
   const dashboard = read('src/renderer/views/Dashboard.tsx');
   assert.match(dashboard, /overflow-y-auto overflow-x-hidden/,
     'Dashboard list pane keeps the overflow-y-auto + overflow-x-hidden precedent');
+});
+
+// ── Defect 12: Models filter chips show raw backend label keys ─────────────
+//   Root cause: Models.tsx:576 renders `{label}` verbatim. NGC returns
+//   label entries as namespaced strings and recordToMetadata()
+//   (nvidia-catalog-sync.mjs:271-291) pushes them untouched, so chips show
+//   "usecase:endpoint:usecase_text_gen", "cloudPartnerType:endpoint:…",
+//   "nimType:…", "playgroundType:…" — backend keys, not UI text.
+//   Fix contract: a pure mapping (known value -> i18n key) so chips render a
+//   localized human name; unknown labels keep the RAW string as fallback so
+//   nothing silently disappears. Only the visible chip text changes — the
+//   filter state keeps carrying the raw label so matching is untouched.
+test('modelLabelI18nKey maps known NGC labels to i18n keys and returns null for unknown ones', () => {
+  const lib = loadTypeScriptExports('src/renderer/lib/models-filter.ts');
+  assert.equal(typeof lib.modelLabelI18nKey, 'function',
+    'a pure modelLabelI18nKey helper must live in models-filter.ts (the import-free, unit-testable module)');
+
+  // The live-audit-confirmed chip label, namespaced form.
+  assert.equal(lib.modelLabelI18nKey('usecase:endpoint:usecase_text_gen'), 'models_label_usecase_text_gen',
+    'the observed namespaced label must map to its i18n key');
+  // The same value in bare token form must also be recognized.
+  assert.equal(lib.modelLabelI18nKey('usecase_text_gen'), 'models_label_usecase_text_gen',
+    'a bare known value token must map to the same key');
+
+  // Unknown labels must NOT be remapped or dropped: null => render raw.
+  assert.equal(lib.modelLabelI18nKey('nimType:nim_type_run_anywhere'), null,
+    'unknown namespaced labels must fall back to the raw string');
+  assert.equal(lib.modelLabelI18nKey('cloudPartnerType:endpoint:aws'), null,
+    'unknown partner-type labels must fall back to the raw string');
+  assert.equal(lib.modelLabelI18nKey('playgroundType:endpoint:playground_text_gen'), null,
+    'unknown playground-type labels must fall back to the raw string');
+  assert.equal(lib.modelLabelI18nKey('Agent'), null,
+    'already-human catalogue labels pass through unchanged');
+  assert.equal(lib.modelLabelI18nKey(''), null, 'an empty label maps to nothing');
+});
+
+test('the humanized model-label string exists in all 7 locales as a real translation', () => {
+  const res = loadTypeScriptExports('src/renderer/i18n/resources.ts');
+  for (const locale of LOCALE_NAMES) {
+    const value = res[locale].models_label_usecase_text_gen;
+    assert.ok(typeof value === 'string' && value.trim().length > 0,
+      `${locale} must define models_label_usecase_text_gen`);
+  }
+  // Script checks catch a left-in-place English copy (same discipline as
+  // tests/feedback-save-path-visible.test.mjs).
+  assert.match(res.ar.models_label_usecase_text_gen, /[؀-ۿ]/, 'ar must be Arabic script');
+  assert.match(res.hi.models_label_usecase_text_gen, /[ऀ-ॿ]/, 'hi must be Devanagari script');
+  assert.match(res.zh.models_label_usecase_text_gen, /[一-鿿]/, 'zh must be Han script');
+  assert.match(res.ru.models_label_usecase_text_gen, /[Ѐ-ӿ]/, 'ru must be Cyrillic script');
+  for (const locale of ['fr', 'es']) {
+    assert.notEqual(res[locale].models_label_usecase_text_gen, res.en.models_label_usecase_text_gen,
+      `${locale} must be translated, not the English string verbatim`);
+  }
+});
+
+test('Models filter chips render the human-readable label with the raw string as fallback, filtering untouched', () => {
+  const view = read('src/renderer/views/Models.tsx');
+  assert.match(view, /import \{[^}]*modelLabelI18nKey[^}]*\} from '\.\.\/lib\/models-filter'/,
+    'Models must import modelLabelI18nKey from the filter library');
+  assert.match(view, /const labelKey = modelLabelI18nKey\(label\)/,
+    'each chip must resolve its display key through the pure helper');
+  assert.match(view, /\{labelKey \? t\(labelKey\) : label\}/,
+    'the chip must render t(labelKey) for known labels and the RAW label for unknown ones (nothing silently disappears)');
+  // Internal filtering logic is unchanged: selection state and toggling keep
+  // operating on the raw, untranslated label value.
+  assert.match(view, /aria-pressed=\{filters\.labels\.includes\(label\)\}/,
+    'chip selection state must still key off the raw label');
+  assert.match(view, /onClick=\{\(\) => toggleLabel\(label\)\}/,
+    'chip toggling must still filter on the raw label');
+});
+
+// ── Defect 13: hit targets < 24px (WCAG 2.5.8) ──────────────────────────────
+//   Measured live: model-card "Details" buttons are 82x16, the Endpoint view's
+//   snippet Copy button is 88x16, and the Models/Logs/Settings checkboxes are
+//   13x13. All are pointer targets below the 24px WCAG 2.5.8 minimum. The fix
+//   grows the CLICKABLE area only (min-height/padding on the control or the
+//   wrapping label) — labels, typography and the checkbox glyph stay visually
+//   unchanged.
+test('model-card Details and Endpoint snippet-Copy buttons get a 24px minimum height', () => {
+  const models = read('src/renderer/views/Models.tsx');
+  const detailsButton = /<button[\s\S]*?toggleExpanded\(model\.id\)[\s\S]*?>/.exec(models);
+  assert.ok(detailsButton, 'the model-card Details expander button must exist');
+  assert.match(detailsButton[0], /className="[^"]*\bmin-h-6\b/,
+    'the Details button measured 82x16 (12px text, no padding) -> needs min-h-6 (24px) of clickable height; label/typography stay as they are');
+
+  const endpoint = read('src/renderer/views/Endpoint.tsx');
+  const copyButton = /<button[\s\S]*?copy\(active\.content, `config-\$\{configTab\}`\)[\s\S]*?>/.exec(endpoint);
+  assert.ok(copyButton, 'the Endpoint config-snippet Copy button must exist');
+  assert.match(copyButton[0], /className="[^"]*\bmin-h-6\b/,
+    'the snippet Copy button measured 88x16 -> needs min-h-6 (24px) of clickable height');
+});
+
+test('checkbox rows in Models/Logs/Settings meet the tap target via label padding (the glyph stays 13px)', () => {
+  const files = {
+    'src/renderer/views/Models.tsx': 2,
+    'src/renderer/views/Logs.tsx': 1,
+    'src/renderer/views/Settings.tsx': 2,
+  };
+  for (const [relative, expectedCount] of Object.entries(files)) {
+    const source = read(relative);
+    const labels = source.match(/<label\b[^>]*>[\s\S]*?<\/label>/g) ?? [];
+    const withCheckbox = labels.filter((label) => /<input[^>]*type="checkbox"/.test(label));
+    assert.equal(withCheckbox.length, expectedCount,
+      `${relative} must render exactly ${expectedCount} checkbox-wrapping label(s) (the audit targets)`);
+    for (const label of withCheckbox) {
+      const className = /className="([^"]*)"/.exec(label)[1];
+      assert.match(className, /(?:^|\s)(?:p-\[?\d|py-\[?\d|pt-\[?\d|pb-\[?\d)/,
+        `${relative} checkbox label must carry vertical padding so the tap area reaches >= 24px: got "${className}"`);
+      // The checkbox INPUT itself must not gain a size class: the visible 13px
+      // glyph stays as designed; only the clickable padding grows.
+      const input = /<input[^>]*type="checkbox"[^>]*>/.exec(label)[0];
+      assert.doesNotMatch(input, /className="[^"]*\b(?:[hw]|min-[hw])-/,
+        `${relative} checkbox glyph must not be visually enlarged (no h-*/w-*/min-h-*/min-w-* on the input)`);
+    }
+  }
 });

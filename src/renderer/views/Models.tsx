@@ -28,6 +28,7 @@ import {
   applyModelFilters,
   collectModelLabels,
   hasActiveFilters,
+  modelLabelI18nKey,
   resetModelFilters,
 } from '../lib/models-filter';
 import type { ModelFilterState, ModelSortBy } from '../lib/models-filter';
@@ -561,25 +562,33 @@ export function Models() {
                     <Tag aria-hidden size={13} className="shrink-0" />
                     <span>{t('models_filter_labels_label')}</span>
                   </span>
-                  {availableLabels.map((label) => (
-                    <button
-                      key={label}
-                      type="button"
-                      aria-pressed={filters.labels.includes(label)}
-                      onClick={() => toggleLabel(label)}
-                      className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs transition-all cursor-pointer select-none animate-tactile-tick border ${
-                        filters.labels.includes(label)
-                          ? 'border-accent-neon/80 bg-accent-neon/15 text-accent-neon shadow-[0_0_10px_rgba(89,255,0,0.25)] font-bold'
-                          : 'border-border/80 bg-surface/50 text-textMuted hover:text-textMain hover:border-border hover:bg-surface font-medium'
-                      }`}
-                    >
-                      {label}
-                    </button>
-                  ))}
+                  {availableLabels.map((label) => {
+                    // NGC emits some labels as raw backend keys
+                    // ("usecase:endpoint:usecase_text_gen", ...): known values
+                    // render a localized human name, unknown ones keep the raw
+                    // string so no chip can silently disappear. Filtering still
+                    // operates on the raw label everywhere else.
+                    const labelKey = modelLabelI18nKey(label);
+                    return (
+                      <button
+                        key={label}
+                        type="button"
+                        aria-pressed={filters.labels.includes(label)}
+                        onClick={() => toggleLabel(label)}
+                        className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs transition-all cursor-pointer select-none animate-tactile-tick border ${
+                          filters.labels.includes(label)
+                            ? 'border-accent-neon/80 bg-accent-neon/15 text-accent-neon shadow-[0_0_10px_rgba(89,255,0,0.25)] font-bold'
+                            : 'border-border/80 bg-surface/50 text-textMuted hover:text-textMain hover:border-border hover:bg-surface font-medium'
+                        }`}
+                      >
+                        {labelKey ? t(labelKey) : label}
+                      </button>
+                    );
+                  })}
                 </div>
               )}
 
-              <label className="flex items-center gap-2 text-xs font-medium text-textMuted cursor-pointer">
+              <label className="flex items-center gap-2 text-xs font-medium text-textMuted cursor-pointer py-1.5">
                 <input
                   type="checkbox"
                   checked={filters.freeOnly}
@@ -589,7 +598,7 @@ export function Models() {
                 <span>{t('models_filter_free_only')}</span>
               </label>
 
-              <label className="flex items-center gap-2 text-xs font-medium text-textMuted cursor-pointer">
+              <label className="flex items-center gap-2 text-xs font-medium text-textMuted cursor-pointer py-1.5">
                 <input
                   type="checkbox"
                   checked={filters.downloadableOnly}
@@ -839,11 +848,13 @@ export function Models() {
                           </div>
                         </div>
 
-                        {/* Expand Details / Inspector Button */}
+                        {/* Expand Details / Inspector Button (min-h-6: the
+                            82x16 text-only button was a 16px-tall hit target;
+                            WCAG 2.5.8 needs >= 24px of clickable height) */}
                         <button
                           type="button"
                           onClick={() => toggleExpanded(model.id)}
-                          className="flex items-center gap-1 text-xs font-medium text-textMuted hover:text-accent-neon transition-colors ml-auto cursor-pointer"
+                          className="flex items-center gap-1 text-xs font-medium text-textMuted hover:text-accent-neon transition-colors ml-auto cursor-pointer min-h-6"
                         >
                           <span>{isExpanded ? t('models_hide_details') : t('models_details')}</span>
                           {isExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}

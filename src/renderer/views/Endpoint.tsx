@@ -345,7 +345,7 @@ export function Endpoint() {
                 <button
                   type="button"
                   onClick={() => copy(active.content, `config-${configTab}`)}
-                  className="flex items-center gap-1.5 text-xs font-semibold text-accent-neon hover:text-accent-neon/80 cursor-pointer animate-tactile-tick"
+                  className="flex items-center gap-1.5 text-xs font-semibold text-accent-neon hover:text-accent-neon/80 cursor-pointer animate-tactile-tick min-h-6"
                 >
                   {copiedField === `config-${configTab}` ? (
                     <>
