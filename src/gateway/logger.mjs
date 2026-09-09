@@ -20,6 +20,15 @@ let debounceTimer = null;
 const MAX_MEM_LOGS = 100;
 const memLogs = [];
 
+// FIX 1 — suppression ledger (O(1), content never queued — same discipline as
+// error-reporter.ts:361-372). A failing append must NOT escape flushLogs: it
+// runs inside the debounce timer callback and the gateway child has no
+// uncaughtException handler, so one throw kills the gateway mid-service.
+let suppressedBatches = 0;
+let suppressedEntries = 0;
+let suppressedSince = "";
+let suppressedUntil = "";
+
 function rotateLogIfNeeded() {
     try {
         const stat = fs.statSync(LOG_FILE);
@@ -80,6 +89,7 @@ export function flushLogs() {
     }
 
     const data = logBuffer.join("\n") + "\n";
+    const batchSize = logBuffer.length;
     debounceTimer = null;
     logBuffer = [];
 
@@ -89,7 +99,36 @@ export function flushLogs() {
         // Rotation failure is not fatal — proceed with append
     }
 
-fs.appendFileSync(LOG_FILE, data, { encoding: "utf8" });
+    try {
+        // ONE summary marker on the first flush after recovery (same
+        // `[log-suppressed: ...]` spirit as error-reporter). Counters reset
+        // ONLY on a successful write, so a still-failing disk retries the
+        // notice later instead of losing the gap silently.
+        if (suppressedBatches > 0) {
+            const now = new Date().toISOString();
+            const notice = JSON.stringify({
+                timestamp: now,
+                level: "warn",
+                message: `[log-suppressed: ${suppressedBatches} batches / ${suppressedEntries} entries between ${suppressedSince} and ${suppressedUntil} were dropped: log write failed]`
+            }) + "\n";
+            fs.appendFileSync(LOG_FILE, notice + data, { encoding: "utf8" });
+            suppressedBatches = 0;
+            suppressedEntries = 0;
+            suppressedSince = "";
+            suppressedUntil = "";
+            return;
+        }
+        fs.appendFileSync(LOG_FILE, data, { encoding: "utf8" });
+    } catch {
+        // Survival first: drop this batch, count it, never rethrow into the
+        // debounce timer. Never queue content — that would move a disk
+        // problem into unbounded memory.
+        const now = new Date().toISOString();
+        if (suppressedBatches === 0) suppressedSince = now;
+        suppressedUntil = now;
+        suppressedBatches += 1;
+        suppressedEntries += batchSize;
+    }
 }
 
 export function closeLogger() {
