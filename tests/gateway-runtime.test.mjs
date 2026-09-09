@@ -1419,3 +1419,43 @@ test('getModelLimits uses hard fallback when no config exists', () => {
     resetModelLimitsCache();
   }
 });
+
+test('/v1/models/cached requires LOCAL_TOKEN: 401 without it, 200 with it, /health stays public', async () => {
+  const upstream = await createLocalUpstream((_request, response) => {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end('{"data":[]}');
+  });
+  let child;
+  let gatewayPort;
+  try {
+    ({ child, gatewayPort } = await startGatewayWithLocalUpstream(upstream.address().port));
+    // BEFORE the fix the /v1 branch sat at server.mjs:1437-1448 ABOVE the
+    // /v1 auth gate at :1478-1482, so this returned 200. It must sit BEHIND
+    // the same gate as /v1/models: no token -> 401 (with Bearer challenge).
+    const denied = await new Promise((resolve, reject) => {
+      const request = http.get({ host: '127.0.0.1', port: gatewayPort, path: '/v1/models/cached' }, (response) => {
+        response.resume();
+        response.once('end', () => resolve({ statusCode: response.statusCode, headers: response.headers }));
+      });
+      request.once('error', reject);
+    });
+    assert.equal(denied.statusCode, 401, 'GET /v1/models/cached without Authorization must be 401');
+    assert.equal(denied.headers['www-authenticate'], 'Bearer');
+    // A healthy token still works, exactly like /v1/models.
+    const allowed = await requestGateway(gatewayPort, '/v1/models/cached');
+    assert.equal(allowed.statusCode, 200);
+    assert.equal(JSON.parse(allowed.body).cached, true);
+    // /health is the ONE documented public route: still 200 with no token.
+    const health = await new Promise((resolve, reject) => {
+      const request = http.get({ host: '127.0.0.1', port: gatewayPort, path: '/health' }, (response) => {
+        response.resume();
+        response.once('end', () => resolve({ statusCode: response.statusCode }));
+      });
+      request.once('error', reject);
+    });
+    assert.equal(health.statusCode, 200, '/health must stay public');
+  } finally {
+    await stopGateway(child);
+    await closeServer(upstream);
+  }
+});

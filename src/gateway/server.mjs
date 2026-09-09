@@ -1433,20 +1433,6 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // Cached models endpoint (no upstream call)
-    if (req.method === "GET" && requestUrl.pathname === "/v1/models/cached") {
-        try {
-            const models = await getCachedModels();
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ data: models, cached: true }));
-        } catch (err) {
-            error("Failed to get cached models", { error: err.message });
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Failed to retrieve cached models" }));
-        }
-        return;
-    }
-
     // Manual refresh endpoint (admin only)
     if (req.method === "POST" && requestUrl.pathname === "/v1/models/refresh") {
         if (!ADMIN_TOKEN || !isBearerAuthorized(req.headers.authorization, ADMIN_TOKEN)) {
@@ -1471,6 +1457,28 @@ const server = http.createServer(async (req, res) => {
             error("Failed to refresh models", { error: err.message });
             res.writeHead(500, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "Failed to refresh models" }));
+        }
+        return;
+    }
+
+    // Cached models endpoint (no upstream call). Behind auth like /v1/models:
+    // explicit LOCAL_TOKEN check in the /v1/models/refresh position, BEFORE
+    // the generic gate (classifyGatewayRoute does not classify this path, so
+    // the generic gate would 404 it before any handler below could run).
+    if (req.method === "GET" && requestUrl.pathname === "/v1/models/cached") {
+        if (!LOCAL_TOKEN || !isBearerAuthorized(req.headers.authorization, LOCAL_TOKEN)) {
+            res.writeHead(401, { "WWW-Authenticate": "Bearer" });
+            res.end();
+            return;
+        }
+        try {
+            const models = await getCachedModels();
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ data: models, cached: true }));
+        } catch (err) {
+            error("Failed to get cached models", { error: err.message });
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Failed to retrieve cached models" }));
         }
         return;
     }
