@@ -28,7 +28,7 @@
 
 ## Bottom Line Up Front (BLUF)
 
-**NV-Gateway** is a high-performance, local **OpenAI and Anthropic dual gateway** and desktop HUD running on `127.0.0.1:12004`. It functions as a native **Local Anthropic Messages Proxy** and **NVIDIA NGC Anthropic API adapter**, allowing tools that only speak Anthropic (such as **Claude Code CLI**, Claude Desktop, and Anthropic SDKs) to seamlessly drive **100+ NVIDIA NGC / NIM models** with zero extra middleware while simultaneously serving standard OpenAI `/v1/chat/completions`. It features intelligent multi-key LRU pooling, automated reasoning/thinking capability discovery, **zero rate limits failover** (`429` cooldowns & retries), Windows DPAPI encryption at rest, and zero mandatory telemetry.
+**NV-Gateway** is a high-performance, local **OpenAI and Anthropic dual gateway** and desktop HUD running on `127.0.0.1:12000`. It functions as a native **Local Anthropic Messages Proxy** and **NVIDIA NGC Anthropic API adapter**, allowing tools that only speak Anthropic (such as **Claude Code CLI**, Claude Desktop, and Anthropic SDKs) to seamlessly drive **100+ NVIDIA NGC / NIM models** with zero extra middleware while simultaneously serving standard OpenAI `/v1/chat/completions`. It features intelligent multi-key LRU pooling, automated reasoning/thinking capability discovery, **zero rate limits failover** (`429` cooldowns & retries), Windows DPAPI encryption at rest, and zero mandatory telemetry.
 
 Whether you're running **Claude Code (`claude-code` CLI)**, autonomous coding swarms (OpenCode, Cline, Cursor, Aider), or interactive chat agents, NV-Gateway delivers **zero rate limits failover**, filters out dead keys (`401`/`403`), discovers model-specific reasoning controls (thinking budgets), and injects context window metadata on the fly.
 
@@ -43,7 +43,7 @@ Whether you're running **Claude Code (`claude-code` CLI)**, autonomous coding sw
 ### What You Get After Downloading
 
 - **One installer, zero DevOps** — 1-click setup, tray app, first-run wizard. No Docker, no Python env, no YAML.
-- **OpenAI and Anthropic dual gateway** — `http://127.0.0.1:12004/v1` (and `http://127.0.0.1:12004` as `ANTHROPIC_BASE_URL`) speaks OpenAI (`/chat/completions`) and Anthropic (`/v1/messages`) natively. **Claude Code**, OpenCode, Cline, Cursor, Aider, Continue, Windsurf, OpenClaw: point, and go.
+- **OpenAI and Anthropic dual gateway** — `http://127.0.0.1:12000/v1` (and `http://127.0.0.1:12000` as `ANTHROPIC_BASE_URL`) speaks OpenAI (`/chat/completions`) and Anthropic (`/v1/messages`) natively. **Claude Code**, OpenCode, Cline, Cursor, Aider, Continue, Windsurf, OpenClaw: point, and go.
 - **Claude Code with NVIDIA NIM** — Drop-in replace Anthropic endpoints for Anthropic's official `claude-code` CLI and run 100+ NVIDIA NIM models (GLM-5, Llama 3.3 70B, DeepSeek-R1, Qwen 2.5, Nemotron, Mistral) with full tool-calling and streaming support without proxy servers or Docker.
 - **All your keys behave like one** — paste your NVIDIA keys into the GUI once; LRU rotation, dead-key quarantine (`401/403`), and `429` cooldowns are automatic with **zero rate limits failover**.
 - **Runs that don't die mid-task** — automatic failover to the next key keeps long agent sessions alive through quota exhaustion.
@@ -76,7 +76,7 @@ Whether you're running **Claude Code (`claude-code` CLI)**, autonomous coding sw
                                   +-------------------------+--------------------------+
                                                             |
                                       OpenAI / Anthropic REST & SSE Streams
-                                      Base URL: http://127.0.0.1:12004 (/v1)
+                                      Base URL: http://127.0.0.1:12000 (/v1)
                                                             |
                                                             v
 +---------------------------------------------------------------------------------------------------------------+
@@ -85,8 +85,8 @@ Whether you're running **Claude Code (`claude-code` CLI)**, autonomous coding sw
 |  +---------------------------------------+                 +-----------------------------------------------+  |
 |  |       ELECTRON MAIN PROCESS           |                 |            GATEWAY CHILD PROCESS              |  |
 |  |                                       |                 |                                               |  |
-|  |  - DPAPI safeStorage (keys.json)      |                 |  - Port 12004: Public OpenAI/Anthropic Facade |  |
-|  |  - System Tray Management             |  Private IPC    |  - Port 12005: Local Admin REST API           |  |
+|  |  - DPAPI safeStorage (keys.json)      |                 |  - Port 12000: Public OpenAI/Anthropic Facade |  |
+|  |  - System Tray Management             |  Private IPC    |  - Port 12001: Local Admin REST API           |  |
 |  |  - Auto-Update Coordinator (offered)  +<===============>+  - LRU Key Rotation & Failover Engine         |  |
 |  |  - Paired-Port Ownership Guard        |  Challenge Auth |  - Dynamic Reasoning & Capability Discovery   |  |
 |  |  - JSONL App Logger (5MB rotation)    |                 |  - Model Limits Injection (Context/Output)    |  |
@@ -111,6 +111,30 @@ Whether you're running **Claude Code (`claude-code` CLI)**, autonomous coding sw
                                                                     |  100+ Models (GLM, LLaMA, Qwen...) |
                                                                     +-----------------------------------+
 ```
+
+---
+
+## Repository Map
+
+Start with [`package.json`](package.json) for supported commands, then follow the runtime boundary from [`src/main/index.ts`](src/main/index.ts) through [`src/preload/index.ts`](src/preload/index.ts) to [`src/renderer/App.tsx`](src/renderer/App.tsx). In development the main process starts the separate gateway from [`src/gateway/server.mjs`](src/gateway/server.mjs); packaged builds start its generated `build/gateway/server.mjs` bundle from inside `app.asar`. Read [`AGENTS.md`](AGENTS.md) before changing runtime, security, packaging, or localization behavior.
+
+| Area | Purpose and flow | Start here and known limits |
+| --- | --- | --- |
+| [`.github/workflows/`](.github/workflows/) | Runs Windows CI, packaged audits, releases, and the preserved Jules automation definitions. | Start with [`test.yml`](.github/workflows/test.yml) and [`release.yml`](.github/workflows/release.yml). The shipped product jobs target Windows and Node 20; the autonomous jobs run only when `vars.AUTONOMOUS_LOOP_ENABLED == 'true'`. |
+| [`src/main/`](src/main/) | Electron's privileged process owns app startup, windows and tray, DPAPI-backed state, gateway lifecycle, updates, and validated IPC. | [`index.ts`](src/main/index.ts) is the process entry point. Keep upstream NVIDIA keys and native I/O here; expose renderer capabilities only through validated IPC. The local gateway token is intentionally returned to the Endpoint view for client configuration. |
+| [`src/preload/`](src/preload/) | Exposes the narrow `window.electronAPI` context bridge used by the sandboxed renderer. | [`index.ts`](src/preload/index.ts) is the preload entry point. Add renderer-to-main capabilities through validated IPC rather than direct Node or Electron access. |
+| [`src/renderer/`](src/renderer/) | Contains the React HUD, routes, views, stores, components, cyber pet, styles, and provider assets. [`i18n/config.ts`](src/renderer/i18n/config.ts) applies language and document direction, while [`i18n/resources.ts`](src/renderer/i18n/resources.ts) holds UI strings. | [`index.html`](src/renderer/index.html) loads [`index.tsx`](src/renderer/index.tsx), which mounts [`App.tsx`](src/renderer/App.tsx). `App.tsx` and [`lib/modal-context.ts`](src/renderer/lib/modal-context.ts) coordinate one app-level modal; backend access must stay behind `window.electronAPI`. |
+| [`src/gateway/`](src/gateway/) | Implements the isolated Node.js OpenAI/Anthropic gateway, public and admin routes, key rotation, failover, model discovery, limits, validation, and logging. | [`server.mjs`](src/gateway/server.mjs) is the child-process entry point. It binds loopback ports and is bundled into generated `build/gateway/` for packaging. |
+| [`src/test-support/`](src/test-support/) | Provides compiled adapters and entry points for migration and configuration tests. | Start with [`final-migration-test-entrypoint.ts`](src/test-support/final-migration-test-entrypoint.ts). This directory is test-only and `electron-builder.yml` excludes it from the packaged app. |
+| [`scripts/`](scripts/) | Holds gateway bundling, package hardening, release guards, credential/security audits, and evidence utilities invoked by package scripts and workflows. | Start with [`build-gateway-bundle.mjs`](scripts/build-gateway-bundle.mjs) for gateway output and [`run-electron-builder.mjs`](scripts/run-electron-builder.mjs) for packaging. Some scripts require packaged output or release environment variables; use the matching `package.json` script. |
+| [`tests/`](tests/) | Contains Node test-runner unit, integration, regression, security, and packaged-output checks. | `npm test` is the package-script entry point and runs `npm run build` first through `pretest`. Packaged assertions need `dist/win-unpacked`, which `npm run package:dir` creates before running `npm run package:audit`. |
+| [`build/assets/`](build/assets/) | Stores the committed canonical application and tray icon sources and rasters consumed by packaging. | Follow [`ICONS.md`](build/assets/ICONS.md). Tray assets also have a development mirror under `src/renderer/assets/`; tray-icon changes must keep the documented mirror and stopped-icon fallback in sync. |
+| Primary configuration | [`package.json`](package.json) defines Electron's generated main entry, dependencies, and supported dev/build/test/package commands; [`package-lock.json`](package-lock.json) locks dependencies. [`tsconfig.json`](tsconfig.json) checks the renderer, while [`tsconfig.node.json`](tsconfig.node.json) emits main, preload, and test-support code. [`vite.config.ts`](vite.config.ts) builds and serves the renderer. [`electron-builder.yml`](electron-builder.yml) defines Windows packaging. [`tailwind.config.js`](tailwind.config.js) and [`postcss.config.js`](postcss.config.js) define renderer CSS processing. | Use these files as the source of truth instead of inferred defaults. Vite writes renderer output under `build/renderer`; Electron Builder writes distributable output under `dist/`. |
+| Generated output | `build/` is a mixed tree: [`build/assets/`](build/assets/) is committed, while compiled `build/src/`, `build/renderer/`, `build/gateway/`, and generated Vite config output are ignored. `dist/` is ignored and contains Electron Builder's unpacked app and installer/portable artifacts. | Do not edit generated paths by hand or treat `build/` and `dist/` as interchangeable: `build/` stages compiled application input, while `dist/` holds packaged distribution output. |
+
+### Current verified behavior
+
+The renderer applies RTL layout for Arabic while keeping technical values such as ports, URLs, tokens, commands, and logs in LTR flow. After startup commits the running state, an unexpected gateway child exit reports a runtime-exit status and the Retry action remains available; an exit before that commitment remains a startup failure. One app-level modal arbiter uses request/session identity so stale asynchronous work cannot replace or close the current dialog. Dialog close controls use context-specific localized labels, and successful Endpoint copies announce through a dedicated polite live region while copy failures remain alerts.
 
 ---
 
@@ -157,7 +181,7 @@ Whether you're running **Claude Code (`claude-code` CLI)**, autonomous coding sw
 ### Option A: 1-Click Installer (Windows)
  1. Download `NV-Gateway-Setup-0.1.0.exe` from [GitHub Releases](https://github.com/HaYkMnE/NV-Gateway/releases).
 2. Launch the installer (installs per-user to `%LOCALAPPDATA%\Programs\NV-Gateway`).
-3. Follow the first-run wizard to add your NVIDIA API keys and select your local port (default: `12004`).
+3. Follow the first-run wizard to add your NVIDIA API keys and select your local port (default: `12000`).
 4. Close the window to minimize to the System Tray.
 
 ### Option B: Build from Source
@@ -170,8 +194,14 @@ cd nv-gateway
 # Install dependencies
 npm install
 
-# Build & Run in Developer Mode
+# Build the Electron app and gateway bundle
+npm run build
+
+# In terminal 1, start the Vite renderer
 npm run dev
+
+# In terminal 2, start Electron
+npm start
 
 # Or build the portable executable
 npm run build:portable
@@ -185,23 +215,29 @@ The portable binary is created in `dist/NV-Gateway 0.1.0.exe`.
 
 Point your favorite AI coding assistant to NV-Gateway:
 
+Copy the generated **Gateway Token** from the app's **Endpoint** screen; the placeholder `<gateway-token>` below is not a working credential.
+
 ### 1. Claude Code (`claude-code` CLI)
 
-Run Anthropic's official **Claude Code** CLI powered by 100+ NVIDIA NIM models with zero extra middleware. NV-Gateway acts as a native **Local Anthropic Messages Proxy** and **NVIDIA NGC Anthropic API adapter**, translating Anthropic `/v1/messages` schema (multi-turn conversations, tool calling, thinking/reasoning blocks, and SSE streaming) directly to NVIDIA NGC backends:
+Run Anthropic's official **Claude Code** CLI powered by 100+ NVIDIA NIM models with zero extra middleware. NV-Gateway acts as a native **Local Anthropic Messages Proxy** and **NVIDIA NGC Anthropic API adapter**, translating Anthropic `/v1/messages` schema (multi-turn conversations, tool calling, thinking/reasoning blocks, and SSE streaming) directly to NVIDIA NGC backends. Claude Code must send the generated gateway token as a Bearer credential, so use the auth-token variable shown below rather than the API-key variable:
+
+PowerShell:
+
+```powershell
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:12000"
+$env:ANTHROPIC_AUTH_TOKEN = "<gateway-token>"
+claude --model z-ai/glm-5.2
+```
+
+Bash/Zsh:
 
 ```bash
-# PowerShell
-$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:12004"
-$env:ANTHROPIC_API_KEY  = "local-nv-gateway"
-claude --model z-ai/glm-5.2
-
-# Bash / Zsh
-export ANTHROPIC_BASE_URL="http://127.0.0.1:12004"
-export ANTHROPIC_API_KEY="local-nv-gateway"
+export ANTHROPIC_BASE_URL="http://127.0.0.1:12000"
+export ANTHROPIC_AUTH_TOKEN="<gateway-token>"
 claude --model meta/llama-3.3-70b-instruct
 ```
 
-> **How it works:** Anthropic clients targeting `http://127.0.0.1:12004` (or `http://127.0.0.1:12004/v1`) send standard Anthropic Messages payloads. NV-Gateway translates the requests on the fly, executes them against your NVIDIA NIM key pool with **zero rate limits failover**, and translates the streaming responses back to Anthropic SSE events. You can target any model in the catalog, including `deepseek-ai/deepseek-r1`, `qwen/qwen2.5-coder-32b-instruct`, and `nvidia/llama-3.1-nemotron-70b-instruct`.
+> **How it works:** Anthropic clients targeting `http://127.0.0.1:12000` (or `http://127.0.0.1:12000/v1`) send standard Anthropic Messages payloads. NV-Gateway translates the requests on the fly, executes them against your NVIDIA NIM key pool with **zero rate limits failover**, and translates the streaming responses back to Anthropic SSE events. You can target any model in the catalog, including `deepseek-ai/deepseek-r1`, `qwen/qwen2.5-coder-32b-instruct`, and `nvidia/llama-3.1-nemotron-70b-instruct`.
 
 ---
 
@@ -210,12 +246,22 @@ In `%USERPROFILE%\.config\opencode\opencode.json` or `opencode.jsonc`:
 
 ```jsonc
 {
+  "$schema": "https://opencode.ai/config.json",
   "provider": {
     "nvidia-gateway": {
-      "type": "openai-compatible",
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "NV-Gateway",
       "options": {
-        "baseURL": "http://127.0.0.1:12004/v1",
-        "apiKey": "local-nv-gateway"
+        "baseURL": "http://127.0.0.1:12000/v1",
+        "apiKey": "<gateway-token>"
+      },
+      "models": {
+        "z-ai/glm-5.2": {
+          "name": "GLM-5.2"
+        },
+        "meta/llama-3.3-70b-instruct": {
+          "name": "Llama 3.3 70B Instruct"
+        }
       }
     }
   }
@@ -229,8 +275,8 @@ In `%USERPROFILE%\.config\opencode\opencode.json` or `opencode.jsonc`:
 ### 3. Cline / Roo Code (VS Code Extension)
 1. Open Cline Settings (`Ctrl+,` -> search `Cline` or click gear icon).
 2. Set **API Provider** to `OpenAI Compatible`.
-3. Set **Base URL** to `http://127.0.0.1:12004/v1`.
-4. Set **API Key** to `local-nv-gateway` (or any string).
+3. Set **Base URL** to `http://127.0.0.1:12000/v1`.
+4. Set **API Key** to the generated Gateway Token copied from the app's **Endpoint** screen.
 5. Select or type your desired model ID, for example:
    - `z-ai/glm-5.2`
    - `meta/llama-3.3-70b-instruct`
@@ -241,8 +287,8 @@ In `%USERPROFILE%\.config\opencode\opencode.json` or `opencode.jsonc`:
 
 ### 4. Cursor
 1. Go to **Cursor Settings** -> **Models** -> **OpenAI API Key**.
-2. Enable custom OpenAI API base URL: `http://127.0.0.1:12004/v1`.
-3. Set custom API key to `local-nv-gateway`.
+2. Enable custom OpenAI API base URL: `http://127.0.0.1:12000/v1`.
+3. Set the custom API key to the generated Gateway Token copied from the app's **Endpoint** screen.
 4. Add model names matching NVIDIA NGC catalog identifiers.
 
 ---
@@ -250,50 +296,50 @@ In `%USERPROFILE%\.config\opencode\opencode.json` or `opencode.jsonc`:
 ### 5. Aider
 Run Aider directly from your terminal:
 
-```bash
-# PowerShell
-$env:OPENAI_API_BASE = "http://127.0.0.1:12004/v1"
-$env:OPENAI_API_KEY  = "local-nv-gateway"
-aider --model openai/z-ai/glm-5.2
+PowerShell:
 
-# Bash / Zsh
-export OPENAI_API_BASE="http://127.0.0.1:12004/v1"
-export OPENAI_API_KEY="local-nv-gateway"
+```powershell
+$env:OPENAI_API_BASE = "http://127.0.0.1:12000/v1"
+$env:OPENAI_API_KEY  = "<gateway-token>"
+aider --model openai/z-ai/glm-5.2
+```
+
+Bash/Zsh:
+
+```bash
+export OPENAI_API_BASE="http://127.0.0.1:12000/v1"
+export OPENAI_API_KEY="<gateway-token>"
 aider --model openai/meta/llama-3.3-70b-instruct
 ```
 
 ---
 
 ### 6. Continue (VS Code / JetBrains)
-In `~/.continue/config.json`:
+In `%USERPROFILE%\.continue\config.yaml` (current Continue versions use YAML):
 
-```json
-{
-  "models": [
-    {
-      "title": "NVIDIA GLM-5.2 (NV-Gateway)",
-      "provider": "openai",
-      "model": "z-ai/glm-5.2",
-      "apiBase": "http://127.0.0.1:12004/v1",
-      "apiKey": "local-nv-gateway"
-    },
-    {
-      "title": "Llama 3.3 70B (NV-Gateway)",
-      "provider": "openai",
-      "model": "meta/llama-3.3-70b-instruct",
-      "apiBase": "http://127.0.0.1:12004/v1",
-      "apiKey": "local-nv-gateway"
-    }
-  ]
-}
+```yaml
+name: NV-Gateway
+version: 1.0.0
+schema: v1
+models:
+  - name: NVIDIA GLM-5.2 (NV-Gateway)
+    provider: openai
+    model: z-ai/glm-5.2
+    apiBase: http://127.0.0.1:12000/v1
+    apiKey: <gateway-token>
+  - name: Llama 3.3 70B (NV-Gateway)
+    provider: openai
+    model: meta/llama-3.3-70b-instruct
+    apiBase: http://127.0.0.1:12000/v1
+    apiKey: <gateway-token>
 ```
 
 ---
 
 ### 7. Windsurf / OpenClaw
 Set Provider to `OpenAI` with:
-- **Base URL**: `http://127.0.0.1:12004/v1`
-- **API Key**: `local-nv-gateway`
+- **Base URL**: `http://127.0.0.1:12000/v1`
+- **API Key**: the generated Gateway Token copied from the app's **Endpoint** screen
 
 ---
 
@@ -319,19 +365,19 @@ On Windows 11, new system tray icons are placed in the hidden overflow flyout be
 
 ## API Endpoints Reference
 
-NV-Gateway binds two paired loopback ports (`P` and `P+1`, default `12004` and `12005`):
+NV-Gateway binds two paired loopback ports (`P` and `P+1`, default `12000` and `12001`):
 
 | Endpoint | Port | Auth | Purpose |
 | :--- | :--- | :--- | :--- |
-| `POST /v1/chat/completions` | `12004` | Optional Bearer | OpenAI chat completions with streaming SSE & failover |
-| `POST /v1/messages` | `12004` | Optional Bearer / x-api-key | Anthropic Messages API translation facade (Claude Code CLI, Anthropic SDKs, Claude Desktop) |
-| `GET /v1/models` | `12004` | Public | Enriched NGC catalog with limits & reasoning specs |
-| `GET /health`, `GET /ready` | `12004` | Public | Process health and readiness probes |
-| `GET /admin/keys` | `12005` | Admin Token | Key status, error counts, and accessible models |
-| `POST /admin/keys` | `12005` | Admin Token | Add a new NVIDIA API key with fire-and-forget probe |
-| `DELETE /admin/keys/:id` | `12005` | Admin Token | Remove a managed key |
-| `POST /admin/models/refresh`| `12005` | Admin Token | Trigger NGC model re-discovery |
-| `GET /admin/logs/recent` | `12005` | Admin Token | Fetch sanitized recent JSONL request events |
+| `POST /v1/chat/completions` | `12000` | Gateway Bearer Token | OpenAI chat completions with streaming SSE & failover |
+| `POST /v1/messages` | `12000` | Gateway Bearer Token | Anthropic Messages API translation facade (Claude Code CLI, Anthropic SDKs, Claude Desktop) |
+| `GET /v1/models` | `12000` | Gateway Bearer Token | Enriched NGC catalog with limits & reasoning specs |
+| `GET /health` | `12000` | Public | Process health and readiness probe (`200` when ready, `503` while starting) |
+| `GET /admin/keys` | `12001` | Admin Token | Key status, error counts, and accessible models |
+| `POST /admin/keys` | `12001` | Admin Token | Add a new NVIDIA API key with fire-and-forget probe |
+| `DELETE /admin/keys/:id` | `12001` | Admin Token | Remove a managed key |
+| `POST /admin/models/refresh`| `12001` | Admin Token | Trigger NGC model re-discovery |
+| `GET /admin/logs` | `12001` | Admin Token | Fetch sanitized recent request events |
 
 ---
 
@@ -358,20 +404,27 @@ All runtime state is stored in `%APPDATA%\NV-Gateway\`:
 
 ## Verification & Testing
 
-NV-Gateway maintains a strict zero-regression testing standard. The full automated test suite (currently 914 tests across unit, integration, and security checks) covers runtime security, ACL protection, ASAR scans, key failover, and protocol translation, and must pass with zero failures:
+NV-Gateway maintains a strict zero-regression testing standard. The automated test suite covers runtime security, ACL protection, ASAR scans, key failover, and protocol translation, and must pass with zero failures:
 
 ```bash
 # Run full suite
 npm test
+```
 
-# Run packaged security audit
-npm run test:packaged-security
+To build the unpacked app and run every packaged audit, set the public releases repository owner for your shell.
 
-# Run credential leak scan
-npm run test:packaged-credentials
+PowerShell:
 
-# Run gateway link smoke
-npm run test:packaged-gateway-link
+```powershell
+$env:NVGW_GH_OWNER = "HaYkMnE"
+npm run package:dir
+```
+
+Bash/Zsh:
+
+```bash
+export NVGW_GH_OWNER="HaYkMnE"
+npm run package:dir
 ```
 
 ---
