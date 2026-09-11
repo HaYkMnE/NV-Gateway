@@ -76,6 +76,10 @@ test('App.tsx: retryHydration does not depend on `t` and reads it through a tRef
   // never via a bare i18n.changeLanguage(state.language) (which emits even on no-op).
   assert.match(block[0], /applyStoredLanguage\(state\.language\)/,
     'retryHydration must apply the stored language via applyStoredLanguage() (the resolvedLanguage-guarded helper)');
+  assert.ok(
+    block[0].indexOf('await applyStoredLanguage(state.language)') < block[0].indexOf('hydrate(state)'),
+    'stored language and direction must be applied before hydrate(state) exposes the full route tree'
+  );
   assert.doesNotMatch(block[0], /i18n\.changeLanguage\(/,
     'retryHydration must NOT call i18n.changeLanguage directly: i18next emits languageChanged even when the language is unchanged');
 
@@ -91,8 +95,8 @@ test('App.tsx: retryHydration does not depend on `t` and reads it through a tRef
   assert.match(app, /const \{ t \} = useTranslation\(\)/, 'App must still take the reactive t from useTranslation for its render body');
 });
 
-// ── 2. config.ts wiring: guarded applyStoredLanguage + preserved lang setter ──
-test('config.ts: applyStoredLanguage early-returns on the resolved language and the <html lang> wiring survives', () => {
+// ── 2. config.ts wiring: guarded language changes + semantic document direction ──
+test('config.ts: applyStoredLanguage guards emissions and synchronizes <html lang/dir>', () => {
   const config = read('src/renderer/i18n/config.ts');
 
   assert.match(config, /export\s+(async\s+function|const)\s+applyStoredLanguage/,
@@ -102,22 +106,23 @@ test('config.ts: applyStoredLanguage early-returns on the resolved language and 
   assert.match(config, /i18n\.changeLanguage\(/,
     'applyStoredLanguage must still call i18n.changeLanguage for a genuine language change');
 
-  // The <html lang> setter is the legitimate consumer of languageChanged — it
-  // must stay; the defect is the loop that spams it, not the setter itself.
-  assert.match(config, /i18n\.on\('languageChanged', \(language\) => \{ document\.documentElement\.lang = language; \}\)/,
-    'the languageChanged -> document.documentElement.lang wiring must be preserved (real language switches must still update <html lang>)');
+  assert.match(config, /(?:document\.documentElement|root)\.lang\s*=\s*language/,
+    'real language switches must update <html lang>');
+  assert.match(config, /(?:document\.documentElement|root)\.dir\s*=\s*[^;]*['"]rtl['"]/,
+    'document direction must become RTL for Arabic');
+  assert.match(config, /['"]ltr['"]/,
+    'document direction must explicitly return to LTR for non-Arabic locales');
 
-  // No new user-visible strings are needed by this fix: the per-locale key
-  // parity invariant pinned by feedback-save-path-visible/logs-copy-failure-detail
-  // must be untouched (302 keys/locale since the Models label-chip key).
+  // Runtime-exit copy and the three context-specific dialog close labels are
+  // user-visible strings, so the per-locale contract now contains 306 keys.
   const { en, ru } = loadTsModule('src/renderer/i18n/resources.ts');
-  assert.equal(Object.keys(en).length, 302, 'en must still carry exactly 302 keys');
-  assert.equal(Object.keys(ru).length, 302, 'ru must still carry exactly 302 keys');
+  assert.equal(Object.keys(en).length, 306, 'en must carry exactly 306 keys');
+  assert.equal(Object.keys(ru).length, 306, 'ru must carry exactly 306 keys');
 });
 
 // ── 3. Executable: the guard breaks the emission edge on the real i18n instance ──
 test('applyStoredLanguage: no-op applications emit nothing; genuine switches emit once and really translate', async () => {
-  const docStub = { documentElement: { lang: '' } };
+  const docStub = { documentElement: { lang: '', dir: '' } };
   const cfg = loadTsModule('src/renderer/i18n/config.ts', { document: docStub });
   const i18n = cfg.default ?? cfg;
   assert.equal(typeof cfg.applyStoredLanguage, 'function',
@@ -139,28 +144,39 @@ test('applyStoredLanguage: no-op applications emit nothing; genuine switches emi
   assert.deepEqual(emissions, ['ru'], 'a genuine language switch must emit exactly once');
   assert.equal(i18n.resolvedLanguage, 'ru');
   assert.equal(docStub.documentElement.lang, 'ru', '<html lang> must follow genuine switches');
+  assert.equal(docStub.documentElement.dir, 'ltr', 'non-Arabic locales must keep an explicit LTR document direction');
   const { en, ru } = loadTsModule('src/renderer/i18n/resources.ts');
   assert.equal(i18n.t('loading'), ru.loading, 'after switching to ru, t(loading) must return the RU string');
   assert.notEqual(ru.loading, en.loading, 'fixture sanity: RU and EN loading strings differ');
 
-  // And back ru -> en.
+  // Arabic changes the semantic document direction; switching back restores LTR.
+  await cfg.applyStoredLanguage('ar');
+  assert.equal(docStub.documentElement.lang, 'ar');
+  assert.equal(docStub.documentElement.dir, 'rtl', 'Arabic must set the root document to RTL');
+
   await cfg.applyStoredLanguage('en');
-  assert.deepEqual(emissions, ['ru', 'en'], 'switching back must emit exactly once more');
+  assert.deepEqual(emissions, ['ru', 'ar', 'en'], 'each genuine switch must emit exactly once');
   assert.equal(i18n.resolvedLanguage, 'en');
+  assert.equal(docStub.documentElement.dir, 'ltr', 'switching away from Arabic must restore LTR');
   assert.equal(i18n.t('loading'), en.loading, 'after switching back, t(loading) must return the EN string');
 
   // Post-switch steady state is silent again.
   await cfg.applyStoredLanguage('en');
-  assert.deepEqual(emissions, ['ru', 'en'], 're-applying the active language after a switch must stay silent');
+  assert.deepEqual(emissions, ['ru', 'ar', 'en'], 're-applying the active language after a switch must stay silent');
 
   // A falsy stored language must be a no-op (defensive: config without language).
   await cfg.applyStoredLanguage(undefined);
-  assert.deepEqual(emissions, ['ru', 'en'], 'undefined language must be a no-op');
+  assert.deepEqual(emissions, ['ru', 'ar', 'en'], 'undefined language must be a no-op');
+});
+
+test('index.html declares an explicit LTR bootstrap direction', () => {
+  assert.match(read('src/renderer/index.html'), /<html\s+lang="en"\s+dir="ltr">/,
+    'the static document must declare its initial direction before React/i18next boot');
 });
 
 // ── 4. Executable: the closed feedback topology terminates instead of spinning ──
 test('a subscriber that re-runs hydration on every languageChanged cannot cascade (the exact App loop topology)', async () => {
-  const docStub = { documentElement: { lang: '' } };
+  const docStub = { documentElement: { lang: '', dir: '' } };
   const cfg = loadTsModule('src/renderer/i18n/config.ts', { document: docStub });
   const i18n = cfg.default ?? cfg;
   assert.equal(typeof cfg.applyStoredLanguage, 'function');

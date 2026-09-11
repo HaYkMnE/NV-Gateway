@@ -2,13 +2,15 @@ import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { X } from 'lucide-react';
 import { useDialogFocus } from '../lib/use-dialog-focus';
+import type { ModalRequest } from '../lib/modal-context';
 
 interface AboutDialogProps {
   isOpen: boolean;
+  session: ModalRequest | null;
   onClose: () => void;
 }
 
-export function AboutDialog({ isOpen, onClose }: AboutDialogProps) {
+export function AboutDialog({ isOpen, session, onClose }: AboutDialogProps) {
   const { t } = useTranslation();
   const [info, setInfo] = useState<AboutInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -17,9 +19,10 @@ export function AboutDialog({ isOpen, onClose }: AboutDialogProps) {
   // Same shared focus management as FeedbackModal — no per-dialog wiring.
   useDialogFocus(dialogRef, isOpen);
 
-  // Fetch about info when opened
+  // A same-modal request is a new session even though isOpen never becomes
+  // false. Re-fetch for that identity and quarantine the previous completion.
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen || session === null) return;
     let cancelled = false;
     setInfo(null);
     setError(null);
@@ -34,7 +37,7 @@ export function AboutDialog({ isOpen, onClose }: AboutDialogProps) {
     return () => {
       cancelled = true;
     };
-  }, [isOpen]);
+  }, [isOpen, session]);
 
   // Close on Escape
   useEffect(() => {
@@ -71,7 +74,7 @@ export function AboutDialog({ isOpen, onClose }: AboutDialogProps) {
           <h2 className="text-xl font-bold">{t('about_title')}</h2>
           <button
             onClick={onClose}
-            aria-label={t('close_menu')}
+            aria-label={t('about_closeDialog')}
             className="p-1 text-textMuted hover:text-accent-neon"
           >
             <X aria-hidden size={20} />
@@ -88,31 +91,32 @@ export function AboutDialog({ isOpen, onClose }: AboutDialogProps) {
           <dl className="grid gap-3">
             <div className="flex justify-between gap-4">
               <dt className="text-textMuted text-sm">{t('about_appVersion')}</dt>
-              <dd className="font-mono text-sm text-textMain">{info.appVersion}</dd>
+              <dd dir="ltr" className="font-mono text-sm text-textMain">{info.appVersion}</dd>
             </div>
             <div className="flex justify-between gap-4">
               <dt className="text-textMuted text-sm">{t('about_electronVersion')}</dt>
-              <dd className="font-mono text-sm text-textMain">{info.electronVersion}</dd>
+              <dd dir="ltr" className="font-mono text-sm text-textMain">{info.electronVersion}</dd>
             </div>
             <div className="flex justify-between gap-4">
               <dt className="text-textMuted text-sm">{t('about_chromeVersion')}</dt>
-              <dd className="font-mono text-sm text-textMain">{info.chromeVersion}</dd>
+              <dd dir="ltr" className="font-mono text-sm text-textMain">{info.chromeVersion}</dd>
             </div>
             <div className="flex justify-between gap-4">
               <dt className="text-textMuted text-sm">{t('about_nodeVersion')}</dt>
-              <dd className="font-mono text-sm text-textMain">{info.nodeVersion}</dd>
+              <dd dir="ltr" className="font-mono text-sm text-textMain">{info.nodeVersion}</dd>
             </div>
             <div className="flex justify-between gap-4">
               <dt className="text-textMuted text-sm">{t('about_proxyPort')}</dt>
-              <dd className="font-mono text-sm text-textMain">{info.proxyPort}</dd>
+              <dd dir="ltr" className="font-mono text-sm text-textMain">{info.proxyPort}</dd>
             </div>
             <div className="flex justify-between gap-4">
               <dt className="text-textMuted text-sm">{t('about_adminPort')}</dt>
-              <dd className="font-mono text-sm text-textMain">{info.adminPort}</dd>
+              <dd dir="ltr" className="font-mono text-sm text-textMain">{info.adminPort}</dd>
             </div>
             <div className="border-t border-border pt-3 mt-1">
               <div className="text-textMuted text-sm mb-1">{t('about_repository')}</div>
               <button
+                dir="ltr"
                 onClick={openRepo}
                 className="text-accent-neon text-sm hover:underline break-all"
               >

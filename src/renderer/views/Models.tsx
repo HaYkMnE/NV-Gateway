@@ -412,27 +412,28 @@ export function Models() {
             <div className="flex flex-wrap items-center gap-3">
               {/* Search Bar */}
               <div className="relative flex-1 min-w-[220px]">
-                <Search aria-hidden size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-textMuted pointer-events-none" />
+                <Search aria-hidden size={16} className="absolute start-3 top-1/2 -translate-y-1/2 text-textMuted pointer-events-none" />
                 <input
+                  dir="auto"
                   ref={searchRef}
                   type="text"
                   value={filters.query}
                   onChange={(e) => patchFilters({ query: e.target.value })}
                   placeholder={t('models_search_placeholder')}
                   aria-label={t('models_search_placeholder')}
-                  className="w-full bg-bg border border-border/90 pl-9 pr-16 py-2 text-sm rounded-lg focus:border-accent-neon/80 focus:shadow-[0_0_10px_rgba(89,255,0,0.2)] outline-none text-textMain transition-all"
+                  className="w-full bg-bg border border-border/90 ps-9 pe-16 py-2 text-sm rounded-lg focus:border-accent-neon/80 focus:shadow-[0_0_10px_rgba(89,255,0,0.2)] outline-none text-textMain transition-all"
                 />
                 {filters.query && (
                   <button
                     type="button"
                     onClick={() => patchFilters({ query: '' })}
-                    className="absolute right-9 top-1/2 -translate-y-1/2 text-textMuted hover:text-textMain p-1"
+                    className="absolute end-9 top-1/2 -translate-y-1/2 text-textMuted hover:text-textMain p-1"
                     aria-label={t('models_clear_search')}
                   >
                     <X aria-hidden size={14} />
                   </button>
                 )}
-                <kbd aria-hidden="true" className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[11px] font-mono text-textMuted/70 bg-surface px-1.5 py-0.5 border border-border rounded hidden sm:block">
+                <kbd dir="ltr" aria-hidden="true" className="absolute end-2.5 top-1/2 -translate-y-1/2 text-[11px] font-mono text-textMuted/70 bg-surface px-1.5 py-0.5 border border-border rounded hidden sm:block">
                   {searchShortcut}
                 </kbd>
               </div>
@@ -474,7 +475,7 @@ export function Models() {
               </label>
 
               {/* Bulk Toggle Buttons */}
-              <div className="flex items-center gap-2 ml-auto">
+              <div className="flex items-center gap-2 ms-auto">
                 <button
                   type="button"
                   onClick={() => void handleToggleAll(true)}
@@ -558,7 +559,7 @@ export function Models() {
             <div className="mt-3 pt-3 border-t border-border/50 flex flex-wrap items-center gap-x-4 gap-y-2">
               {availableLabels.length > 0 && (
                 <div className="flex flex-wrap gap-1.5 items-center" role="group" aria-label={t('models_filter_labels_label')}>
-                  <span className="flex items-center gap-1.5 text-xs font-medium text-textMuted mr-0.5">
+                  <span className="flex items-center gap-1.5 text-xs font-medium text-textMuted me-0.5">
                     <Tag aria-hidden size={13} className="shrink-0" />
                     <span>{t('models_filter_labels_label')}</span>
                   </span>
@@ -742,12 +743,12 @@ export function Models() {
                       {/* Card Title (Namespace + Crisp Bold Hero Name) */}
                       <div className="mt-2 mb-1.5">
                         {namespace && (
-                          <div className="text-[11px] font-mono text-textMuted tracking-wider font-semibold uppercase flex items-center gap-1 mb-0.5">
+                          <div dir="ltr" className="text-[11px] font-mono text-textMuted tracking-wider font-semibold uppercase flex items-center gap-1 mb-0.5">
                             <span>{namespace}</span>
                             <span className="text-border-soft">/</span>
                           </div>
                         )}
-                        <h3 className="text-base sm:text-lg font-bold text-textMain tracking-tight break-words">
+                        <h3 dir="ltr" className="text-base sm:text-lg font-bold text-textMain tracking-tight break-words">
                           {heroName}
                         </h3>
                       </div>
@@ -772,7 +773,7 @@ export function Models() {
                         </div>
 
                         {/* Popularity & Last Updated */}
-                        <div className="flex items-center gap-3 text-[11px] text-textMuted font-mono shrink-0 ml-auto">
+                        <div className="flex items-center gap-3 text-[11px] text-textMuted font-mono shrink-0 ms-auto">
                           {model.popularity != null && <span title={t('models_popularity', { count: model.popularity })}>↓ {formatPopularity(model.popularity)}</span>}
                           {model.lastUpdated && <span>⏱ {formatLastUpdated(model.lastUpdated)}</span>}
                         </div>
@@ -800,7 +801,7 @@ export function Models() {
                             >
                               <span
                                 className={`inline-block h-4 w-4 transform rounded-full bg-white shadow-md transition-transform duration-200 ${
-                                  model.enabled ? 'translate-x-6 bg-black' : 'translate-x-1'
+                                  model.enabled ? 'translate-x-6 rtl:-translate-x-6 bg-black' : 'translate-x-1 rtl:-translate-x-1'
                                 }`}
                               />
                             </button>
@@ -854,7 +855,7 @@ export function Models() {
                         <button
                           type="button"
                           onClick={() => toggleExpanded(model.id)}
-                          className="flex items-center gap-1 text-xs font-medium text-textMuted hover:text-accent-neon transition-colors ml-auto cursor-pointer min-h-6"
+                          className="flex items-center gap-1 text-xs font-medium text-textMuted hover:text-accent-neon transition-colors ms-auto cursor-pointer min-h-6"
                         >
                           <span>{isExpanded ? t('models_hide_details') : t('models_details')}</span>
                           {isExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
@@ -868,7 +869,7 @@ export function Models() {
                           <div className="flex items-center justify-between gap-2 pb-2 border-b border-border/50">
                             <div className="min-w-0 flex-1">
                               <div className="text-[10px] text-textMuted uppercase font-bold tracking-wider">{t('models_full_id')}</div>
-                              <code className="font-mono text-xs text-accent-neon break-all select-all">{model.id}</code>
+                              <code dir="ltr" className="font-mono text-xs text-accent-neon break-all select-all">{model.id}</code>
                             </div>
                             <button
                               type="button"
@@ -905,7 +906,7 @@ export function Models() {
                                 )}
                               </button>
                             </div>
-                            <pre className="bg-[#080B09] border border-border/80 p-2.5 text-[11px] font-mono text-textMuted overflow-x-auto whitespace-pre-wrap break-all rounded leading-relaxed">
+                            <pre dir="ltr" className="bg-[#080B09] border border-border/80 p-2.5 text-[11px] font-mono text-textMuted overflow-x-auto whitespace-pre-wrap break-all rounded leading-relaxed">
                               {curlSnippet}
                             </pre>
                           </div>
@@ -914,7 +915,7 @@ export function Models() {
                           {(model.labels?.length || 0) > 0 && (
                             <div className="flex flex-wrap gap-1 pt-1">
                               {model.labels?.map((labelItem, i) => (
-                                <span key={i} className="px-2 py-0.5 text-[10px] font-mono bg-white/5 border border-white/10 text-textMuted rounded">
+                                <span dir="ltr" key={i} className="px-2 py-0.5 text-[10px] font-mono bg-white/5 border border-white/10 text-textMuted rounded">
                                   {labelItem}
                                 </span>
                               ))}

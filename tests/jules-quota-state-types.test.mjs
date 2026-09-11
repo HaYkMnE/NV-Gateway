@@ -10,6 +10,266 @@ const workflowPath = path.join(root, '.github', 'workflows', 'autonomous-analysi
 const workflowText = fs.readFileSync(workflowPath, 'utf8');
 const workflow = yaml.load(workflowText);
 const statePath = path.join(root, '.jules', 'state', 'quota-state.json');
+const workflowsDirectory = path.join(root, '.github', 'workflows');
+const autonomousWorkflowFiles = [
+  'autonomous-analysis.yml',
+  'autonomous-change.yml',
+  'autonomous-developer.yml',
+  'autonomous-merge.yml',
+  'autonomous-quota-reset.yml'
+];
+
+function loadAutonomousWorkflowDocuments(directoryEntries = fs.readdirSync(workflowsDirectory)) {
+  const discovered = directoryEntries
+    .filter((file) => /^autonomous-.*\.ya?ml$/i.test(file))
+    .sort();
+  assert.deepEqual(discovered, autonomousWorkflowFiles,
+    'the autonomous workflow contract must load the complete expected file set');
+  return new Map(autonomousWorkflowFiles.map((file) => [
+    file,
+    yaml.load(fs.readFileSync(path.join(workflowsDirectory, file), 'utf8'))
+  ]));
+}
+
+function stripBalancedOuterParentheses(value) {
+  let expression = value.trim();
+  while (expression.startsWith('(')) {
+    let depth = 0;
+    let quote = null;
+    let closesAt = -1;
+    for (let index = 0; index < expression.length; index += 1) {
+      const character = expression[index];
+      if (quote) {
+        if (character === quote) {
+          if (quote === "'" && expression[index + 1] === "'") index += 1;
+          else if (expression[index - 1] !== '\\') quote = null;
+        }
+        continue;
+      }
+      if (character === "'" || character === '"') quote = character;
+      else if (character === '(') depth += 1;
+      else if (character === ')') {
+        depth -= 1;
+        if (depth === 0) {
+          closesAt = index;
+          break;
+        }
+        if (depth < 0) return null;
+      }
+    }
+    if (quote || closesAt < 0) return null;
+    if (closesAt !== expression.length - 1) break;
+    expression = expression.slice(1, -1).trim();
+  }
+  return expression;
+}
+
+function topLevelConjuncts(value) {
+  const conjuncts = [];
+  let start = 0;
+  let depth = 0;
+  let quote = null;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (quote) {
+      if (character === quote) {
+        if (quote === "'" && value[index + 1] === "'") index += 1;
+        else if (value[index - 1] !== '\\') quote = null;
+      }
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      continue;
+    }
+    if (character === '(') depth += 1;
+    else if (character === ')') {
+      depth -= 1;
+      if (depth < 0) return null;
+    } else if (depth === 0 && value.startsWith('&&', index)) {
+      if (value[index - 1] === '&' || value[index + 2] === '&') return null;
+      conjuncts.push(value.slice(start, index).trim());
+      start = index + 2;
+      index += 1;
+    } else if (depth === 0 && (value.startsWith('||', index) || character === '?')) {
+      return null;
+    } else if (depth === 0 && character === '!' && value[index + 1] !== '=') {
+      return null;
+    }
+  }
+  if (quote || depth !== 0) return null;
+  conjuncts.push(value.slice(start).trim());
+  // Conservative GitHub-condition recognizer: top-level && peers must start
+  // with an operand, not an operator fragment; nested/quoted syntax stays opaque.
+  return conjuncts.every((conjunct) => {
+    if (!conjunct) return false;
+    const normalized = stripBalancedOuterParentheses(conjunct);
+    return normalized !== null && /^(?:[A-Za-z_][A-Za-z0-9_]*|\d|['"])/.test(normalized);
+  }) ? conjuncts : null;
+}
+
+function expressionRequiresAutonomousGate(value) {
+  const envelope = /^\s*\$\{\{([\s\S]*)\}\}\s*$/.exec(value);
+  const expression = stripBalancedOuterParentheses(envelope ? envelope[1] : value);
+  if (!expression) return false;
+  const conjuncts = topLevelConjuncts(expression);
+  if (!conjuncts) return false;
+  return conjuncts.some((conjunct) => {
+    const normalized = stripBalancedOuterParentheses(conjunct);
+    return normalized !== null
+      && /^vars\s*\.\s*AUTONOMOUS_LOOP_ENABLED\s*==\s*(['"])true\1$/.test(normalized);
+  });
+}
+
+function assertEveryAutonomousJobIsGated(documents) {
+  assert.deepEqual([...documents.keys()], autonomousWorkflowFiles,
+    'the autonomous workflow contract must inspect every expected file');
+  let totalJobs = 0;
+  for (const [file, document] of documents) {
+    assert.ok(document && typeof document === 'object', `${file} must parse as a YAML mapping`);
+
+    assert.ok(Object.hasOwn(document, 'on'), `${file} must define an own on trigger mapping`);
+    const triggers = document.on;
+    assert.ok(triggers && typeof triggers === 'object' && !Array.isArray(triggers),
+      `${file} must define a nonempty on trigger mapping`);
+    assert.ok(Object.keys(triggers).length > 0, `${file} must define at least one trigger`);
+
+    const jobs = document.jobs;
+    assert.ok(jobs && typeof jobs === 'object' && !Array.isArray(jobs),
+      `${file} must define a jobs mapping`);
+    const jobEntries = Object.entries(jobs);
+    assert.ok(jobEntries.length > 0, `${file} must define at least one job`);
+    totalJobs += jobEntries.length;
+
+    for (const [jobName, job] of jobEntries) {
+      assert.equal(typeof job?.if, 'string', `${file} job ${jobName} must define an if gate`);
+      assert.ok(expressionRequiresAutonomousGate(job.if),
+        `${file} job ${jobName} must require vars.AUTONOMOUS_LOOP_ENABLED == 'true'`);
+    }
+  }
+  assert.ok(totalJobs > 0, 'the autonomous workflow contract must inspect at least one job');
+}
+
+function mutateWorkflowDocument(documents, file, mutate) {
+  const document = structuredClone(documents.get(file));
+  mutate(document);
+  documents.set(file, document);
+  return documents;
+}
+
+test('an OR branch cannot bypass the repository-variable gate', () => {
+  const documents = mutateWorkflowDocument(
+    loadAutonomousWorkflowDocuments(),
+    'autonomous-change.yml',
+    (document) => {
+      document.jobs['build-and-test'].if = "${{ vars.AUTONOMOUS_LOOP_ENABLED == 'true' && false || true }}";
+    }
+  );
+
+  assert.throws(
+    () => assertEveryAutonomousJobIsGated(documents),
+    /autonomous-change\.yml job build-and-test must require vars\.AUTONOMOUS_LOOP_ENABLED/
+  );
+});
+
+test('a third ampersand cannot form a valid peer conjunct', () => {
+  const documents = mutateWorkflowDocument(
+    loadAutonomousWorkflowDocuments(),
+    'autonomous-change.yml',
+    (document) => {
+      document.jobs['build-and-test'].if = "${{ vars.AUTONOMOUS_LOOP_ENABLED == 'true' &&& true }}";
+    }
+  );
+
+  assert.throws(
+    () => assertEveryAutonomousJobIsGated(documents),
+    /autonomous-change\.yml job build-and-test must require vars\.AUTONOMOUS_LOOP_ENABLED/
+  );
+});
+
+test('an equals sign cannot begin a peer conjunct', () => {
+  const documents = mutateWorkflowDocument(
+    loadAutonomousWorkflowDocuments(),
+    'autonomous-change.yml',
+    (document) => {
+      document.jobs['build-and-test'].if = "${{ vars.AUTONOMOUS_LOOP_ENABLED == 'true' && = true }}";
+    }
+  );
+
+  assert.throws(
+    () => assertEveryAutonomousJobIsGated(documents),
+    /autonomous-change\.yml job build-and-test must require vars\.AUTONOMOUS_LOOP_ENABLED/
+  );
+});
+
+test('a parenthesized repository-variable gate remains a required conjunct', () => {
+  const documents = mutateWorkflowDocument(
+    loadAutonomousWorkflowDocuments(),
+    'autonomous-change.yml',
+    (document) => {
+      document.jobs['build-and-test'].if = "${{ (vars.AUTONOMOUS_LOOP_ENABLED == 'true') && success() }}";
+    }
+  );
+
+  assert.doesNotThrow(() => assertEveryAutonomousJobIsGated(documents));
+});
+
+test('quoted operator text remains opaque within a valid peer conjunct', () => {
+  const documents = mutateWorkflowDocument(
+    loadAutonomousWorkflowDocuments(),
+    'autonomous-change.yml',
+    (document) => {
+      document.jobs['build-and-test'].if = "${{ vars.AUTONOMOUS_LOOP_ENABLED == 'true' && contains(github.event.issue.title, '&& || ? !') }}";
+    }
+  );
+
+  assert.doesNotThrow(() => assertEveryAutonomousJobIsGated(documents));
+});
+
+test('an unrelated literal true key cannot substitute for the on trigger key', () => {
+  const documents = mutateWorkflowDocument(
+    loadAutonomousWorkflowDocuments(),
+    'autonomous-change.yml',
+    (document) => {
+      document.true = document.on;
+      delete document.on;
+    }
+  );
+
+  assert.throws(
+    () => assertEveryAutonomousJobIsGated(documents),
+    /autonomous-change\.yml must define an own on trigger mapping/
+  );
+});
+
+test('case-variant autonomous workflow filenames are discovered and rejected', () => {
+  const directoryEntries = [
+    ...fs.readdirSync(workflowsDirectory),
+    'Autonomous-shadow.yml'
+  ];
+
+  assert.throws(
+    () => loadAutonomousWorkflowDocuments(directoryEntries),
+    /complete expected file set/
+  );
+});
+
+test('regression proof: an autonomous job missing the repository-variable gate is rejected', () => {
+  const documents = loadAutonomousWorkflowDocuments();
+  const file = 'autonomous-change.yml';
+  const document = structuredClone(documents.get(file));
+  delete document.jobs['build-and-test'].if;
+  documents.set(file, document);
+
+  assert.throws(
+    () => assertEveryAutonomousJobIsGated(documents),
+    /autonomous-change\.yml job build-and-test must define an if gate/
+  );
+});
+
+test('every job in every autonomous workflow requires the repository-variable gate', () => {
+  assertEveryAutonomousJobIsGated(loadAutonomousWorkflowDocuments());
+});
 
 /**
  * Every `run:` body in the workflow, with full-line shell comments removed.
@@ -176,7 +436,8 @@ test('the Jules automation stays unable to act on its own', () => {
     'the 404 fail-fast condition must stay');
 
   // Triggers must be unchanged: dispatch plus the hourly cron.
-  const on = workflow.on ?? workflow.true;
+  assert.ok(Object.hasOwn(workflow, 'on'), 'the workflow must define its own on trigger key');
+  const on = workflow.on;
   assert.ok(Object.hasOwn(on, 'workflow_dispatch'), 'workflow_dispatch must remain');
   assert.equal(on.schedule?.[0]?.cron, '0 */1 * * *', 'the cron schedule must remain unchanged');
 });

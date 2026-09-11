@@ -61,22 +61,15 @@ test('the saved-to string exists in all 7 locales and interpolates the path', ()
   }
 });
 
-test('every locale stays key-complete and the key count grew by exactly one', () => {
+test('every locale stays key-complete at the current 306-key contract', () => {
   const exports = loadTypeScriptExports('src/renderer/i18n/resources.ts');
 
   const enKeys = Object.keys(exports.en);
-  // Counter maintenance only — the strictness below is untouched.
-  // Lineage: 292 baseline, +1 for this defect's feedback_savedTo = 293, then +8
-  // for the Models filter controls (models_filter_* — popularity label/any/
-  // threshold, labels label, the two narrowing toggles, reset, result count)
-  // = 301, then +1 for the humanized Models label chip
-  // (models_label_usecase_text_gen) = 302. This number is a snapshot of the
-  // CURRENT key set; the assertions that
-  // actually protect the 7-locale contract are the key-completeness ones below
-  // (no missing keys, no keys EN does not define), which remain exactly as
-  // strict as before.
-  assert.equal(enKeys.length, 302,
-    'EN key count: 292 baseline + 1 (feedback_savedTo) + 8 (models_filter_*) + 1 (models_label_usecase_text_gen)');
+  // CURRENT key-set lineage: 302 from the earlier feedback/model-label work,
+  // +1 for runtime_exit, then +3 context-specific dialog close labels = 306.
+  // The assertions below also preserve exact key parity across all locales.
+  assert.equal(enKeys.length, 306,
+    'EN key count: 302 previous baseline + 1 runtime exit + 3 dialog close labels');
 
   for (const locale of LOCALE_NAMES) {
     const localeKeys = Object.keys(exports[locale]);
@@ -84,7 +77,7 @@ test('every locale stays key-complete and the key count grew by exactly one', ()
     const extra = localeKeys.filter((key) => !enKeys.includes(key));
     assert.deepEqual(missing, [], `${locale} is missing keys: ${missing.join(', ')}`);
     assert.deepEqual(extra, [], `${locale} has keys EN does not define: ${extra.join(', ')}`);
-    assert.equal(localeKeys.length, 302, `${locale} must hold 302 keys`);
+    assert.equal(localeKeys.length, 306, `${locale} must hold 306 keys`);
   }
 });
 

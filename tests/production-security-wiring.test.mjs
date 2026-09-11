@@ -64,7 +64,7 @@ test('secure store migrates both plaintext files and persists encrypted credenti
 test('private channel binds a child-generated challenge to the attached IPC child', async () => {
   const { createPrivateStateChannel } = await import(built('private-state-channel.js'));
   const messages = [];
-  const child = new EventEmitter(); child.connected = true; child.send = (value) => messages.push(value);
+  const child = new EventEmitter(); child.connected = true; child.send = (value, callback) => { messages.push(value); callback?.(null); };
   let persisted;
   const channel = createPrivateStateChannel({ initialState: { keys: [{ key: 'secret' }] }, persist: (state) => { persisted = state; } });
   channel.attach(child);
@@ -77,6 +77,45 @@ test('private channel binds a child-generated challenge to the attached IPC chil
   assert.equal(channel.authenticated, true);
   assert.equal(channel.initializationSent, true);
   assert.equal(channel.challenge, 'child-random-challenge-1234567890');
+});
+
+test('private channel reports synchronous state-init send failure without false authentication or an escaping throw', async () => {
+  const { createPrivateStateChannel } = await import(built('private-state-channel.js'));
+  const child = new EventEmitter();
+  child.connected = true;
+  child.send = (value) => JSON.stringify(value);
+  const channel = createPrivateStateChannel({ initialState: { keys: [], allowedExtra: 1n }, persist: () => {} });
+  channel.attach(child);
+
+  assert.doesNotThrow(() => child.emit('message', { type: 'ready', challenge: 'sync-failure-challenge-123456789' }));
+  assert.equal(channel.authenticated, false);
+  assert.equal(channel.initializationSent, false);
+  assert.equal(channel.failed, true);
+  assert.equal(channel.challenge, null);
+});
+
+test('private channel reports async send callback failure and callback success exactly once', async () => {
+  const { createPrivateStateChannel } = await import(built('private-state-channel.js'));
+  for (const [error, expected] of [[new Error('private callback detail'), false], [null, true]]) {
+    const child = new EventEmitter();
+    child.connected = true;
+    let sends = 0;
+    child.send = (_value, callback) => {
+      sends += 1;
+      setImmediate(() => { callback(error); callback(error ? null : new Error('late duplicate callback')); });
+      return true;
+    };
+    const channel = createPrivateStateChannel({ initialState: { keys: [] }, persist: () => {} });
+    channel.attach(child);
+    assert.doesNotThrow(() => child.emit('message', { type: 'ready', challenge: 'callback-channel-challenge-123456' }));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(sends, 1);
+    assert.equal(channel.authenticated, expected);
+    assert.equal(channel.initializationSent, expected);
+    assert.equal(channel.failed, !expected);
+    assert.equal(channel.challenge, expected ? 'callback-channel-challenge-123456' : null);
+  }
 });
 
 test('spawn options contain no state path or explicit gateway credential in argv or environment', async () => {
@@ -237,7 +276,7 @@ test('actual lifecycle spawn boundary excludes secrets and sends state only afte
     const capturedSpawn = createSpawnCapture();
     child = new EventEmitter();
     child.pid = 42; child.exitCode = null; child.killed = false; child.connected = true;
-    child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.send = (value) => sent.push(value);
+    child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.send = (value, callback) => { sent.push(value); callback?.(null); };
     child.kill = () => { child.killed = true; child.exitCode = 0; child.emit('exit', 0, null); return true; };
     const instance = new GatewayLifecycle({ executablePath: 'C:\\Electron\\electron.exe', serverPath: 'C:\\app\\gateway\\server.mjs', runtimePaths: paths,
       initialState: { keys: [{ key: secret }], credentials: { gatewayToken: secret, adminToken: secret } }, startupTimeoutMs: 20, healthPollIntervalMs: 1,

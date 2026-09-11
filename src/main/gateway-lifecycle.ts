@@ -14,7 +14,7 @@ export type GatewayState = "stopped" | "starting" | "running" | "error";
 export interface GatewayStatus {
   state: GatewayState;
   port?: number;
-  code?: "PORT_IN_USE" | "START_FAILED";
+  code?: "PORT_IN_USE" | "START_FAILED" | "RUNTIME_EXIT";
   message?: string;
 }
 
@@ -45,7 +45,22 @@ export interface GatewayLifecycleOptions {
 
 interface BoundAttestation {
   attested: boolean;
+  dispose: () => void;
   invalid: boolean;
+}
+
+interface ManagedChildLifecycle {
+  committedRunning: boolean;
+  intentionalStop: boolean;
+  lateExitCleanupInstalled: boolean;
+  listenerDisposers: Set<() => void>;
+  listenersDetached: boolean;
+  ownerId: string;
+  port: number;
+  runtimeErrorMessage: string | null;
+  runtimeErrorListener: ((error: Error) => void) | null;
+  runtimeExitListener: ((code: number | null, signal: NodeJS.Signals | null) => void) | null;
+  terminalEventHandled: boolean;
 }
 
 const MAX_OUTPUT_LENGTH = 4_000;
@@ -91,6 +106,7 @@ export class GatewayLifecycle {
   private readonly persistState: (state: ChildKeyProjection) => void;
   private readonly protectFile: (filePath: string) => void;
   private readonly onPreparedChildSpawn?: GatewayLifecycleOptions["onPreparedChildSpawn"];
+  private readonly childLifecycles = new WeakMap<ChildProcess, ManagedChildLifecycle>();
 
   constructor(options: GatewayLifecycleOptions) {
     const initialState = cloneValidatedGatewayState(options.initialState);
@@ -157,18 +173,19 @@ export class GatewayLifecycle {
     if (!isCompleteGatewayState(initialState)) {
       return this.setStatus({ state: "error", code: "START_FAILED", port, message: STATE_INVALID_MESSAGE });
     }
-    const conflict = await this.preflight(port);
-    if (conflict) {
-      return this.setStatus(conflict);
-    }
-
     if (this.child) {
-      return this.setStatus({
+      if (this.managedPort === port) return this.getStatus();
+      return {
         state: "error",
         code: "START_FAILED",
         port,
         message: "Gateway is already managed by this application."
-      });
+      };
+    }
+
+    const conflict = await this.preflight(port);
+    if (conflict) {
+      return this.setStatus(conflict);
     }
 
     this.output = "";
@@ -193,6 +210,20 @@ export class GatewayLifecycle {
       });
     }
     this.child = child;
+    const childLifecycle: ManagedChildLifecycle = {
+      committedRunning: false,
+      intentionalStop: false,
+      lateExitCleanupInstalled: false,
+      listenerDisposers: new Set(),
+      listenersDetached: false,
+      ownerId,
+      port,
+      runtimeErrorMessage: null,
+      runtimeErrorListener: null,
+      runtimeExitListener: null,
+      terminalEventHandled: false
+    };
+    this.childLifecycles.set(child, childLifecycle);
     if (preparedMigration) try { this.onPreparedChildSpawn?.("spawned", child.pid); } catch { /* diagnostics must not alter startup */ }
     this.managedPort = port;
     try {
@@ -200,14 +231,15 @@ export class GatewayLifecycle {
       const boundAttestation = this.watchBoundAttestation(child, port, privateChannel, () => {
         void this.enqueue(() => this.handleProtocolViolation(child, port));
       });
-      privateChannel.attach(child);
+      this.addChildListenerDisposer(child, boundAttestation.dispose);
+      this.addChildListenerDisposer(child, privateChannel.attach(child));
       this.captureOutput(child);
 
       const startupError = await this.waitForHealthOrFailure(child, port, privateChannel, boundAttestation);
       if (startupError) return this.failStartedChild(child, port, ownerId, startupError);
 
       const ownershipVerified = await this.verifyChildOwnership(child, port);
-      if (!privateChannel.authenticated || !boundAttestation.attested || boundAttestation.invalid || !ownershipVerified || boundAttestation.invalid) {
+      if (!privateChannel.authenticated || !privateChannel.initializationConfirmed || !boundAttestation.attested || boundAttestation.invalid || !ownershipVerified || boundAttestation.invalid) {
         return this.failStartedChild(child, port, ownerId, {
           state: "error",
           code: "START_FAILED",
@@ -219,7 +251,7 @@ export class GatewayLifecycle {
       this.writeOwnerRecord(child, port, ownerId);
       await this.afterOwnerRecordWrite?.(child);
       const recordedOwnershipVerified = await this.verifyChildOwnership(child, port);
-      if (!privateChannel.authenticated || !boundAttestation.attested || boundAttestation.invalid || !recordedOwnershipVerified || boundAttestation.invalid) {
+      if (!privateChannel.authenticated || !privateChannel.initializationConfirmed || !boundAttestation.attested || boundAttestation.invalid || !recordedOwnershipVerified || boundAttestation.invalid) {
         return this.failStartedChild(child, port, ownerId, {
           state: "error",
           code: "START_FAILED",
@@ -227,6 +259,7 @@ export class GatewayLifecycle {
           message: this.withOutput("Gateway exited before startup could be recorded.")
         });
       }
+      childLifecycle.committedRunning = true;
       return this.setStatus({ state: "running", port });
     } catch {
       return this.failStartedChild(child, port, ownerId, {
@@ -247,7 +280,8 @@ export class GatewayLifecycle {
       const conflict = await this.preflight(port);
       if (conflict) return this.setStatus(conflict);
     }
-    await this.stopInternal();
+    const stopped = await this.stopInternal();
+    if (stopped.state !== "stopped") return stopped;
     return this.startInternal(port);
   }
 
@@ -257,7 +291,11 @@ export class GatewayLifecycle {
 
   private async stopInternal(): Promise<GatewayStatus> {
     const child = this.child;
+    const lifecycle = child ? this.childLifecycles.get(child) : undefined;
+    const port = lifecycle?.port ?? this.managedPort;
+    if (child) this.markIntentionalStop(child);
     if (child && !await this.stopChild(child)) {
+      this.retainStoppedChildUntilExit(child, port);
       return this.setStatus({
         state: "error",
         code: "START_FAILED",
@@ -265,10 +303,11 @@ export class GatewayLifecycle {
         message: "Managed gateway child shutdown could not be confirmed."
       });
     }
+    if (child) this.detachChildListeners(child);
     if (child && this.child === child) this.child = null;
-    this.managedPort = null;
-    if (child) this.clearOwnerRecordForChild(child, this.status.port ?? 0);
-    else this.clearOwnerRecord();
+    if (this.managedPort === port) this.managedPort = null;
+    if (child && lifecycle) this.clearOwnerRecordFor(child, lifecycle.port, lifecycle.ownerId);
+    else if (child && port !== null) this.clearOwnerRecordForChild(child, port);
     return this.setStatus({ state: "stopped" });
   }
 
@@ -329,12 +368,16 @@ export class GatewayLifecycle {
   }
 
   private async verifyChildOwnership(child: ChildProcess, port: number): Promise<boolean> {
-    return this.child === child && child.exitCode === null && !child.killed && await requestHealth(port);
+    if (this.child !== child || child.exitCode !== null || child.killed) return false;
+    const healthy = await requestHealth(port);
+    return healthy && this.child === child && child.exitCode === null && !child.killed;
   }
 
   private async failStartedChild(child: ChildProcess, port: number, ownerId: string, status: GatewayStatus): Promise<GatewayStatus> {
+    this.markIntentionalStop(child);
     const stopped = await this.stopChild(child);
     if (stopped) {
+      this.detachChildListeners(child);
       this.clearOwnerRecordFor(child, port, ownerId);
       if (this.child === child) this.child = null;
       if (this.managedPort === port) this.managedPort = null;
@@ -352,20 +395,50 @@ export class GatewayLifecycle {
 
   private retainFailedChildUntilExit(child: ChildProcess, port: number, ownerId: string): void {
     child.once("exit", () => {
+      this.detachChildListeners(child);
       this.clearOwnerRecordFor(child, port, ownerId);
       if (this.child === child) this.child = null;
       if (this.managedPort === port) this.managedPort = null;
     });
   }
 
-  private watchBoundAttestation(child: ChildProcess, port: number, channel: { authenticated: boolean; initializationSent: boolean; challenge: string | null }, onInvalid: () => void): BoundAttestation {
-    const result: BoundAttestation = { attested: false, invalid: false };
+  private retainStoppedChildUntilExit(child: ChildProcess, port: number | null): void {
+    const lifecycle = this.childLifecycles.get(child);
+    if (!lifecycle || lifecycle.lateExitCleanupInstalled) return;
+    lifecycle.lateExitCleanupInstalled = true;
+    let cleaned = false;
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      child.removeListener("exit", cleanup);
+      if (this.child !== child) return;
+      if (lifecycle) this.clearOwnerRecordFor(child, lifecycle.port, lifecycle.ownerId);
+      else if (port !== null) this.clearOwnerRecordForChild(child, port);
+      this.child = null;
+      if (this.managedPort === port) this.managedPort = null;
+    };
+    child.once("exit", cleanup);
+    if (child.exitCode !== null) cleanup();
+  }
+
+  private watchBoundAttestation(child: ChildProcess, port: number, channel: { authenticated: boolean; initializationSent: boolean; failed: boolean; challenge: string | null }, onInvalid: () => void): BoundAttestation {
+    let attached = true;
+    const result: BoundAttestation = {
+      attested: false,
+      dispose: () => {
+        if (!attached) return;
+        attached = false;
+        child.removeListener("message", onMessage);
+      },
+      invalid: false
+    };
     const invalidate = () => {
       if (result.invalid) return;
       result.invalid = true;
       onInvalid();
     };
-    child.on("message", (message: unknown) => {
+    const onMessage = (message: unknown) => {
+      if (!attached) return;
       const value = strictBoundAttestation(message);
       if (value === null) {
         if (isBoundAttestationCandidate(message)) invalidate();
@@ -375,7 +448,8 @@ export class GatewayLifecycle {
       if (typeof value.challenge !== "string" || value.challenge !== channel.challenge) { invalidate(); return; }
       if (!Number.isSafeInteger(value.gatewayPort) || !Number.isSafeInteger(value.adminPort) || value.gatewayPort !== port || value.adminPort !== port + 1) { invalidate(); return; }
       result.attested = true;
-    });
+    };
+    child.on("message", onMessage);
     return result;
   }
 
@@ -430,13 +504,21 @@ private async preflight(port: number): Promise<GatewayStatus | null> {
   }
 
   private captureOutput(child: ChildProcess): void {
+    let attached = true;
     const append = (chunk: Buffer | string) => {
+      if (!attached) return;
       const text = String(redact(chunk.toString())).slice(0, MAX_OUTPUT_LENGTH);
       this.output = `${this.output}${text}`.slice(-MAX_OUTPUT_LENGTH);
       this.appendToStdioLog(text);
     };
     child.stdout?.on("data", append);
     child.stderr?.on("data", append);
+    this.addChildListenerDisposer(child, () => {
+      if (!attached) return;
+      attached = false;
+      child.stdout?.removeListener("data", append);
+      child.stderr?.removeListener("data", append);
+    });
   }
 
   private appendToStdioLog(text: string): void {
@@ -478,7 +560,7 @@ private async preflight(port: number): Promise<GatewayStatus | null> {
     }
   }
 
-  private async waitForHealthOrFailure(child: ChildProcess, port: number, channel: { authenticated: boolean }, boundAttestation: BoundAttestation): Promise<GatewayStatus | null> {
+  private async waitForHealthOrFailure(child: ChildProcess, port: number, channel: { authenticated: boolean; initializationConfirmed: boolean; failed: boolean }, boundAttestation: BoundAttestation): Promise<GatewayStatus | null> {
     let childFailure: string | null = null;
     const onError = (error: Error) => { childFailure = `Gateway child process error: ${error.message}`; };
     const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
@@ -490,6 +572,16 @@ private async preflight(port: number): Promise<GatewayStatus | null> {
 
     const deadline = Date.now() + this.startupTimeoutMs;
     while (Date.now() < deadline && !childFailure) {
+      if (channel.failed) {
+        child.removeListener("error", onError);
+        child.removeListener("exit", onExit);
+        return {
+          state: "error",
+          code: "START_FAILED",
+          port,
+          message: "Gateway startup could not be completed."
+        };
+      }
       if (boundAttestation.invalid) {
         child.removeListener("error", onError);
         child.removeListener("exit", onExit);
@@ -500,7 +592,7 @@ private async preflight(port: number): Promise<GatewayStatus | null> {
           message: this.withOutput("Gateway exited before startup could be verified.")
         };
       }
-      if (channel.authenticated && boundAttestation.attested && !boundAttestation.invalid && await requestHealth(port) && await requestAdminHealth(port + 1)) {
+      if (channel.authenticated && channel.initializationConfirmed && boundAttestation.attested && !boundAttestation.invalid && await requestHealth(port) && await requestAdminHealth(port + 1)) {
         child.removeListener("error", onError);
         child.removeListener("exit", onExit);
         this.registerRuntimeEvents(child, port);
@@ -520,40 +612,89 @@ private async preflight(port: number): Promise<GatewayStatus | null> {
   }
 
   private registerRuntimeEvents(child: ChildProcess, port: number): void {
-    child.once("error", (error) => {
-      if (this.child !== child) return;
-      this.child = null;
-      this.managedPort = null;
-      this.clearOwnerRecordForChild(child, port);
-      this.setStatus({ state: "error", code: "START_FAILED", port, message: this.withOutput(`Gateway child process error: ${error.message}`) });
-    });
-    child.once("exit", (code, signal) => {
-      if (this.child !== child) return;
-      this.child = null;
-      this.managedPort = null;
-      this.clearOwnerRecordForChild(child, port);
-      this.setStatus({
-        state: "error",
-        code: "START_FAILED",
-        port,
-        message: this.withOutput(`Gateway exited${code === null ? "" : ` with code ${code}`}${signal ? ` (${signal})` : ""}.`)
-      });
-    });
+    const lifecycle = this.childLifecycles.get(child);
+    if (!lifecycle || lifecycle.runtimeErrorListener || lifecycle.runtimeExitListener) return;
+    const onError = (error: Error) => {
+      const lifecycle = this.childLifecycles.get(child);
+      if (this.child !== child || !lifecycle || lifecycle.intentionalStop || lifecycle.terminalEventHandled) return;
+      lifecycle.runtimeErrorMessage = `Gateway child process error: ${error.message}`;
+      if (child.exitCode !== null) {
+        this.detachChildListeners(child);
+        this.reportUnexpectedRuntimeExit(child, port, lifecycle.runtimeErrorMessage);
+      }
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      const lifecycle = this.childLifecycles.get(child);
+      const message = lifecycle?.runtimeErrorMessage ?? `Gateway exited${code === null ? "" : ` with code ${code}`}${signal ? ` (${signal})` : ""}.`;
+      this.detachChildListeners(child);
+      this.reportUnexpectedRuntimeExit(child, port, message);
+    };
+    lifecycle.runtimeErrorListener = onError;
+    lifecycle.runtimeExitListener = onExit;
+    child.on("error", onError);
+    child.once("exit", onExit);
+    this.addChildListenerDisposer(child, () => child.removeListener("error", onError));
+    this.addChildListenerDisposer(child, () => child.removeListener("exit", onExit));
+  }
+
+  private addChildListenerDisposer(child: ChildProcess, dispose: () => void): void {
+    const lifecycle = this.childLifecycles.get(child);
+    if (!lifecycle || lifecycle.listenersDetached) {
+      dispose();
+      return;
+    }
+    lifecycle.listenerDisposers.add(dispose);
+  }
+
+  private detachChildListeners(child: ChildProcess): void {
+    const lifecycle = this.childLifecycles.get(child);
+    if (!lifecycle || lifecycle.listenersDetached) return;
+    lifecycle.listenersDetached = true;
+    for (const dispose of lifecycle.listenerDisposers) dispose();
+    lifecycle.listenerDisposers.clear();
+    lifecycle.runtimeErrorListener = null;
+    lifecycle.runtimeExitListener = null;
+  }
+
+  private reportUnexpectedRuntimeExit(child: ChildProcess, port: number, message: string): void {
+    if (!this.claimUnexpectedRuntimeFailure(child)) return;
+    const lifecycle = this.childLifecycles.get(child);
+    this.child = null;
+    this.managedPort = null;
+    if (lifecycle) this.clearOwnerRecordFor(child, lifecycle.port, lifecycle.ownerId);
+    else this.clearOwnerRecordForChild(child, port);
+    this.setStatus({ state: "error", code: "RUNTIME_EXIT", port, message: this.withOutput(message) });
   }
 
   private async handleProtocolViolation(child: ChildProcess, port: number): Promise<void> {
     if (this.child !== child || this.status.state === "starting") return;
+    this.markIntentionalStop(child);
     const stopped = await this.stopChild(child);
+    const lifecycle = this.childLifecycles.get(child);
     if (stopped) {
-      this.clearOwnerRecordForChild(child, port);
+      this.detachChildListeners(child);
+      if (lifecycle) this.clearOwnerRecordFor(child, lifecycle.port, lifecycle.ownerId);
+      else this.clearOwnerRecordForChild(child, port);
       if (this.child === child) this.child = null;
       if (this.managedPort === port) this.managedPort = null;
       this.setStatus({ state: "error", code: "START_FAILED", port, message: "Gateway lifecycle protocol violation." });
       return;
     }
-    this.retainFailedChildUntilExit(child, port, "");
+    this.retainFailedChildUntilExit(child, lifecycle?.port ?? port, lifecycle?.ownerId ?? "");
     this.onLifecycleEvent?.("gateway_lifecycle_cleanup_failed", { operation: "stop_child" });
     this.setStatus({ state: "error", code: "START_FAILED", port, message: "Gateway lifecycle protocol violation; managed child shutdown could not be confirmed." });
+  }
+
+  private markIntentionalStop(child: ChildProcess): void {
+    const lifecycle = this.childLifecycles.get(child);
+    if (lifecycle) lifecycle.intentionalStop = true;
+  }
+
+  private claimUnexpectedRuntimeFailure(child: ChildProcess): boolean {
+    const lifecycle = this.childLifecycles.get(child);
+    if (this.child !== child || !lifecycle || !lifecycle.committedRunning || lifecycle.intentionalStop || lifecycle.terminalEventHandled) return false;
+    lifecycle.terminalEventHandled = true;
+    return true;
   }
 
   private clearOwnerRecordForChild(child: ChildProcess, port: number): void {
@@ -764,4 +905,3 @@ function strictBoundAttestation(message: unknown): Record<(typeof BOUND_ATTESTAT
     return null;
   }
 }
-

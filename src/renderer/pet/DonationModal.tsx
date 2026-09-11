@@ -4,6 +4,7 @@ import { X } from 'lucide-react';
 import QRCode from 'qrcode';
 import { petAudio } from './audioEngine';
 import { useDialogFocus } from '../lib/use-dialog-focus';
+import type { ModalRequest } from '../lib/modal-context';
 import './donation-modal.css';
 
 /**
@@ -23,6 +24,7 @@ import './donation-modal.css';
 
 export interface DonationModalProps {
   open: boolean;
+  session: ModalRequest | null;
   onClose: () => void;
   /** Fired after every successful support action (see Ascension above). */
   onAscension: () => void;
@@ -279,15 +281,34 @@ function QrCorner({ pos }: { pos: 'tl' | 'tr' | 'bl' | 'br' }): React.JSX.Elemen
   );
 }
 
-export function DonationModal({ open, onClose, onAscension }: DonationModalProps) {
+export function DonationModal({ open, session, onClose, onAscension }: DonationModalProps) {
   const { t } = useTranslation();
   const [activeTab, setActiveTab] = useState<TabKey>('crypto');
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [qrRow, setQrRow] = useState<DonationRow | null>(null);
   const [bubble, setBubble] = useState<string | null>(null);
   const bubbleTimerRef = useRef<number | null>(null);
+  const copiedTimerRef = useRef<number | null>(null);
+  const openRef = useRef(open);
+  const sessionRef = useRef<ModalRequest | null>(session);
   const dialogRef = useRef<HTMLDivElement>(null);
   const qrDialogRef = useRef<HTMLDivElement>(null);
+  openRef.current = open;
+  sessionRef.current = session;
+
+  const ownsSession = useCallback((ownedSession: ModalRequest | null): ownedSession is ModalRequest =>
+    ownedSession !== null && openRef.current && sessionRef.current === ownedSession, []);
+
+  const clearSessionTimers = useCallback(() => {
+    if (bubbleTimerRef.current !== null) {
+      window.clearTimeout(bubbleTimerRef.current);
+      bubbleTimerRef.current = null;
+    }
+    if (copiedTimerRef.current !== null) {
+      window.clearTimeout(copiedTimerRef.current);
+      copiedTimerRef.current = null;
+    }
+  }, []);
 
   // Focus-in-on-open, Tab trapping and focus-restore-on-close all come from the
   // ONE shared hook (same as FeedbackModal/AboutDialog). This component renders
@@ -299,24 +320,25 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
   // into the main dialog; on the final modal close focus returns to the pet
   // widget launch button that opened it.
   useDialogFocus(dialogRef, open && qrRow === null);
-  useDialogFocus(qrDialogRef, qrRow !== null);
+  useDialogFocus(qrDialogRef, open && qrRow !== null);
 
-  // Reset transient UI state each time the modal opens.
+  // Reset transient UI state and cancel owned timers for every request identity,
+  // including same-modal replacement where `open` remains true.
   useEffect(() => {
-    if (open) {
+    clearSessionTimers();
+    if (open && session !== null) {
       setActiveTab('crypto');
       setCopiedId(null);
       setQrRow(null);
       setBubble(null);
+    } else {
+      // App-level replacement keeps this component mounted. Clear the nested
+      // overlay before a later Donation session can render the stale QR row.
+      setQrRow(null);
     }
-  }, [open]);
+  }, [open, session, clearSessionTimers]);
 
-  useEffect(
-    () => () => {
-      if (bubbleTimerRef.current !== null) window.clearTimeout(bubbleTimerRef.current);
-    },
-    [],
-  );
+  useEffect(() => clearSessionTimers, [clearSessionTimers]);
 
   // Escape: close the enlarged QR view first, then the modal itself.
   useEffect(() => {
@@ -331,23 +353,29 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
   }, [open, qrRow, onClose]);
 
   /** Show a transient message in the modal's role="status" speech bubble. */
-  const showBubble = useCallback((message: string): void => {
+  const showBubble = useCallback((message: string, ownedSession = sessionRef.current): void => {
+    if (!ownsSession(ownedSession)) return;
     setBubble(message);
     if (bubbleTimerRef.current !== null) window.clearTimeout(bubbleTimerRef.current);
-    bubbleTimerRef.current = window.setTimeout(() => setBubble(null), 4000);
-  }, []);
+    const timer = window.setTimeout(() => {
+      if (bubbleTimerRef.current === timer) bubbleTimerRef.current = null;
+      if (ownsSession(ownedSession)) setBubble(null);
+    }, 4000);
+    bubbleTimerRef.current = timer;
+  }, [ownsSession]);
 
   /** Full Ascension sequence shared by COPY / QR confirm / external links. */
-  const triggerAscension = useCallback((): void => {
+  const triggerAscension = useCallback((ownedSession = sessionRef.current): void => {
+    if (!ownsSession(ownedSession)) return;
     petAudio.playAscensionRitual();
     try {
       window.localStorage.setItem('nv_pet_vip', Date.now().toString());
     } catch {
       /* storage unavailable — VIP flag simply won't persist */
     }
-    showBubble(t('pet_thanks'));
+    showBubble(t('pet_thanks'), ownedSession);
     onAscension();
-  }, [onAscension, showBubble, t]);
+  }, [onAscension, ownsSession, showBubble, t]);
 
   const handleTabSwitch = useCallback((tab: TabKey): void => {
     setActiveTab(tab);
@@ -359,20 +387,32 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
   // tick and the Ascension ritual now wait for the write to actually succeed --
   // previously they fired unconditionally, so the UI cheerfully confirmed a copy
   // that never happened and the user pasted nothing.
+  const completeCopy = useCallback((row: DonationRow, ownedSession: ModalRequest | null): void => {
+    if (!ownsSession(ownedSession)) return;
+    setCopiedId(row.id);
+    if (copiedTimerRef.current !== null) window.clearTimeout(copiedTimerRef.current);
+    const timer = window.setTimeout(() => {
+      if (copiedTimerRef.current === timer) copiedTimerRef.current = null;
+      if (ownsSession(ownedSession)) {
+        setCopiedId((current) => (current === row.id ? null : current));
+      }
+    }, 1000);
+    copiedTimerRef.current = timer;
+    triggerAscension(ownedSession);
+  }, [ownsSession, triggerAscension]);
+
   const handleCopy = useCallback(
     (row: DonationRow): void => {
+      const ownedSession = sessionRef.current;
       void window.electronAPI.clipboard
         .writeText(row.value)
-        .then(() => {
-          setCopiedId(row.id);
-          window.setTimeout(() => setCopiedId((current) => (current === row.id ? null : current)), 1000);
-          triggerAscension();
-        })
+        .then(() => completeCopy(row, ownedSession))
         .catch(() => {
-          showBubble(t('copy_failed'));
+          if (!ownsSession(ownedSession)) return;
+          showBubble(t('copy_failed'), ownedSession);
         });
     },
-    [triggerAscension, showBubble, t],
+    [completeCopy, ownsSession, showBubble, t],
   );
 
   /** Open a link row's URL externally via the safe IPC channel + Ascension. */
@@ -459,7 +499,7 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
           </div>
 
           {/* Rows */}
-          <div role="tabpanel" aria-label={activeTabLabel} className="flex max-h-[60vh] flex-col gap-2 overflow-y-auto pr-1">
+          <div role="tabpanel" aria-label={activeTabLabel} className="flex max-h-[60vh] flex-col gap-2 overflow-y-auto pe-1">
             {rows.map((row) => (
               <div
                 key={row.id}
@@ -497,7 +537,7 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
                 {/* Label + placeholder value */}
                 <div className="flex min-w-0 flex-col gap-0.5">
                   <span className="text-sm font-semibold text-textMain">{row.label}</span>
-                  <span className="truncate font-mono text-xs text-textMuted" title={row.value}>
+                  <span dir="ltr" className="truncate font-mono text-xs text-textMuted" title={row.value}>
                     {row.display ?? row.value}
                   </span>
                 </div>
@@ -605,13 +645,13 @@ export function DonationModal({ open, onClose, onAscension }: DonationModalProps
 
             {/* Address row (below the QR) with COPY */}
             <div className="mx-auto mb-3 flex w-full items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2">
-              <span className="truncate font-mono text-xs text-textMuted" title={qrRow.value}>
+              <span dir="ltr" className="truncate font-mono text-xs text-textMuted" title={qrRow.value}>
                 {qrRow.display ?? qrRow.value}
               </span>
               <button
                 type="button"
                 onClick={() => handleCopy(qrRow)}
-                className={`ml-auto min-w-[64px] shrink-0 rounded-md border px-2 py-1 font-mono text-[11px] font-semibold tracking-wide transition-colors ${
+                className={`ms-auto min-w-[64px] shrink-0 rounded-md border px-2 py-1 font-mono text-[11px] font-semibold tracking-wide transition-colors ${
                   copiedId === qrRow.id
                     ? 'border-success bg-success/10 text-success'
                     : 'border-border text-textMuted hover:border-warning hover:text-warning'

@@ -13,7 +13,7 @@ import { PetWidget } from '../pet/PetWidget';
 const navClass = (active: boolean) =>
   `flex items-center gap-3 px-3.5 py-2.5 rounded-sm text-sm transition-colors ${
     active
-      ? 'bg-surface text-accent-neon font-medium border-l-2 border-accent-neon'
+      ? 'bg-surface text-accent-neon font-medium border-s-2 border-accent-neon'
       : 'text-textMuted hover:bg-surface hover:text-accent-neon'
   }`;
 
@@ -77,13 +77,13 @@ const StatusDisplay = memo(function StatusDisplay({
         <span className="text-sm font-medium">{t(`gateway_${status.state}`)}</span>
       </div>
       <div className="text-xs text-textMuted font-mono">
-        {t('port_label')} {status.port ?? gatewayPort}
+        {t('port_label')} <bdi dir="ltr">{status.port ?? gatewayPort}</bdi>
       </div>
       {status.state === 'error' && (
         <div role="alert" className="mt-2 border border-error/60 bg-error/10 p-2 text-xs text-error break-words">
           <div className="flex gap-1">
             <AlertTriangle aria-hidden size={15} />
-            <span>{t(status.code === 'PORT_IN_USE' ? 'port_conflict' : 'start_failed')}</span>
+            <span>{t(status.code === 'PORT_IN_USE' ? 'port_conflict' : status.code === 'RUNTIME_EXIT' ? 'runtime_exit' : 'start_failed')}</span>
           </div>
           <div className="mt-2 flex gap-3">
             <button onClick={onRetry} disabled={retrying} className="text-textMain hover:text-accent-neon">
@@ -91,7 +91,7 @@ const StatusDisplay = memo(function StatusDisplay({
                 <Loader2 aria-label={t('loading')} size={13} className="animate-spin" />
               ) : (
                 <>
-                  <RefreshCw aria-hidden size={13} className="inline mr-1" />
+                  <RefreshCw aria-hidden size={13} className="inline me-1" />
                   {t('retry')}
                 </>
               )}
@@ -144,7 +144,11 @@ export function Layout() {
   // round-trip per transition (the exact cost this channel exists to remove).
   // The returned unsubscribe is the effect cleanup, so a remount cannot stack
   // listeners on a channel that fires on every transition.
+  // A backup/focus fetch may already be in flight when the push arrives. Cancel
+  // it before committing the newer transition; otherwise its older response can
+  // resolve afterward and roll the cache back (for example error -> running).
   useEffect(() => window.electronAPI.onGatewayStatusChanged((status) => {
+    void queryClient.cancelQueries({ queryKey: ['gateway-status'] });
     queryClient.setQueryData(['gateway-status'], status);
   }), [queryClient]);
 
@@ -210,7 +214,7 @@ export function Layout() {
 
   return (
     <div className="flex h-full min-w-0 overflow-hidden">
-      <aside className="hidden md:flex w-[250px] shrink-0 bg-bg border-r border-border flex-col overflow-y-auto overflow-x-hidden">
+      <aside className="hidden md:flex w-[250px] shrink-0 bg-bg border-e border-border flex-col overflow-y-auto overflow-x-hidden">
         <div className="p-5 pb-2">
           <div className="flex items-center gap-3 mb-4">
             <Logo className="w-9 h-9" />
@@ -230,7 +234,7 @@ export function Layout() {
             onChangePort={handleChangePort}
           />
           <button
-            onClick={openFeedback}
+            onClick={() => openFeedback()}
             className="mt-3 w-full flex items-center justify-center gap-2 border border-border px-3 py-2 text-xs font-medium text-textMuted hover:text-accent-neon hover:border-accent-neon/50 transition-colors"
             aria-label={t('feedback_title')}
           >
@@ -253,7 +257,7 @@ export function Layout() {
           </button>
           <Logo className="w-8 h-8" />
           <h1 className="font-bold text-lg">{t('product_name')}</h1>
-          <div className="ml-auto flex items-center gap-2 max-w-[60%]">
+          <div className="ms-auto flex items-center gap-2 max-w-[60%]">
             <StatusDisplay
               status={status}
               gatewayPort={gatewayPort}
@@ -262,7 +266,7 @@ export function Layout() {
               onChangePort={handleChangePort}
             />
             <button
-              onClick={openFeedback}
+               onClick={() => openFeedback()}
               className="p-2 text-textMuted hover:text-accent-neon transition-colors"
               aria-label={t('feedback_title')}
               title={t('feedback_title')}
@@ -280,7 +284,7 @@ export function Layout() {
             />
             <aside
               id="mobile-navigation"
-              className="md:hidden fixed inset-y-0 left-0 z-30 w-[min(250px,85vw)] bg-bg border-r border-border p-5"
+              className="md:hidden fixed inset-y-0 start-0 z-30 w-[min(250px,85vw)] bg-bg border-e border-border p-5"
             >
               <div className="mb-8">
                 <Logo className="w-9 h-9" />

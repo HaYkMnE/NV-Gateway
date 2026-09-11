@@ -356,9 +356,10 @@ test('overlapping startPrepared calls retain the first queued state for its chil
   child.connected = true;
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
-  child.send = (message) => {
+  child.send = (message, callback) => {
     sent.push(message);
     if (message?.type === 'state:init') {
+      callback?.(null);
       child.emit('message', { type: 'ports:bound', challenge: message.challenge, gatewayPort: 12000, adminPort: 12001 });
     }
   };

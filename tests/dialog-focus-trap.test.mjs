@@ -26,7 +26,13 @@ const read = (relative) => fs.readFileSync(path.join(root, relative), 'utf8');
 
 // ── 1. Pure focus-trap decision helper (the one non-trivial piece) ───────────
 test('nextFocusTarget wraps Tab inside the dialog subtree and pulls stray focus back in', async () => {
-  const helpers = await import('../build/src/renderer/lib/frontend-behavior.js');
+  const source = read('src/renderer/lib/frontend-behavior.ts');
+  const compiled = (await import('typescript')).default.transpileModule(source, {
+    compilerOptions: { module: 1, target: 7 },
+  }).outputText;
+  const module = { exports: {} };
+  new Function('module', 'exports', compiled)(module, module.exports);
+  const helpers = module.exports;
   assert.equal(typeof helpers.nextFocusTarget, 'function',
     'a pure nextFocusTarget helper must exist in frontend-behavior.js so ONE implementation is shared by both dialogs');
   assert.equal(typeof helpers.FOCUSABLE_SELECTOR, 'string',
@@ -34,6 +40,10 @@ test('nextFocusTarget wraps Tab inside the dialog subtree and pulls stray focus 
   assert.match(helpers.FOCUSABLE_SELECTOR, /button/, 'selector must cover buttons');
   assert.match(helpers.FOCUSABLE_SELECTOR, /input/, 'selector must cover inputs');
   assert.match(helpers.FOCUSABLE_SELECTOR, /tabindex/, 'selector must honor [tabindex]');
+  assert.match(helpers.FOCUSABLE_SELECTOR, /:not\(\[disabled\]\)/,
+    'selector must exclude disabled native controls so the trap never targets an unfocusable button');
+  assert.match(helpers.FOCUSABLE_SELECTOR, /aria-disabled/,
+    'selector must exclude controls marked aria-disabled from the focus cycle');
 
   // Stable stub elements (the helper is element-agnostic — pure array math).
   const [a, b, c] = ['a', 'b', 'c'];
@@ -113,6 +123,18 @@ test('AboutDialog uses the same shared hook with a newly created dialog ref', ()
     'the role=dialog container must gain ref + tabIndex={-1} without layout/style changes');
 });
 
+test('SendErrorsDialog uses the shared hook instead of leaving focus in the Logs page', () => {
+  const logs = read('src/renderer/views/Logs.tsx');
+  assert.match(logs, /import \{ useDialogFocus \} from '\.\.\/lib\/use-dialog-focus'/,
+    'Logs must import the one shared dialog-focus hook');
+  assert.match(logs, /function SendErrorsDialog[\s\S]*?const dialogRef = useRef<HTMLDivElement>\(null\)/,
+    'SendErrorsDialog must own a ref for its dialog container');
+  assert.match(logs, /function SendErrorsDialog[\s\S]*?useDialogFocus\(dialogRef, true\)/,
+    'the mounted SendErrorsDialog must activate the shared focus trap');
+  assert.match(logs, /ref=\{dialogRef\}\s*\n\s*role="dialog"\s*\n\s*aria-modal="true"\s*\n\s*tabIndex=\{-1\}/,
+    'SendErrorsDialog must wire its ref and focus fallback to the role=dialog container');
+});
+
 // ── 5. Anti-duplication guard ────────────────────────────────────────────────
 test('focus management exists exactly once in the renderer (no duplicated trap logic)', () => {
   const files = fs.readdirSync(path.join(root, 'src/renderer/lib'))
@@ -141,8 +163,8 @@ test('DonationModal wires the shared useDialogFocus hook to its main dialog and 
     'the enlarged-QR overlay (a second role="dialog") needs its own ref');
   assert.match(modal, /useDialogFocus\(dialogRef, open && qrRow === null\)/,
     'the main dialog trap must be suspended while the QR overlay is open, otherwise the two document-level Tab handlers fight over the same keypress');
-  assert.match(modal, /useDialogFocus\(qrDialogRef, qrRow !== null\)/,
-    'the QR overlay must get the same focus-in/trap/restore treatment while open');
+  assert.match(modal, /useDialogFocus\(qrDialogRef, open && qrRow !== null\)/,
+    'the QR overlay must trap focus only while its parent Donation modal is actually open');
   // Both dialog containers must be programmatically focusable for the
   // empty-subtree fallback, exactly like FeedbackModal/AboutDialog.
   assert.match(modal, /ref=\{dialogRef\}\s*\n\s*role="dialog"\s*\n\s*aria-modal="true"\s*\n\s*tabIndex=\{-1\}/,

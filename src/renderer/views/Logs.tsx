@@ -8,6 +8,7 @@ import { classifyScrollEvent, createLogsQueryPolicy, isNearBottom, shouldCancelA
 import { formatLogLine } from '../lib/logs-format';
 import { useGatewayLifecycle } from '../lib/gateway-lifecycle';
 import { useModal } from '../lib/modal-context';
+import { useDialogFocus } from '../lib/use-dialog-focus';
 
 type Log = Record<string, unknown> & { level?: string; message?: string; timestamp?: string; time?: string };
 interface LogLine { key: string; text: string; label: string; cls: string }
@@ -23,8 +24,7 @@ export function Logs() {
   const prevScrollTop = useRef(0);
   const programmaticTimer = useRef<number | undefined>(undefined);
   const lifecycle = useGatewayLifecycle();
-  const { openFeedback } = useModal();
-  const [sendErrorsOpen, setSendErrorsOpen] = useState(false);
+  const { activeModal, activeModalRequest, beginModalRequest, closeModal, isCurrentModalRequest, openFeedback, openSendErrors } = useModal();
   const [errorCount, setErrorCount] = useState<number>(0);
   const [errorPreview, setErrorPreview] = useState<ErrorEntry[] | null>(null);
   const [errorPreviewLoading, setErrorPreviewLoading] = useState(false);
@@ -172,49 +172,57 @@ export function Logs() {
 
   // --- Error reporting ---
   const handleSendErrorsClick = useCallback(async () => {
+    const request = beginModalRequest();
     try {
       const count = await window.electronAPI.errorReport.getCount();
+      if (!isCurrentModalRequest(request)) return;
       if (count === 0) {
         announce(t('errors_noErrors'));
         return;
       }
       setErrorCount(count);
-      setSendErrorsOpen(true);
+      if (!openSendErrors(request)) return;
+      setSending(false);
       setErrorPreview(null);
       setErrorPreviewLoading(true);
       try {
         const preview = await window.electronAPI.errorReport.preview();
-        setErrorPreview(preview);
+        if (isCurrentModalRequest(request)) setErrorPreview(preview);
       } catch {
-        setErrorPreview(null);
+        if (isCurrentModalRequest(request)) setErrorPreview(null);
       } finally {
-        setErrorPreviewLoading(false);
+        if (isCurrentModalRequest(request)) setErrorPreviewLoading(false);
       }
     } catch {
-      announce(t('errors_failed', { message: t('unknown_error') }));
+      if (isCurrentModalRequest(request)) announce(t('errors_failed', { message: t('unknown_error') }));
     }
-  }, [t, announce]);
+  }, [t, announce, beginModalRequest, isCurrentModalRequest, openSendErrors]);
 
   const handleSendConfirm = useCallback(async () => {
+    const request = activeModalRequest;
+    if (request === null || !isCurrentModalRequest(request)) return;
     setSending(true);
     try {
       const result = await window.electronAPI.errorReport.send();
+      if (!isCurrentModalRequest(request)) return;
       if (result.success) {
         announce(t('errors_success', { count: result.count }));
-        setSendErrorsOpen(false);
+        closeModal('send-errors', request);
       } else {
         announce(t('errors_failed', { message: result.message }));
       }
     } catch (error: unknown) {
-      announce(t('errors_failed', { message: error instanceof Error ? error.message : String(error) }));
+      if (isCurrentModalRequest(request)) {
+        announce(t('errors_failed', { message: error instanceof Error ? error.message : String(error) }));
+      }
     } finally {
-      setSending(false);
+      if (isCurrentModalRequest(request)) setSending(false);
     }
-  }, [t, announce]);
+  }, [t, announce, activeModalRequest, closeModal, isCurrentModalRequest]);
 
   const handleSendErrorsClose = useCallback(() => {
-    setSendErrorsOpen(false);
-  }, []);
+    if (activeModalRequest !== null) closeModal('send-errors', activeModalRequest);
+  }, [activeModalRequest, closeModal]);
 
   if (unavailable) {
     return (
@@ -243,8 +251,8 @@ export function Logs() {
           <button onClick={() => void handleSendErrorsClick()} className="border border-border px-3 py-2">
             {t('errors_sendButton')}
           </button>
-          <button onClick={openFeedback} className="border border-border px-3 py-2">
-            <Lightbulb aria-hidden size={16} className="inline mr-1" />
+          <button onClick={() => openFeedback()} className="border border-border px-3 py-2">
+            <Lightbulb aria-hidden size={16} className="inline me-1" />
             {t('feedback_title')}
           </button>
         </div>
@@ -265,7 +273,7 @@ export function Logs() {
       {state === 'error' && (
         <div role="alert" className="border border-error p-4">
           {t('logs_error')} <span className="break-all">{safeError(query.error, t('unknown_error'))}</span>
-          <button onClick={() => void query.refetch()} className="ml-3 text-nvidia">
+          <button onClick={() => void query.refetch()} className="ms-3 text-nvidia">
             {t('retry')}
           </button>
         </div>
@@ -279,6 +287,7 @@ export function Logs() {
 
       {(state === 'success' || state === 'stale') && (
         <ol
+          dir="ltr"
           ref={terminal}
           onScroll={trackScroll}
           role="log"
@@ -292,7 +301,7 @@ export function Logs() {
         </ol>
       )}
 
-      {sendErrorsOpen && (
+      {activeModal === 'send-errors' && (
         <SendErrorsDialog
           count={errorCount}
           preview={errorPreview}
@@ -317,12 +326,24 @@ interface SendErrorsDialogProps {
 
 function SendErrorsDialog({ count, preview, previewLoading, sending, onClose, onConfirm }: SendErrorsDialogProps) {
   const { t } = useTranslation();
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useDialogFocus(dialogRef, true);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [onClose]);
 
   return (
     <div className="fixed inset-0 z-50 bg-black/60 grid place-items-center p-4" onMouseDown={onClose}>
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
+        tabIndex={-1}
         aria-label={t('errors_confirmTitle')}
         onMouseDown={(e) => e.stopPropagation()}
         className="bg-bg border border-border p-6 max-w-lg w-full max-h-[80vh] overflow-y-auto"
@@ -332,7 +353,7 @@ function SendErrorsDialog({ count, preview, previewLoading, sending, onClose, on
             <Send aria-hidden size={20} />
             {t('errors_confirmTitle')}
           </h2>
-          <button onClick={onClose} aria-label={t('close_menu')} className="p-1 text-textMuted hover:text-accent-neon">
+          <button onClick={onClose} aria-label={t('errors_closeDialog')} className="p-1 text-textMuted hover:text-accent-neon">
             <X aria-hidden size={20} />
           </button>
         </div>
@@ -348,7 +369,7 @@ function SendErrorsDialog({ count, preview, previewLoading, sending, onClose, on
               {t('loading')}
             </div>
           ) : preview && preview.length > 0 ? (
-            <ul className="grid gap-2 text-xs font-mono">
+            <ul dir="ltr" className="grid gap-2 text-xs font-mono">
               {preview.slice(0, 50).map((entry, idx) => (
                 <li key={idx} className="border-b border-border pb-1 break-words">
                   <span className="text-textMuted">{entry.timestamp}</span>{' '}

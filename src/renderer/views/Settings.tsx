@@ -210,13 +210,13 @@ export function Settings() {
       <div className="flex items-center justify-between gap-4"><span>{t('updates')}</span><button onClick={() => checkUpdates.mutate()} disabled={checkUpdates.isPending || updateBusy} className="border border-border px-4 py-2">{t('update_check')}</button></div>
       <p role="status" className="text-sm text-textMuted">{updateStatusText}</p>
     </section>
-    <dl className="grid grid-cols-2 gap-3 border border-border bg-surface p-4"><dt>{t('current_status')}</dt><dd>{t(`gateway_${query.data.status.state}`)}</dd><dt>{t('port')}</dt><dd className="font-mono">{query.data.status.port ?? query.data.gatewayPort}</dd><dt>{t('version')}</dt><dd className="font-mono">{query.data.version}</dd></dl>
+    <dl className="grid grid-cols-2 gap-3 border border-border bg-surface p-4"><dt>{t('current_status')}</dt><dd>{t(`gateway_${query.data.status.state}`)}</dd><dt>{t('port')}</dt><dd dir="ltr" className="font-mono">{query.data.status.port ?? query.data.gatewayPort}</dd><dt>{t('version')}</dt><dd dir="ltr" className="font-mono">{query.data.version}</dd></dl>
     <ModelsSection />
     <div className="flex flex-wrap gap-3"><button onClick={() => navigate('/wizard?mode=change')} className="bg-nvidia text-bg px-4 py-2">{t('change_port')}</button><button onClick={() => void rerun()} className="border border-border px-4 py-2 text-textMuted">{t('reset_wizard')}</button></div>
     <section aria-label={t('feedback_title')} className="grid gap-3 border border-border bg-surface p-4">
       <div className="flex items-center justify-between gap-4">
         <span className="text-textMain font-medium">{t('feedback_title')}</span>
-        <button onClick={openFeedback} className="flex items-center gap-2 border border-border px-4 py-2 text-textMain hover:text-accent-neon">
+        <button onClick={() => openFeedback()} className="flex items-center gap-2 border border-border px-4 py-2 text-textMain hover:text-accent-neon">
           <Lightbulb aria-hidden size={16} />
           {t('feedback_title')}
         </button>

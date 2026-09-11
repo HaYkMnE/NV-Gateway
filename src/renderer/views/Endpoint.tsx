@@ -34,6 +34,7 @@ export function Endpoint() {
   const { gatewayPort } = useConfigStore();
   const [showToken, setShowToken] = useState(false);
   const [copiedField, setCopiedField] = useState<string | null>(null);
+  const [copyFeedback, setCopyFeedback] = useState('');
   const [copyError, setCopyError] = useState<string | null>(null);
   const [configTab, setConfigTab] = useState<ConfigTab>('opencode');
   const [isConfigOpen, setIsConfigOpen] = useState(true);
@@ -63,6 +64,11 @@ export function Endpoint() {
   });
   const keysCount = keysQuery.data?.keys?.length ?? 0;
 
+  const announceCopySuccess = (message: string) => {
+    setCopyFeedback('');
+    window.setTimeout(() => setCopyFeedback(message), 0);
+  };
+
   // Copy goes through the main process: navigator.clipboard rejects with
   // NotAllowedError whenever this tray-resident window is not focused. A failure
   // is reported rather than discarded -- silently swallowing it is what made the
@@ -72,6 +78,7 @@ export function Endpoint() {
       await window.electronAPI.clipboard.writeText(text);
       setCopyError(null);
       setCopiedField(field);
+      announceCopySuccess(t('copied'));
       window.setTimeout(() => setCopiedField(null), 2000);
     } catch (error) {
       setCopyError(`${t('copy_failed')} ${safeError(error, t('unknown_error'))}`);
@@ -187,6 +194,8 @@ export function Endpoint() {
         </div>
       </div>
 
+      <p className="sr-only" aria-live="polite">{copyFeedback}</p>
+
       {/* A failed copy must be visible: this view copies the base URL and the
           gateway token, so a silent failure leaves the user pasting nothing. */}
       {copyError && (
@@ -215,7 +224,7 @@ export function Endpoint() {
               <Server size={13} className="text-nvidia" />
               <span>{t('port')}</span>
             </div>
-            <div className="font-mono text-base font-bold text-textMain">{port}</div>
+            <div dir="ltr" className="font-mono text-base font-bold text-textMain">{port}</div>
           </div>
 
           <div className="bg-bg border border-border/70 p-3 rounded-lg">
@@ -249,7 +258,7 @@ export function Endpoint() {
           <div>
             <label className="block text-xs font-semibold text-textMuted uppercase tracking-wider mb-1.5">{t('endpoint_base_url')}</label>
             <div className="flex items-center gap-2">
-              <code className="flex-1 bg-bg border border-border/90 px-3.5 py-2 text-sm font-mono text-accent-neon rounded-lg break-all select-all">
+              <code dir="ltr" className="flex-1 bg-bg border border-border/90 px-3.5 py-2 text-sm font-mono text-accent-neon rounded-lg break-all select-all">
                 {baseUrl}
               </code>
               <button
@@ -270,17 +279,18 @@ export function Endpoint() {
             <div className="flex items-center gap-2">
               <div className="relative flex-1">
                 <input
+                  dir="ltr"
                   type={showToken ? 'text' : 'password'}
                   value={gatewayToken}
                   readOnly
-                  className="w-full bg-bg border border-border/90 px-3.5 py-2 pr-10 font-mono text-sm text-textMain rounded-lg outline-none select-all"
+                  className="w-full bg-bg border border-border/90 px-3.5 py-2 pe-10 font-mono text-sm text-textMain rounded-lg outline-none select-all"
                 />
                 <button
                   type="button"
                   onClick={() => setShowToken((v) => !v)}
                   onMouseDown={(e) => e.preventDefault()}
                   aria-label={showToken ? t('hide_key') : t('show_key')}
-                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-textMuted hover:text-accent-neon p-1 transition-colors cursor-pointer"
+                  className="absolute end-2.5 top-1/2 -translate-y-1/2 text-textMuted hover:text-accent-neon p-1 transition-colors cursor-pointer"
                 >
                   {showToken ? <EyeOff aria-hidden size={16} /> : <Eye aria-hidden size={16} />}
                 </button>
@@ -304,7 +314,7 @@ export function Endpoint() {
         <button
           type="button"
           onClick={() => setIsConfigOpen((v) => !v)}
-          className="flex items-center justify-between w-full p-4 bg-surface/90 border border-border hover:border-accent-neon/50 rounded-xl transition-all text-left cursor-pointer"
+          className="flex items-center justify-between w-full p-4 bg-surface/90 border border-border hover:border-accent-neon/50 rounded-xl transition-all text-start cursor-pointer"
           aria-expanded={isConfigOpen}
         >
           <div className="flex items-center gap-2.5">
@@ -360,7 +370,7 @@ export function Endpoint() {
                   )}
                 </button>
               </div>
-              <pre className="bg-[#080B09] border border-border p-4 text-xs font-mono text-textMain overflow-x-auto whitespace-pre-wrap break-all rounded-lg leading-relaxed shadow-inner">
+              <pre dir="ltr" className="bg-[#080B09] border border-border p-4 text-xs font-mono text-textMain overflow-x-auto whitespace-pre-wrap break-all rounded-lg leading-relaxed shadow-inner">
                 {active.content}
               </pre>
             </div>
@@ -404,7 +414,7 @@ export function Endpoint() {
 
                   {/* Model ID & Name */}
                   <div className="min-w-0 flex-1">
-                    <div className="font-mono text-sm text-textMain font-semibold break-all">{m.id}</div>
+                    <div dir="ltr" className="font-mono text-sm text-textMain font-semibold break-all">{m.id}</div>
                     {m.name && m.name !== m.id ? (
                       <div className="text-xs text-textMuted mt-0.5 truncate">{m.name}</div>
                     ) : null}

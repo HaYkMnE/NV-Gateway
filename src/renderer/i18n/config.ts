@@ -14,7 +14,13 @@ i18n.use(initReactI18next).init({
   },
   lng: 'en', fallbackLng: 'en', interpolation: { escapeValue: false }, returnNull: false
 });
-i18n.on('languageChanged', (language) => { document.documentElement.lang = language; });
+function applyDocumentLanguage(language: string): void {
+  const root = document.documentElement;
+  root.lang = language;
+  root.dir = language.split('-')[0] === 'ar' ? 'rtl' : 'ltr';
+}
+
+i18n.on('languageChanged', applyDocumentLanguage);
 
 // i18next emits `languageChanged` even when changeLanguage is called with the
 // already-active language (verified against the i18next@23 dist source: done()

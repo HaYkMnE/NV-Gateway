@@ -86,13 +86,14 @@ function makeFakeGatewayApi() {
 }
 
 // ── Execute the REAL Layout.tsx with instrumented hooks ────────────────────
-function executeLayout(fakeApi) {
+function executeLayout(fakeApi, translations = {}) {
   const captured = { queryOptions: [], effects: [] };
   const client = new QueryClient();
   const fakeWindow = { electronAPI: fakeApi.api, setTimeout, clearTimeout };
   const fakeDocument = { addEventListener() {}, removeEventListener() {}, visibilityState: 'visible' };
 
   const componentStub = () => null;
+  const renderNode = (type, props) => ({ type, props: props ?? {} });
   const stubs = {
     react: {
       memo: (fn) => fn,
@@ -102,7 +103,7 @@ function executeLayout(fakeApi) {
       useRef: (v) => ({ current: v }),
       useState: (v) => [typeof v === 'function' ? v() : v, () => {}],
     },
-    'react/jsx-runtime': { jsx: () => null, jsxs: () => null, Fragment: {} },
+    'react/jsx-runtime': { jsx: renderNode, jsxs: renderNode, Fragment: 'fragment' },
     'react-router-dom': { Outlet: componentStub, NavLink: componentStub, useNavigate: () => () => {} },
     '@tanstack/react-query': {
       useQuery: (options) => {
@@ -111,7 +112,7 @@ function executeLayout(fakeApi) {
       },
       useQueryClient: () => client,
     },
-    'react-i18next': { useTranslation: () => ({ t: (key) => key }) },
+    'react-i18next': { useTranslation: () => ({ t: (key) => translations[key] ?? key }) },
     // Any icon name resolves to an inert component, robust to icon churn.
     'lucide-react': new Proxy({}, { get: () => componentStub }),
   };
@@ -125,7 +126,8 @@ function executeLayout(fakeApi) {
   };
 
   const relative = 'src/renderer/components/Layout.tsx';
-  const compiled = typescript.transpileModule(read(relative), {
+  const instrumentedSource = `${read(relative)}\nexport { StatusDisplay };\n`;
+  const compiled = typescript.transpileModule(instrumentedSource, {
     compilerOptions: {
       module: typescript.ModuleKind.CommonJS,
       target: typescript.ScriptTarget.ES2020,
@@ -155,8 +157,70 @@ function executeLayout(fakeApi) {
   module.exports.Layout();
   assert.equal(captured.queryOptions.length, 1,
     `Layout must issue exactly ONE useQuery (the gateway-status query); got ${captured.queryOptions.length}`);
-  return { captured, client };
+  return { captured, client, layoutExports: module.exports };
 }
+
+function loadTypeScriptExports(relative) {
+  const compiled = typescript.transpileModule(read(relative), {
+    compilerOptions: {
+      module: typescript.ModuleKind.CommonJS,
+      target: typescript.ScriptTarget.ES2020,
+    },
+  });
+  const module = { exports: {} };
+  vm.runInNewContext(compiled.outputText, { module, exports: module.exports }, { filename: relative });
+  return module.exports;
+}
+
+function renderedText(node) {
+  if (typeof node === 'string' || typeof node === 'number') return String(node);
+  if (Array.isArray(node)) return node.map(renderedText).join(' ');
+  if (!node || typeof node !== 'object') return '';
+  return renderedText(node.props?.children);
+}
+
+function renderedElements(node, type, found = []) {
+  if (Array.isArray(node)) {
+    for (const child of node) renderedElements(child, type, found);
+  } else if (node && typeof node === 'object') {
+    if (node.type === type) found.push(node);
+    renderedElements(node.props?.children, type, found);
+  }
+  return found;
+}
+
+// ── Runtime-exit semantics: truthful copy while preserving Retry ───────────
+test('the error banner renders truthful runtime-exit copy and keeps Retry wired', () => {
+  const fake = makeFakeGatewayApi();
+  const resources = loadTypeScriptExports('src/renderer/i18n/resources.ts');
+  const { layoutExports } = executeLayout(fake, resources.en);
+  let retryCalls = 0;
+  const tree = layoutExports.StatusDisplay({
+    status: { state: 'error', code: 'RUNTIME_EXIT', port: 41191 },
+    gatewayPort: 41191,
+    retrying: false,
+    onRetry: () => { retryCalls += 1; },
+    onChangePort: () => {},
+  });
+  const text = renderedText(tree);
+
+  assert.match(text, /Gateway stopped unexpectedly\./,
+    `runtime exit must not render startup-failure copy; rendered: ${text}`);
+  assert.doesNotMatch(text, /Gateway could not start\./);
+  const retryButton = renderedElements(tree, 'button').find((button) => /Retry/.test(renderedText(button)));
+  assert.ok(retryButton, 'runtime-exit banner must keep the existing Retry action visible');
+  retryButton.props.onClick();
+  assert.equal(retryCalls, 1, 'runtime-exit Retry must invoke the existing handler exactly once');
+});
+
+test('runtime-exit copy exists in all seven locales', () => {
+  const resources = loadTypeScriptExports('src/renderer/i18n/resources.ts');
+  const locales = ['en', 'ru', 'zh', 'es', 'hi', 'fr', 'ar'];
+  for (const locale of locales) {
+    assert.equal(typeof resources[locale].runtime_exit, 'string', `${locale} must define runtime_exit`);
+    assert.ok(resources[locale].runtime_exit.trim().length > 0, `${locale} runtime_exit must not be empty`);
+  }
+});
 
 // ── 1. The query the push feeds: key, 30 s backup poll, reveal pins ────────
 test('Layout executes with the pinned gateway-status query options', () => {
@@ -183,6 +247,42 @@ test('Layout executes with the pinned gateway-status query options', () => {
 });
 
 // ── 2. The subscription: push -> setQueryData, no IPC per push, unsubscribe ──
+test('an older in-flight status fetch cannot overwrite a newer pushed status', async () => {
+  const fake = makeFakeGatewayApi();
+  let resolveFetch;
+  fake.api.getGatewayStatus = async () => {
+    fake.calls.getGatewayStatus += 1;
+    return new Promise((resolve) => { resolveFetch = resolve; });
+  };
+  const { captured, client } = executeLayout(fake);
+  const options = captured.queryOptions[0];
+  const observer = new QueryObserver(client, options);
+  const offObserver = observer.subscribe(() => {});
+  const cleanups = captured.effects.map(({ cb }) => cb());
+
+  try {
+    await tick();
+    assert.equal(fake.calls.getGatewayStatus, 1, 'fixture: one status fetch must be in flight');
+    assert.equal(typeof resolveFetch, 'function', 'fixture: the in-flight fetch resolver must be captured');
+
+    const pushed = { state: 'error', code: 'RUNTIME_EXIT', port: 41191 };
+    fake.emit(pushed);
+    await tick();
+    assert.deepEqual(client.getQueryData(['gateway-status']), pushed,
+      'the newer pushed transition must become authoritative immediately');
+
+    resolveFetch({ state: 'running', port: 41191 });
+    await tick();
+    assert.deepEqual(client.getQueryData(['gateway-status']), pushed,
+      'a stale response from the fetch that predated the push must not roll the renderer back to running');
+  } finally {
+    for (const cleanup of cleanups) if (typeof cleanup === 'function') cleanup();
+    offObserver();
+    observer.destroy();
+    client.clear();
+  }
+});
+
 test('a pushed status lands in the query cache with ZERO IPC round-trips, and unsubscribe detaches', async () => {
   const fake = makeFakeGatewayApi();
   const { captured, client } = executeLayout(fake);

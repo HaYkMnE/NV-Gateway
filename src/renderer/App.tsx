@@ -12,7 +12,7 @@ import { Layout } from './components/Layout';
 import { FeedbackModal } from './components/FeedbackModal';
 import { AboutDialog } from './components/AboutDialog';
 import { DonationModal } from './pet/DonationModal';
-import { ModalContext, type ModalContextValue } from './lib/modal-context';
+import { ModalContext, type ActiveModal, type ModalContextValue, type ModalRequest } from './lib/modal-context';
 import { useConfigStore } from './stores/config';
 import { applyStoredLanguage } from './i18n/config';
 import { reduceHydration } from './lib/frontend-behavior';
@@ -45,12 +45,12 @@ export default function App() {
     dispatchHydration({ type: 'retry' });
     try {
       const state = await window.electronAPI.getRuntimeState();
+      await applyStoredLanguage(state.language);
       hydrate(state);
       queryClient.setQueryData(queryKeys.runtime, state);
       if (state.status) {
         queryClient.setQueryData(['gateway-status'], state.status);
       }
-      await applyStoredLanguage(state.language);
       dispatchHydration({ type: 'resolve' });
     } catch (error) {
       dispatchHydration({ type: 'reject', message: error instanceof Error ? error.message : tRef.current('unknown_error') });
@@ -58,17 +58,59 @@ export default function App() {
   }, [hydrate]);
   useEffect(() => { void retryHydration(); }, [retryHydration]);
 
-  const [aboutDialogOpen, setAboutDialogOpen] = useState(false);
-  const [feedbackModalOpen, setFeedbackModalOpen] = useState(false);
-  const [donationModalOpen, setDonationModalOpen] = useState(false);
+  // Every user request receives a monotonically increasing identity. Delayed
+  // work may open/close only the identity it owns, so an older promise or timer
+  // can never replace or close a newer dialog.
+  const modalRequestRef = useRef<ModalRequest>(0);
+  const [activeModalState, setActiveModalState] = useState<{
+    modal: Exclude<ActiveModal, null>;
+    request: ModalRequest;
+  } | null>(null);
+  const activeModalRef = useRef<typeof activeModalState>(null);
+  const beginModalRequest = useCallback((): ModalRequest => {
+    modalRequestRef.current += 1;
+    return modalRequestRef.current;
+  }, []);
+  const isCurrentModalRequest = useCallback((request: ModalRequest): boolean => (
+    request === modalRequestRef.current
+  ), []);
+  const openModal = useCallback((modal: Exclude<ActiveModal, null>, request?: ModalRequest): boolean => {
+    const ownedRequest = request ?? beginModalRequest();
+    if (ownedRequest !== modalRequestRef.current) return false;
+    const next = { modal, request: ownedRequest };
+    activeModalRef.current = next;
+    setActiveModalState(next);
+    return true;
+  }, [beginModalRequest]);
+  const closeModal = useCallback((expected: Exclude<ActiveModal, null>, request: ModalRequest): void => {
+    const current = activeModalRef.current;
+    if (current?.modal !== expected || current.request !== request || modalRequestRef.current !== request) return;
+    // Revoke ownership synchronously. Async completions can run before React's
+    // close render commits, so clearing state alone is not an ownership fence.
+    modalRequestRef.current += 1;
+    activeModalRef.current = null;
+    setActiveModalState(null);
+  }, []);
+  const openFeedback = useCallback((request?: ModalRequest) => openModal('feedback', request), [openModal]);
+  const openAbout = useCallback((request?: ModalRequest) => openModal('about', request), [openModal]);
+  const openDonation = useCallback((request?: ModalRequest) => openModal('donation', request), [openModal]);
+  const openSendErrors = useCallback((request?: ModalRequest) => openModal('send-errors', request), [openModal]);
+  const activeModal = activeModalState?.modal ?? null;
+  const activeModalRequest = activeModalState?.request ?? null;
 
   const modalValue = useMemo<ModalContextValue>(
     () => ({
-      openFeedback: () => setFeedbackModalOpen(true),
-      openAbout: () => setAboutDialogOpen(true),
-      openDonation: () => setDonationModalOpen(true),
+      activeModal,
+      activeModalRequest,
+      beginModalRequest,
+      isCurrentModalRequest,
+      openFeedback,
+      openAbout,
+      openDonation,
+      openSendErrors,
+      closeModal,
     }),
-    []
+    [activeModal, activeModalRequest, beginModalRequest, closeModal, isCurrentModalRequest, openAbout, openDonation, openFeedback, openSendErrors]
   );
 
   // Donation ascension: nv_pet_vip was persisted by DonationModal; nudge the
@@ -80,13 +122,13 @@ export default function App() {
 
   // Listen for menu-driven navigation events from the main process
   useEffect(() => {
-    const offAbout = window.electronAPI.onNavigateAbout?.(() => setAboutDialogOpen(true));
-    const offFeedback = window.electronAPI.onNavigateFeedback?.(() => setFeedbackModalOpen(true));
+    const offAbout = window.electronAPI.onNavigateAbout?.(() => { openAbout(); });
+    const offFeedback = window.electronAPI.onNavigateFeedback?.(() => { openFeedback(); });
     return () => {
       offAbout?.();
       offFeedback?.();
     };
-  }, []);
+  }, [openAbout, openFeedback]);
 
   // Capture renderer errors and forward them to the main process error log
   useEffect(() => {
@@ -136,9 +178,22 @@ export default function App() {
           </Routes>
         </Router>
       </QueryClientProvider>
-      <FeedbackModal isOpen={feedbackModalOpen} onClose={() => setFeedbackModalOpen(false)} />
-      <AboutDialog isOpen={aboutDialogOpen} onClose={() => setAboutDialogOpen(false)} />
-      <DonationModal open={donationModalOpen} onClose={() => setDonationModalOpen(false)} onAscension={handleAscension} />
+      <FeedbackModal
+        isOpen={activeModal === 'feedback'}
+        session={activeModal === 'feedback' ? activeModalRequest : null}
+        onClose={() => activeModalRequest !== null && closeModal('feedback', activeModalRequest)}
+      />
+      <AboutDialog
+        isOpen={activeModal === 'about'}
+        session={activeModal === 'about' ? activeModalRequest : null}
+        onClose={() => activeModalRequest !== null && closeModal('about', activeModalRequest)}
+      />
+      <DonationModal
+        open={activeModal === 'donation'}
+        session={activeModal === 'donation' ? activeModalRequest : null}
+        onClose={() => activeModalRequest !== null && closeModal('donation', activeModalRequest)}
+        onAscension={handleAscension}
+      />
     </ModalContext.Provider>
   );
 }

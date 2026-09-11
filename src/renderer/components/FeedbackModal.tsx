@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { X } from 'lucide-react';
 import { useDialogFocus } from '../lib/use-dialog-focus';
+import type { ModalRequest } from '../lib/modal-context';
 
 const TITLE_MAX = 100;
 const DESCRIPTION_MAX = 2000;
@@ -12,10 +13,11 @@ const PATH_TOAST_CLOSE_MS = 4000;
 
 interface FeedbackModalProps {
   isOpen: boolean;
+  session: ModalRequest | null;
   onClose: () => void;
 }
 
-export function FeedbackModal({ isOpen, onClose }: FeedbackModalProps) {
+export function FeedbackModal({ isOpen, session, onClose }: FeedbackModalProps) {
   const { t } = useTranslation();
   const [type, setType] = useState<'suggestion' | 'bug'>('suggestion');
   const [title, setTitle] = useState('');
@@ -25,23 +27,45 @@ export function FeedbackModal({ isOpen, onClose }: FeedbackModalProps) {
   const [submitting, setSubmitting] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
+  const isOpenRef = useRef(isOpen);
+  const sessionRef = useRef<ModalRequest | null>(session);
+  const toastTimerRef = useRef<number | null>(null);
+  const closeTimerRef = useRef<number | null>(null);
+  isOpenRef.current = isOpen;
+  sessionRef.current = session;
+
+  const clearTimers = useCallback(() => {
+    if (toastTimerRef.current !== null) {
+      window.clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = null;
+    }
+    if (closeTimerRef.current !== null) {
+      window.clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = null;
+    }
+  }, []);
 
   // Focus-in-on-open, Tab trapping and focus-restore-on-close all live in the
   // ONE shared hook — the dialogRef is handed over, not used directly here.
   useDialogFocus(dialogRef, isOpen);
 
-  // Reset form when opening
+  useEffect(() => clearTimers, [clearTimers]);
+
+  // A request identity is one logical Feedback session. It changes even when
+  // the modal remains visibly open (for example, a native-menu reopen), so the
+  // reset and timer cancellation must follow identity rather than only the
+  // isOpen boolean.
   useEffect(() => {
-    if (isOpen) {
-      setType('suggestion');
-      setTitle('');
-      setDescription('');
-      setEmail('');
-      setAttachDiagnostic(true);
-      setSubmitting(false);
-      setToast(null);
-    }
-  }, [isOpen]);
+    clearTimers();
+    if (!isOpen || session === null) return;
+    setType('suggestion');
+    setTitle('');
+    setDescription('');
+    setEmail('');
+    setAttachDiagnostic(true);
+    setSubmitting(false);
+    setToast(null);
+  }, [isOpen, session, clearTimers]);
 
   // Close on Escape
   useEffect(() => {
@@ -53,10 +77,18 @@ export function FeedbackModal({ isOpen, onClose }: FeedbackModalProps) {
     return () => document.removeEventListener('keydown', handler);
   }, [isOpen, onClose]);
 
-  const showToast = useCallback((message: string) => {
+  const ownsCurrentSession = useCallback((ownedSession: ModalRequest | null): ownedSession is ModalRequest =>
+    ownedSession !== null && isOpenRef.current && ownedSession === sessionRef.current, []);
+
+  const showToast = useCallback((message: string, ownedSession = sessionRef.current) => {
+    if (!ownsCurrentSession(ownedSession)) return;
     setToast(message);
-    window.setTimeout(() => setToast(null), 4000);
-  }, []);
+    if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = window.setTimeout(() => {
+      toastTimerRef.current = null;
+      if (ownsCurrentSession(ownedSession)) setToast(null);
+    }, 4000);
+  }, [ownsCurrentSession]);
 
   const buildData = useCallback((): FeedbackData => ({
     type,
@@ -83,37 +115,48 @@ export function FeedbackModal({ isOpen, onClose }: FeedbackModalProps) {
   // this is wired to must name SAVING rather than sending.
   const handleSave = useCallback(() => {
     if (!validate()) return;
+    const session = sessionRef.current;
     setSubmitting(true);
     window.electronAPI.feedback
       .save(buildData())
       .then((result) => {
+        if (!ownsCurrentSession(session)) return;
         if (result.success) {
           // The whole point of this flow is that the user shares the file
           // themselves, which is impossible unless we say where it landed.
           // `path` is optional on FeedbackResult, so keep the plain confirmation
           // as the fallback rather than rendering "undefined".
-          showToast(result.path ? t('feedback_savedTo', { path: result.path }) : t('feedback_success'));
+          showToast(result.path ? t('feedback_savedTo', { path: result.path }) : t('feedback_success'), session);
           // A path the user cannot finish reading is not a disclosure: give the
           // longer message time on screen before the modal closes itself.
-          window.setTimeout(onClose, result.path ? PATH_TOAST_CLOSE_MS : CLOSE_MS);
+          if (closeTimerRef.current !== null) window.clearTimeout(closeTimerRef.current);
+          closeTimerRef.current = window.setTimeout(() => {
+            closeTimerRef.current = null;
+            if (ownsCurrentSession(session)) onClose();
+          }, result.path ? PATH_TOAST_CLOSE_MS : CLOSE_MS);
         } else {
-          showToast(t('feedback_failed', { message: result.message }));
+          showToast(t('feedback_failed', { message: result.message }), session);
         }
       })
       .catch((error: unknown) => {
-        showToast(t('feedback_failed', { message: error instanceof Error ? error.message : String(error) }));
+        if (!ownsCurrentSession(session)) return;
+        showToast(t('feedback_failed', { message: error instanceof Error ? error.message : String(error) }), session);
       })
-      .finally(() => setSubmitting(false));
-  }, [validate, buildData, showToast, onClose, t]);
+      .finally(() => {
+        if (ownsCurrentSession(session)) setSubmitting(false);
+      });
+  }, [validate, buildData, ownsCurrentSession, showToast, onClose, t]);
 
   const handleGithub = useCallback(() => {
     if (!validate()) return;
+    const session = sessionRef.current;
     window.electronAPI.feedback
       .openGitHubIssue(buildData())
       .catch((error: unknown) => {
-        showToast(t('feedback_failed', { message: error instanceof Error ? error.message : String(error) }));
+        if (!ownsCurrentSession(session)) return;
+        showToast(t('feedback_failed', { message: error instanceof Error ? error.message : String(error) }), session);
       });
-  }, [validate, buildData, showToast, t]);
+  }, [validate, buildData, ownsCurrentSession, showToast, t]);
 
   if (!isOpen) return null;
 
@@ -132,7 +175,7 @@ export function FeedbackModal({ isOpen, onClose }: FeedbackModalProps) {
           <h2 className="text-xl font-bold">{t('feedback_title')}</h2>
           <button
             onClick={onClose}
-            aria-label={t('close_menu')}
+            aria-label={t('feedback_closeDialog')}
             className="p-1 text-textMuted hover:text-accent-neon"
           >
             <X aria-hidden size={20} />
@@ -210,6 +253,7 @@ export function FeedbackModal({ isOpen, onClose }: FeedbackModalProps) {
           </label>
           <input
             id="feedback-email"
+            dir="ltr"
             type="email"
             value={email}
             onChange={(e) => setEmail(e.target.value)}

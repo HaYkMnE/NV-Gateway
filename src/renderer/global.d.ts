@@ -106,7 +106,7 @@ interface RuntimeState extends AppConfig { status: GatewayStatus; version: strin
 interface GatewayStatus {
   state: 'stopped' | 'starting' | 'running' | 'error';
   port?: number;
-  code?: 'PORT_IN_USE' | 'START_FAILED';
+  code?: 'PORT_IN_USE' | 'START_FAILED' | 'RUNTIME_EXIT';
   message?: string;
 }
 

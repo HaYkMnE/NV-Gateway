@@ -193,6 +193,14 @@ function close(server) {
   return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 }
 
+async function waitFor(predicate, timeoutMs = 1_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error('Timed out waiting for lifecycle condition.');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 async function assertPairAvailable(port) {
   const gateway = http.createServer();
   const admin = http.createServer();
@@ -230,7 +238,9 @@ function fakeChild({
   attestation,
   earlyAttestation = false,
   exitOnGracefulKill = true,
-  exitOnForcedKill = true
+  exitOnForcedKill = true,
+  stateInitCallback,
+  stateInitSend
 }) {
   const child = new EventEmitter();
   const servers = [];
@@ -269,9 +279,12 @@ function fakeChild({
     }
     return true;
   };
-  child.send = (message) => {
+  child.send = (message, callback) => {
     if (message?.type !== 'state:init' || listenersStarted) return;
+    if (stateInitSend) return stateInitSend(message, callback);
     listenersStarted = true;
+    if (stateInitCallback) stateInitCallback(callback);
+    else callback?.(null);
     const gateway = http.createServer((_request, response) => { response.writeHead(gatewayHealth()); response.end(); });
     const admin = http.createServer((_request, response) => { response.writeHead(404); response.end(); });
     servers.push(gateway, admin);
@@ -293,7 +306,86 @@ function fakeChild({
     if (earlyAttestation) child.emit('message', { type: 'ports:bound', challenge, gatewayPort: port, adminPort: port + 1 });
     child.emit('message', { type: 'ready', challenge });
   };
+  child.resetForReuse = () => {
+    child.exitCode = null;
+    child.killed = false;
+    child.connected = true;
+    child.exitPromise = undefined;
+    child.exitError = null;
+    listenersStarted = false;
+  };
   return child;
+}
+
+function installExternalListenerBaseline(child) {
+  const listeners = {
+    error: () => {},
+    exit: () => {},
+    message: () => {},
+    stdout: () => {},
+    stderr: () => {}
+  };
+  child.on('error', listeners.error);
+  child.on('exit', listeners.exit);
+  child.on('message', listeners.message);
+  child.stdout.on('data', listeners.stdout);
+  child.stderr.on('data', listeners.stderr);
+  return {
+    counts: lifecycleListenerCounts(child),
+    dispose() {
+      child.removeListener('error', listeners.error);
+      child.removeListener('exit', listeners.exit);
+      child.removeListener('message', listeners.message);
+      child.stdout.removeListener('data', listeners.stdout);
+      child.stderr.removeListener('data', listeners.stderr);
+    }
+  };
+}
+
+function lifecycleListenerCounts(child) {
+  return {
+    error: child.listenerCount('error'),
+    exit: child.listenerCount('exit'),
+    message: child.listenerCount('message'),
+    stdoutData: child.stdout.listenerCount('data'),
+    stderrData: child.stderr.listenerCount('data')
+  };
+}
+
+function assertLifecycleListenersAttached(child, baseline) {
+  assert.deepEqual(lifecycleListenerCounts(child), {
+    error: baseline.error + 1,
+    exit: baseline.exit + 1,
+    message: baseline.message + 2,
+    stdoutData: baseline.stdoutData + 1,
+    stderrData: baseline.stderrData + 1
+  });
+}
+
+function assertLifecycleListenersRestored(child, baseline) {
+  assert.deepEqual(lifecycleListenerCounts(child), baseline);
+}
+
+async function assertDetachedEventsAreInert(child, instance, persisted, emitted) {
+  const statusBefore = instance.getStatus();
+  const outputBefore = instance.output;
+  const persistedBefore = persisted.length;
+  const emittedBefore = emitted.length;
+  child.emit('message', { type: 'state:persist', state: { keys: [] } });
+  child.emit('message', {
+    type: 'ports:bound',
+    challenge: 'test-child-challenge-0123456789',
+    gatewayPort: 1,
+    adminPort: 2
+  });
+  child.stdout.emit('data', 'stale stdout');
+  child.stderr.emit('data', 'stale stderr');
+  child.emit('error', new Error('stale child error'));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(instance.getStatus(), statusBefore, 'stale child events must not change lifecycle status');
+  assert.equal(instance.output, outputBefore, 'stale child streams must not change captured output');
+  assert.equal(persisted.length, persistedBefore, 'stale child IPC must not persist state');
+  assert.equal(emitted.length, emittedBefore, 'stale child events must not emit lifecycle status');
 }
 
 test('fake child exposes exit only after both bound listeners close', async () => {
@@ -406,6 +498,554 @@ test('accepts a live child only after it attests the exact paired ports', async 
   assert.deepEqual(await instance.start(port), { state: 'running', port });
   assert.deepEqual(await instance.stop(), { state: 'stopped' });
   assert.equal(child.killCalls, 1);
+});
+
+test('running stop emits no runtime-exit status', async () => {
+  const port = await freePortPair();
+  const child = fakeChild({ port });
+  const emitted = [];
+  const { instance } = await createLifecycle(port, child, {
+    onStatusChange: (status) => emitted.push(status)
+  });
+
+  assert.deepEqual(await instance.start(port), { state: 'running', port });
+  assert.deepEqual(await instance.stop(), { state: 'stopped' });
+  assert.equal(emitted.filter((status) => status.code === 'RUNTIME_EXIT').length, 0);
+});
+
+test('duplicate same-port start is idempotent and does not preflight or corrupt running status', async () => {
+  const port = await freePortPair();
+  const child = fakeChild({ port });
+  const emitted = [];
+  let preflightCalls = 0;
+  const { instance, paths } = await createLifecycle(port, child, {
+    onStatusChange: (status) => emitted.push(status)
+  });
+
+  try {
+    assert.deepEqual(await instance.start(port), { state: 'running', port });
+    instance.preflight = async () => {
+      preflightCalls += 1;
+      return { state: 'error', code: 'PORT_IN_USE', port, message: 'must not run' };
+    };
+
+    assert.deepEqual(await instance.start(port), { state: 'running', port });
+    assert.equal(preflightCalls, 0, 'a managed same-port start must not probe its own occupied ports');
+    assert.deepEqual(instance.getStatus(), { state: 'running', port });
+    assert.equal(instance.child, child);
+    assert.equal(fs.existsSync(paths.ownerPath), true);
+    assert.equal(emitted.filter((status) => status.code === 'PORT_IN_USE').length, 0);
+  } finally {
+    await instance.stop();
+    await child.exit();
+  }
+});
+
+test('duplicate different-port start rejects without changing authoritative running status or owner', async () => {
+  const port = await freePortPair();
+  const differentPort = await freePortPair();
+  const child = fakeChild({ port });
+  const emitted = [];
+  const { instance, paths } = await createLifecycle(port, child, {
+    onStatusChange: (status) => emitted.push(status)
+  });
+
+  try {
+    assert.deepEqual(await instance.start(port), { state: 'running', port });
+    const ownerBefore = fs.readFileSync(paths.ownerPath, 'utf8');
+    assert.deepEqual(await instance.start(differentPort), {
+      state: 'error',
+      code: 'START_FAILED',
+      port: differentPort,
+      message: 'Gateway is already managed by this application.'
+    });
+    assert.deepEqual(instance.getStatus(), { state: 'running', port });
+    assert.equal(instance.child, child);
+    assert.equal(instance.managedPort, port);
+    assert.equal(fs.readFileSync(paths.ownerPath, 'utf8'), ownerBefore);
+    assert.equal(emitted.at(-1)?.state, 'running', 'rejected presentation result must not be broadcast as authoritative state');
+  } finally {
+    await instance.stop();
+    await child.exit();
+  }
+});
+
+for (const [name, stateInitSend] of [
+  ['synchronous state-init serialization failure', (message) => JSON.stringify(message)],
+  ['asynchronous state-init callback failure', (_message, callback) => { setImmediate(() => callback(new Error('private callback detail'))); return true; }]
+]) {
+  test(`${name} resolves startup failure without escaping or retaining false channel state`, async () => {
+    const port = await freePortPair();
+    const child = fakeChild({ port, stateInitSend });
+    const { instance, paths } = await createLifecycle(port, child, {
+      initialState: {
+        keys: [],
+        credentials: { gatewayToken: 'fixture-gateway-token', adminToken: 'fixture-admin-token' },
+        allowedExtra: 1n
+      }
+    });
+
+    const status = await instance.start(port);
+
+    assert.equal(status.state, 'error');
+    assert.equal(status.code, 'START_FAILED');
+    assert.equal(status.message.includes('private callback detail'), false);
+    assert.equal(status.message.includes('BigInt'), false);
+    assert.equal(instance.child, null);
+    assert.equal(instance.managedPort, null);
+    assert.equal(fs.existsSync(paths.ownerPath), false);
+    assert.equal(child.exitCode, 0);
+  });
+}
+
+test('delayed state-init delivery failure cannot commit a healthy attested child as running', async () => {
+  const port = await freePortPair();
+  let callbackFired = false;
+  const child = fakeChild({
+    port,
+    stateInitCallback: (callback) => setTimeout(() => {
+      callbackFired = true;
+      callback(new Error('delayed private callback detail'));
+    }, 50)
+  });
+  const emitted = [];
+  const { instance, paths } = await createLifecycle(port, child, {
+    startupTimeoutMs: 500,
+    onStatusChange: (status) => emitted.push(status)
+  });
+
+  try {
+    const status = await instance.start(port);
+
+    assert.equal(callbackFired, true, 'startup must await confirmation that state:init was delivered');
+    assert.equal(status.state, 'error');
+    assert.equal(status.code, 'START_FAILED');
+    assert.equal(status.message.includes('delayed private callback detail'), false);
+    assert.equal(emitted.some((candidate) => candidate.state === 'running'), false);
+    assert.equal(instance.child, null);
+    assert.equal(instance.managedPort, null);
+    assert.equal(fs.existsSync(paths.ownerPath), false);
+    assert.equal(child.exitCode, 0);
+  } finally {
+    await instance.stop();
+    await child.exit();
+  }
+});
+
+test('stop without a tracked child preserves a foreign owner record and external gateway', async () => {
+  const port = await freePortPair();
+  const child = fakeChild({ port });
+  const { instance, paths } = await createLifecycle(port, child);
+  const foreignOwner = JSON.stringify({
+    pid: 999999,
+    ownerIdHash: 'f'.repeat(64),
+    executablePath: 'foreign.exe',
+    serverPath: 'foreign-server.mjs',
+    createdAt: 'foreign-owner',
+    gatewayPort: port,
+    adminPort: port + 1
+  });
+  const external = http.createServer((_request, response) => { response.writeHead(200); response.end('external'); });
+  fs.writeFileSync(paths.ownerPath, foreignOwner);
+  await listen(external, port);
+
+  try {
+    assert.deepEqual(await instance.stop(), { state: 'stopped' });
+    assert.equal(fs.readFileSync(paths.ownerPath, 'utf8'), foreignOwner);
+    assert.equal(await new Promise((resolve, reject) => {
+      http.get(`http://127.0.0.1:${port}/health`, (response) => {
+        response.resume();
+        response.once('end', () => resolve(response.statusCode));
+      }).once('error', reject);
+    }), 200);
+  } finally {
+    await close(external);
+    fs.rmSync(paths.ownerPath, { force: true });
+  }
+});
+
+test('intentional stop restores every lifecycle-owned child listener and stale events are inert', async () => {
+  const port = await freePortPair();
+  const child = fakeChild({ port });
+  const external = installExternalListenerBaseline(child);
+  const persisted = [];
+  const emitted = [];
+  const { instance } = await createLifecycle(port, child, {
+    persistState: (state) => persisted.push(state),
+    onStatusChange: (status) => emitted.push(status)
+  });
+
+  try {
+    assert.deepEqual(await instance.start(port), { state: 'running', port });
+    assertLifecycleListenersAttached(child, external.counts);
+    assert.deepEqual(await instance.stop(), { state: 'stopped' });
+    assertLifecycleListenersRestored(child, external.counts);
+    await assertDetachedEventsAreInert(child, instance, persisted, emitted);
+  } finally {
+    external.dispose();
+    await child.exit();
+  }
+});
+
+test('genuine runtime exit restores every lifecycle-owned child listener and stale events are inert', async () => {
+  const port = await freePortPair();
+  const child = fakeChild({ port });
+  const external = installExternalListenerBaseline(child);
+  const persisted = [];
+  const emitted = [];
+  const { instance } = await createLifecycle(port, child, {
+    persistState: (state) => persisted.push(state),
+    onStatusChange: (status) => emitted.push(status)
+  });
+
+  try {
+    assert.deepEqual(await instance.start(port), { state: 'running', port });
+    assertLifecycleListenersAttached(child, external.counts);
+    await child.exit();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(instance.getStatus().code, 'RUNTIME_EXIT');
+    assertLifecycleListenersRestored(child, external.counts);
+    await assertDetachedEventsAreInert(child, instance, persisted, emitted);
+  } finally {
+    external.dispose();
+    await child.exit();
+  }
+});
+
+test('late exit after unconfirmed stop restores every lifecycle-owned child listener', async () => {
+  const port = await freePortPair();
+  const child = fakeChild({ port, exitOnGracefulKill: false, exitOnForcedKill: false });
+  const external = installExternalListenerBaseline(child);
+  const persisted = [];
+  const emitted = [];
+  const { instance } = await createLifecycle(port, child, {
+    shutdownTimeoutMs: 10,
+    forcedShutdownTimeoutMs: 10,
+    persistState: (state) => persisted.push(state),
+    onStatusChange: (status) => emitted.push(status)
+  });
+
+  try {
+    assert.deepEqual(await instance.start(port), { state: 'running', port });
+    assert.equal((await instance.stop()).message, 'Managed gateway child shutdown could not be confirmed.');
+    await child.exit();
+    await new Promise((resolve) => setImmediate(resolve));
+    assertLifecycleListenersRestored(child, external.counts);
+    await assertDetachedEventsAreInert(child, instance, persisted, emitted);
+  } finally {
+    external.dispose();
+    await child.exit();
+  }
+});
+
+test('confirmed startup failure restores every lifecycle-owned child listener', async () => {
+  const port = await freePortPair();
+  const child = fakeChild({ port, attest: false });
+  const external = installExternalListenerBaseline(child);
+  const persisted = [];
+  const emitted = [];
+  const { instance } = await createLifecycle(port, child, {
+    persistState: (state) => persisted.push(state),
+    onStatusChange: (status) => emitted.push(status)
+  });
+
+  try {
+    const status = await instance.start(port);
+    assert.equal(status.code, 'START_FAILED');
+    assertLifecycleListenersRestored(child, external.counts);
+    await assertDetachedEventsAreInert(child, instance, persisted, emitted);
+  } finally {
+    external.dispose();
+    await child.exit();
+  }
+});
+
+test('confirmed protocol-violation cleanup restores every lifecycle-owned child listener', async () => {
+  const port = await freePortPair();
+  const child = fakeChild({ port });
+  const external = installExternalListenerBaseline(child);
+  const persisted = [];
+  const emitted = [];
+  const { instance } = await createLifecycle(port, child, {
+    persistState: (state) => persisted.push(state),
+    onStatusChange: (status) => emitted.push(status)
+  });
+
+  try {
+    assert.deepEqual(await instance.start(port), { state: 'running', port });
+    child.emit('message', {
+      type: 'ports:bound',
+      challenge: 'test-child-challenge-0123456789',
+      gatewayPort: port,
+      adminPort: port + 1
+    });
+    await waitFor(() => instance.getStatus().message === 'Gateway lifecycle protocol violation.');
+    assertLifecycleListenersRestored(child, external.counts);
+    await assertDetachedEventsAreInert(child, instance, persisted, emitted);
+  } finally {
+    external.dispose();
+    await child.exit();
+  }
+});
+
+test('three start-stop cycles reusing one child restore listener baselines without growth', async () => {
+  const port = await freePortPair();
+  const child = fakeChild({ port });
+  const external = installExternalListenerBaseline(child);
+  const { instance } = await createLifecycle(port, child);
+
+  try {
+    for (let cycle = 1; cycle <= 3; cycle += 1) {
+      assert.deepEqual(await instance.start(port), { state: 'running', port }, `cycle ${cycle} must start`);
+      assertLifecycleListenersAttached(child, external.counts);
+      assert.deepEqual(await instance.stop(), { state: 'stopped' }, `cycle ${cycle} must stop`);
+      assertLifecycleListenersRestored(child, external.counts);
+      if (cycle < 3) child.resetForReuse();
+    }
+  } finally {
+    external.dispose();
+    await child.exit();
+  }
+});
+
+test('running retry replaces one child without emitting a runtime-exit status', async () => {
+  const port = await freePortPair();
+  const firstChild = fakeChild({ port });
+  const replacementChild = fakeChild({ port });
+  const children = [firstChild, replacementChild];
+  const emitted = [];
+  let spawnIndex = 0;
+  const { instance } = await createLifecycle(port, firstChild, {
+    onStatusChange: (status) => emitted.push(status),
+    spawnChild: () => {
+      const child = children[spawnIndex++];
+      assert.ok(child, 'retry must not spawn more than one replacement child');
+      setImmediate(() => child.emitReady());
+      return child;
+    }
+  });
+
+  assert.deepEqual(await instance.start(port), { state: 'running', port });
+  assert.deepEqual(await instance.retry(port), { state: 'running', port });
+  assert.equal(spawnIndex, 2, 'retry must start exactly one replacement child');
+  assert.deepEqual(await instance.stop(), { state: 'stopped' });
+  assert.equal(emitted.filter((status) => status.code === 'RUNTIME_EXIT').length, 0);
+});
+
+test('failed running-child shutdown blocks replacement, cleans up on late exit, and permits isolated recovery', async () => {
+  const port = await freePortPair();
+  const unresponsiveChild = fakeChild({ port, exitOnGracefulKill: false, exitOnForcedKill: false });
+  const replacementChild = fakeChild({ port });
+  const children = [unresponsiveChild, replacementChild];
+  const emitted = [];
+  let spawnIndex = 0;
+  const { instance, paths } = await createLifecycle(port, unresponsiveChild, {
+    shutdownTimeoutMs: 10,
+    forcedShutdownTimeoutMs: 10,
+    onStatusChange: (status) => emitted.push(status),
+    spawnChild: () => {
+      const child = children[spawnIndex++];
+      assert.ok(child, 'failed shutdown and recovery must spawn only the expected children');
+      setImmediate(() => child.emitReady());
+      return child;
+    }
+  });
+
+  try {
+    assert.deepEqual(await instance.start(port), { state: 'running', port });
+    assert.equal(fs.existsSync(paths.ownerPath), true);
+
+    assert.deepEqual(await instance.retry(port), {
+      state: 'error',
+      code: 'START_FAILED',
+      port,
+      message: 'Managed gateway child shutdown could not be confirmed.'
+    });
+    assert.equal(spawnIndex, 1, 'retry must not spawn while the old child shutdown is unconfirmed');
+    assert.equal(emitted.filter((status) => status.code === 'RUNTIME_EXIT').length, 0);
+
+    await unresponsiveChild.exit();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(instance.child, null);
+    assert.equal(instance.managedPort, null);
+    assert.equal(fs.existsSync(paths.ownerPath), false);
+
+    assert.deepEqual(await instance.retry(port), { state: 'running', port });
+    assert.equal(spawnIndex, 2, 'recovery must spawn exactly one replacement');
+    replacementChild.emit('error', new Error('replacement runtime failure'));
+    await replacementChild.exit();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const runtimeExits = emitted.filter((status) => status.code === 'RUNTIME_EXIT');
+    assert.equal(runtimeExits.length, 1);
+    assert.match(runtimeExits[0].message, /replacement runtime failure/);
+    assert.equal(instance.child, null);
+    assert.equal(instance.managedPort, null);
+    assert.equal(fs.existsSync(paths.ownerPath), false);
+  } finally {
+    await unresponsiveChild.exit();
+    await replacementChild.exit();
+  }
+});
+
+test('post-readiness exit before final startup commitment emits START_FAILED and no runtime-exit status', async () => {
+  const port = await freePortPair();
+  const child = fakeChild({ port });
+  const emitted = [];
+  const { instance } = await createLifecycle(port, child, {
+    onStatusChange: (status) => emitted.push(status),
+    afterOwnerRecordWrite: () => child.exit()
+  });
+
+  const status = await instance.start(port);
+
+  assert.equal(status.state, 'error');
+  assert.equal(status.code, 'START_FAILED');
+  assert.equal(emitted.filter((candidate) => candidate.code === 'RUNTIME_EXIT').length, 0);
+});
+
+test('exit during the final ownership health request cannot commit running', async () => {
+  const port = await freePortPair();
+  const emitted = [];
+  let healthRequests = 0;
+  let child;
+  child = fakeChild({ port, gatewayHealth: () => {
+    healthRequests += 1;
+    if (healthRequests === 3) {
+      child.connected = false;
+      child.exitCode = 0;
+      child.emit('exit', 0, null);
+    }
+    return 200;
+  } });
+  const { instance, paths } = await createLifecycle(port, child, {
+    onStatusChange: (status) => emitted.push(status)
+  });
+
+  try {
+    const status = await instance.start(port);
+
+    assert.equal(healthRequests, 3, 'the child must exit from inside the final ownership HTTP request');
+    assert.equal(status.state, 'error');
+    assert.equal(status.code, 'START_FAILED');
+    assert.equal(emitted.filter((candidate) => candidate.code === 'START_FAILED').length, 1);
+    assert.equal(emitted.filter((candidate) => candidate.code === 'RUNTIME_EXIT').length, 0);
+    assert.equal(instance.child, null);
+    assert.equal(instance.managedPort, null);
+    assert.equal(fs.existsSync(paths.ownerPath), false);
+  } finally {
+    await child.exit();
+  }
+});
+
+test('two live-child errors retain ownership until exit, emit once, and detach listeners', async () => {
+  const port = await freePortPair();
+  const child = fakeChild({ port });
+  const emitted = [];
+  const { instance, paths } = await createLifecycle(port, child, {
+    onStatusChange: (status) => emitted.push(status)
+  });
+
+  try {
+    assert.deepEqual(await instance.start(port), { state: 'running', port });
+    assert.equal(child.listenerCount('error'), 1);
+    assert.doesNotThrow(() => {
+      child.emit('error', new Error('first nonterminal runtime failure'));
+      child.emit('error', new Error('second nonterminal runtime failure'));
+    });
+
+    assert.equal(child.exitCode, null);
+    assert.equal(child.listenerCount('error'), 1);
+    assert.equal(instance.child, child);
+    assert.equal(instance.managedPort, port);
+    assert.equal(fs.existsSync(paths.ownerPath), true);
+    assert.deepEqual(instance.getStatus(), { state: 'running', port });
+    assert.equal(emitted.filter((status) => status.code === 'RUNTIME_EXIT').length, 0);
+
+    await child.exit();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const runtimeExits = emitted.filter((status) => status.code === 'RUNTIME_EXIT');
+    assert.equal(runtimeExits.length, 1);
+    assert.match(runtimeExits[0].message, /second nonterminal runtime failure/);
+    assert.deepEqual(instance.getStatus(), runtimeExits[0]);
+    assert.equal(instance.child, null);
+    assert.equal(instance.managedPort, null);
+    assert.equal(fs.existsSync(paths.ownerPath), false);
+    assert.equal(child.listenerCount('error'), 0);
+    assert.equal(child.listenerCount('exit'), 0);
+  } finally {
+    await child.exit();
+  }
+});
+
+test('two pre-commit errors remain handled and later exit reports exactly once', async () => {
+  const port = await freePortPair();
+  const child = fakeChild({ port });
+  const emitted = [];
+  let listenerCountAfterErrors = -1;
+  const { instance, paths } = await createLifecycle(port, child, {
+    onStatusChange: (status) => emitted.push(status),
+    afterOwnerRecordWrite: () => {
+      child.emit('error', new Error('first pre-commit failure'));
+      child.emit('error', new Error('second pre-commit failure'));
+      listenerCountAfterErrors = child.listenerCount('error');
+    }
+  });
+
+  try {
+    assert.deepEqual(await instance.start(port), { state: 'running', port });
+    assert.equal(listenerCountAfterErrors, 1);
+    assert.equal(instance.child, child);
+    assert.equal(instance.managedPort, port);
+    assert.equal(fs.existsSync(paths.ownerPath), true);
+    assert.equal(emitted.filter((status) => status.code === 'RUNTIME_EXIT').length, 0);
+
+    await child.exit();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const runtimeExits = emitted.filter((status) => status.code === 'RUNTIME_EXIT');
+    assert.equal(runtimeExits.length, 1);
+    assert.match(runtimeExits[0].message, /second pre-commit failure/);
+    assert.equal(child.listenerCount('error'), 0);
+    assert.equal(child.listenerCount('exit'), 0);
+  } finally {
+    await child.exit();
+  }
+});
+
+test('per-child stop and startup intent clears across retry failure and recovery', async () => {
+  const port = await freePortPair();
+  const firstChild = fakeChild({ port });
+  const failedReplacement = fakeChild({ port, attest: false });
+  const recoveredChild = fakeChild({ port });
+  const children = [firstChild, failedReplacement, recoveredChild];
+  const emitted = [];
+  let spawnIndex = 0;
+  const { instance } = await createLifecycle(port, firstChild, {
+    onStatusChange: (status) => emitted.push(status),
+    spawnChild: () => {
+      const child = children[spawnIndex++];
+      assert.ok(child, 'retry sequence must not spawn an extra child');
+      setImmediate(() => child.emitReady());
+      return child;
+    }
+  });
+
+  assert.deepEqual(await instance.start(port), { state: 'running', port });
+  const failed = await instance.retry(port);
+  assert.equal(failed.state, 'error');
+  assert.equal(failed.code, 'START_FAILED');
+  assert.equal(emitted.filter((status) => status.code === 'RUNTIME_EXIT').length, 0);
+
+  assert.deepEqual(await instance.retry(port), { state: 'running', port });
+  assert.equal(spawnIndex, 3);
+  await recoveredChild.exit();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(emitted.filter((status) => status.code === 'RUNTIME_EXIT').length, 1,
+    'the recovered child must retain independent unexpected-exit reporting');
 });
 
 test('rejects a paired-port attestation that includes an extra own property', async () => {
@@ -649,6 +1289,75 @@ test('shuts down a running child when it sends a duplicate attestation', async (
   assert.equal(fs.existsSync(paths.ownerPath), false);
   assert.equal(instance.child, null);
   assert.equal(instance.managedPort, null);
+});
+
+test('protocol-violation late exit clears only its exact owner record once', async () => {
+  const port = await freePortPair();
+  const child = fakeChild({ port, exitOnGracefulKill: false, exitOnForcedKill: false });
+  const { instance, paths } = await createLifecycle(port, child, {
+    shutdownTimeoutMs: 10,
+    forcedShutdownTimeoutMs: 10
+  });
+
+  try {
+    assert.deepEqual(await instance.start(port), { state: 'running', port });
+    child.emit('message', {
+      type: 'ports:bound',
+      challenge: 'test-child-challenge-0123456789',
+      gatewayPort: port,
+      adminPort: port + 1
+    });
+    await waitFor(() => instance.getStatus().message?.includes('shutdown could not be confirmed') === true);
+
+    const originalOwner = fs.readFileSync(paths.ownerPath, 'utf8');
+    const replacementOwner = JSON.stringify({
+      ...JSON.parse(originalOwner),
+      ownerIdHash: 'a'.repeat(64),
+      createdAt: 'replacement-owner'
+    });
+    fs.writeFileSync(`${paths.ownerPath}.tmp`, originalOwner);
+    fs.writeFileSync(paths.ownerPath, replacementOwner);
+
+    await child.exit();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(fs.existsSync(`${paths.ownerPath}.tmp`), false, 'the exact failed owner must be cleared');
+    assert.equal(fs.readFileSync(paths.ownerPath, 'utf8'), replacementOwner, 'a replacement owner must survive stale cleanup');
+    assert.equal(instance.child, null);
+    assert.equal(instance.managedPort, null);
+
+    child.emit('exit', 0, null);
+    assert.equal(fs.readFileSync(paths.ownerPath, 'utf8'), replacementOwner, 'late cleanup must run only once');
+  } finally {
+    await child.exit();
+    fs.rmSync(paths.ownerPath, { force: true });
+    fs.rmSync(`${paths.ownerPath}.tmp`, { force: true });
+  }
+});
+
+test('rejected second start cannot redirect owner cleanup away from the managed port', async () => {
+  const oldPort = await freePortPair();
+  const newPort = await freePortPair();
+  const child = fakeChild({ port: oldPort });
+  const { instance, paths } = await createLifecycle(oldPort, child);
+
+  try {
+    assert.deepEqual(await instance.start(oldPort), { state: 'running', port: oldPort });
+    assert.deepEqual(await instance.start(newPort), {
+      state: 'error',
+      code: 'START_FAILED',
+      port: newPort,
+      message: 'Gateway is already managed by this application.'
+    });
+    assert.equal(instance.child, child);
+    assert.equal(instance.managedPort, oldPort);
+    assert.equal(fs.existsSync(paths.ownerPath), true);
+
+    assert.deepEqual(await instance.stop(), { state: 'stopped' });
+    assert.equal(fs.existsSync(paths.ownerPath), false);
+  } finally {
+    await child.exit();
+  }
 });
 
 test('keeps a child with one valid minimal attestation running', async () => {

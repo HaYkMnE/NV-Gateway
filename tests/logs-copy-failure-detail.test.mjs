@@ -134,18 +134,16 @@ test('every string the failure message composes exists in all 7 locales', () => 
   }
 });
 
-test('this fix adds no i18n key of its own; every locale stays key-complete at 302', () => {
-  // Composing existing localized strings kept this fix key-free. The count is
-  // 301 + 1 for the later Models label-chip fix (models_label_usecase_text_gen)
-  // — tests/frontend-defects.test.mjs owns that key; this file only keeps the
-  // sibling parity guard in sync (the original "no new key" discipline stands:
-  // composing here avoided shipping machine-translated English).
+test('this fix adds no i18n key of its own; every locale stays key-complete at 306', () => {
+  // Composing existing localized strings kept this fix key-free. The shared
+  // locale baseline later grew to 306 for runtime_exit and three contextual
+  // dialog close labels; this sibling guard tracks the complete contract.
   const exports_ = loadTypeScriptExports('src/renderer/i18n/resources.ts');
   const enKeys = Object.keys(exports_.en);
-  assert.equal(enKeys.length, 302, 'EN must hold 302 keys');
+  assert.equal(enKeys.length, 306, 'EN must hold 306 keys');
   for (const locale of LOCALE_NAMES) {
     const keys = Object.keys(exports_[locale]);
-    assert.equal(keys.length, 302, `${locale} must hold 302 keys`);
+    assert.equal(keys.length, 306, `${locale} must hold 306 keys`);
     assert.deepEqual(enKeys.filter((k) => !keys.includes(k)), [], `${locale} is missing keys`);
   }
 });

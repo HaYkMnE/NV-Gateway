@@ -71,9 +71,13 @@ test('observe() is fed by real request outcomes and drives the auto day->night t
       GATEWAY_TEST_LOCAL_UPSTREAM_PORT: String(upstream.address().port),
       PORT: String(port)
     },
-    stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     windowsHide: true
   });
+  const childStdout = [];
+  const childStderr = [];
+  child.stdout.on('data', (chunk) => childStdout.push(chunk));
+  child.stderr.on('data', (chunk) => childStderr.push(chunk));
 
   try {
     child.once('message', (message) => {
@@ -86,9 +90,22 @@ test('observe() is fed by real request outcomes and drives the auto day->night t
       }
     });
 
-    await waitFor(async () => {
-      try { return (await request(port, '/health')).statusCode === 200; } catch { return false; }
-    }, 20_000, 25);
+    const startup = await Promise.race([
+      waitForMessage(child, (message) => message?.type === 'ports:bound', 20_000),
+      waitForExit(child).then(({ code, signal }) => {
+        throw new Error(`gateway child exited before binding ports (code=${code}, signal=${signal ?? 'none'})`);
+      })
+    ]).catch((error) => {
+      const diagnostics = formatChildDiagnostics(childStdout, childStderr);
+      throw new Error(`${error.message}${diagnostics}`, { cause: error });
+    });
+    assert.equal(startup.gatewayPort, port);
+    assert.equal(startup.adminPort, port + 1);
+    const health = await request(port, '/health').catch((error) => {
+      const diagnostics = formatChildDiagnostics(childStdout, childStderr);
+      throw new Error(`gateway refused health request after ports:bound: ${error.message}${diagnostics}`, { cause: error });
+    });
+    assert.equal(health.statusCode, 200, `gateway must report ready after ports:bound (got ${health.statusCode}: ${health.body})`);
 
     // Drive 17 real proxied requests. The transition is evaluated on resolve()
     // at request start, so the 17th request observes the window filled by the
@@ -269,12 +286,66 @@ async function waitFor(predicate, timeoutMs = 10_000, intervalMs = 50) {
 
 async function freePort() {
   while (true) {
-    const probe = http.createServer();
-    await new Promise((resolve) => probe.listen(0, '127.0.0.1', resolve));
-    const port = probe.address().port;
-    await new Promise((resolve) => probe.close(resolve));
-    if (port < 65534) return port;
+    const gatewayProbe = http.createServer();
+    await new Promise((resolve, reject) => {
+      gatewayProbe.once('error', reject);
+      gatewayProbe.listen(0, '127.0.0.1', resolve);
+    });
+    const port = gatewayProbe.address().port;
+    if (port >= 65534) {
+      await new Promise((resolve) => gatewayProbe.close(resolve));
+      continue;
+    }
+
+    const adminProbe = http.createServer();
+    try {
+      await new Promise((resolve, reject) => {
+        adminProbe.once('error', reject);
+        adminProbe.listen(port + 1, '127.0.0.1', resolve);
+      });
+    } catch {
+      await new Promise((resolve) => gatewayProbe.close(resolve));
+      continue;
+    }
+
+    await Promise.all([
+      new Promise((resolve) => gatewayProbe.close(resolve)),
+      new Promise((resolve) => adminProbe.close(resolve))
+    ]);
+    return port;
   }
+}
+
+function waitForMessage(child, predicate, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error(`timed out after ${timeoutMs}ms waiting for gateway ports:bound`));
+    }, timeoutMs);
+    const onMessage = (message) => {
+      if (!predicate(message)) return;
+      cleanup();
+      resolve(message);
+    };
+    const cleanup = () => {
+      clearTimeout(timeout);
+      child.removeListener('message', onMessage);
+    };
+    child.on('message', onMessage);
+  });
+}
+
+function waitForExit(child) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve({ code: child.exitCode, signal: child.signalCode });
+  }
+  return new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal })));
+}
+
+function formatChildDiagnostics(stdoutChunks, stderrChunks) {
+  const stdout = Buffer.concat(stdoutChunks).toString('utf8').trim();
+  const stderr = Buffer.concat(stderrChunks).toString('utf8').trim();
+  return `\nchild stdout: ${stdout || '<empty>'}\nchild stderr: ${stderr || '<empty>'}`;
 }
 
 async function stopChild(child) {

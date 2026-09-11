@@ -168,7 +168,7 @@ test('private state channel rejects credential injection, unexpected root fields
   const sent = [];
   const saved = [];
   child.connected = true;
-  child.send = (value) => sent.push(value);
+  child.send = (value, callback) => { sent.push(value); callback?.(null); };
   const channel = createPrivateStateChannel({ initialState: { keys: [keyRecord()], credentials: fakeCredentials }, persist: (value) => saved.push(value) });
   channel.attach(child);
   child.emit('message', { type: 'ready', challenge: 'c'.repeat(24) });

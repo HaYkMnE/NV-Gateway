@@ -50,7 +50,7 @@ export function reduceMenu(open: boolean, action: { type: 'toggle' | 'close' | '
 // Focus-trap primitives for modal dialogs (FeedbackModal, AboutDialog). THE
 // single shared implementation used by use-dialog-focus.ts: duplicating this
 // logic per dialog would let the traps drift apart.
-export const FOCUSABLE_SELECTOR = "button, [href], input, select, textarea, [tabindex]:not([tabindex=\"-1\"])";
+export const FOCUSABLE_SELECTOR = 'button:not([disabled]):not([aria-disabled="true"]), [href]:not([aria-disabled="true"]), input:not([disabled]):not([aria-disabled="true"]), select:not([disabled]):not([aria-disabled="true"]), textarea:not([disabled]):not([aria-disabled="true"]), [tabindex]:not([tabindex="-1"]):not([disabled]):not([aria-disabled="true"])';
 
 /**
  * Pure Tab/Shift+Tab decision for a focus trap. Given the dialog's focusable
