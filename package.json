@@ -51,7 +51,7 @@
     "js-yaml": "4.3.2",
     "jsqr": "^1.4.0",
     "lucide-react": "^0.435.0",
-    "postcss": "^8.4.40",
+    "postcss": "^8.5.32",
     "qrcode": "^1.5.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
