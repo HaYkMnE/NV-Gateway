@@ -45,7 +45,7 @@ jobs:
       # so Dependabot (.github/dependabot.yml tracks github-actions) can still
       # offer readable bumps.
       - name: Checkout repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The tag being RELEASED, not whatever the default ref resolves to on a
           # manual dispatch. inputs.tag_name is empty on a tag push, so the
