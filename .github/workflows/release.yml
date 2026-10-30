@@ -1,0 +1,314 @@
+name: Release Pipeline
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      # No default, deliberately. A default tag publishes whatever tree happens to
+      # be checked out under a version that tree does not contain — the release
+      # would be labelled v0.1.0 while shipping arbitrary code. Required, so a
+      # manual run cannot publish an unversioned release at all.
+      tag_name:
+        description: 'Release tag name (e.g. v0.1.0)'
+        required: true
+
+# Least privilege per OpenSSF Scorecard (TokenPermissions): the workflow default
+# is read-only, and only the publishing job below is granted contents: write.
+permissions:
+  contents: read
+
+# One run per tag, and never cancelled mid-publish. Cancelling after the installer
+# has been uploaded but before latest.yml leaves the feed offering a version with
+# no manifest — a half-published release is worse than a queued one.
+#
+# The group is keyed on the TAG, not on the workflow name: a single global group
+# would serialise unrelated releases, and a run-id group would serialise nothing.
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-release:
+    name: Build & Package Windows Distribution
+    runs-on: windows-latest
+    # The only job; it creates the GitHub release and uploads its assets.
+    permissions:
+      contents: write
+    steps:
+      # Third-party actions are pinned to a COMMIT SHA, not a tag. A tag is a
+      # movable pointer: whoever controls the action's repository can repoint v4
+      # at new code, and that code would run here with this job's GITHUB_TOKEN
+      # (contents: write). A SHA is immutable, so a compromised or rewritten tag
+      # cannot change what executes. The trailing comment records the tag each SHA was resolved from
+      # so Dependabot (.github/dependabot.yml tracks github-actions) can still
+      # offer readable bumps.
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # The tag being RELEASED, not whatever the default ref resolves to on a
+          # manual dispatch. inputs.tag_name is empty on a tag push, so the
+          # fallback is the pushed ref — the same expression every publish step
+          # uses, so the checked-out tree cannot describe a different commit than
+          # the one being published.
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+          # Full history AND tags. The version gate below resolves the tag's
+          # commit with `git rev-list -n 1 refs/tags/<tag>` and compares it to
+          # HEAD; a shallow clone carries neither the tag object nor the history
+          # to resolve it, so a legitimate release would fail the gate.
+          fetch-depth: 0
+          # Do not leave GITHUB_TOKEN (contents: write) in .git/config, where
+          # npm ci lifecycle scripts and the build could read it. Nothing below
+          # needs git credentials: the tag gate runs only local git commands, and
+          # action-gh-release takes the token through its own `token:` input.
+          persist-credentials: false
+
+      # 22.x, not 20.x: @electron/fuses 2.1.3 declares itself unsupported on
+      # Node < 22.12.0 (engines.node), and the afterPack hardening hook imports
+      # it. It still LOADS on 20.x — measured on 20.18.0 — so this is a declared
+      # floor that `npm ci` would enforce, not a runtime crash.
+      - name: Set up Node.js 22.x
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.x
+          cache: 'npm'
+
+      # Tag == package.json version == the commit being published. Three separate
+      # failures, one gate, and it runs before npm ci and before the build on
+      # purpose: the answer is known at second zero, so there is no reason to
+      # spend a full Windows packaging run discovering a typo.
+      #
+      # The tag arrives through env, never as ${{ }} inside the script body: a tag
+      # is attacker-influenced text, and interpolating it into a shell is a
+      # script-injection sink.
+      #
+      # -cne, not -ne: PowerShell's -ne is case-INSENSITIVE, so "V0.1.1" would
+      # compare equal to "v0.1.1" and publish a tag that is not the version. The
+      # format check is anchored and case-sensitive for the same reason.
+      #
+      # The commit check is what stops a tag pointing at a different tree: without
+      # it, a tag can be moved to any commit and the pipeline will happily publish
+      # that commit's artifacts under the tag's version.
+      - name: Verify the release tag matches package.json
+        shell: pwsh
+        env:
+          NVGW_RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+        run: |
+          $actual = $env:NVGW_RELEASE_TAG
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $expected = "v" + $version
+
+          if ($actual -cnotmatch '^v\d+\.\d+\.\d+$') {
+            Write-Host "::error::tag '$actual' is not a release tag; expected ^v\d+\.\d+\.\d+$ (case-sensitive)"
+            exit 1
+          }
+
+          if ($actual -cne $expected) {
+            Write-Host "::error::tag '$actual' does not match package.json version '$expected'"
+            exit 1
+          }
+
+          $tagCommit = (git rev-list -n 1 "refs/tags/$actual").Trim()
+          # Capture the exit code IMMEDIATELY. $LASTEXITCODE is overwritten by the
+          # next native command, so testing it after `git rev-parse HEAD` would
+          # report rev-parse's status and let an unresolvable tag fall through as
+          # "HEAD != empty" instead of naming the real cause.
+          $tagExit = $LASTEXITCODE
+          $headCommit = (git rev-parse HEAD).Trim()
+          if ($tagExit -ne 0 -or [string]::IsNullOrWhiteSpace($tagCommit)) {
+            Write-Host "::error::cannot resolve refs/tags/$actual (git exit $tagExit); was the tag fetched? (fetch-depth: 0)"
+            exit 1
+          }
+          if ($tagCommit -cne $headCommit) {
+            Write-Host "::error::tag '$actual' points at $tagCommit but HEAD is $headCommit; the tag was moved or the wrong ref was checked out"
+            exit 1
+          }
+
+          Write-Host "tag '$actual' == package.json version and points at HEAD ($headCommit)"
+
+      # The app's update feed is BAKED at package time: electron-builder writes the
+      # literal publish block (electron-builder.yml: HaYkMnE/NV-Gateway) into
+      # resources/app-update.yml. Releases go into the SAME repository, so the
+      # built-in GITHUB_TOKEN (contents: write, above) is enough and no personal
+      # access token exists anywhere in this workflow. This gate proves the
+      # repository running the workflow IS the baked feed; a fork or a renamed
+      # repository fails here instead of publishing a release nobody polls.
+      #
+      # It runs before npm ci and before the build on purpose: the answer is known
+      # at second zero. It has no `if:` and no continue-on-error - a soft failure
+      # here would restore exactly the silent-success mode it removes.
+      - name: Verify the release can reach the baked update feed
+        id: release-target
+        env:
+          NVGW_GH_OWNER: ${{ github.repository_owner }}
+        run: node scripts/release-target-guard.mjs
+
+      # A re-run of an already-published tag must FAIL HERE, not upload into a void.
+      #
+      # Measured, not assumed: action-gh-release does NOT fail on an existing
+      # release. It logs "already exists and overwrite_files is false" per asset
+      # and returns null, so the step reports SUCCESS having published nothing.
+      # `fail_on_unmatched_files` does not apply either - the local globs did match;
+      # the refusal happens server-side per asset.
+      #
+      # So the destination is asked the same question the upload would ask, and
+      # only a 404 means "unpublished". Any other status (401/403 = bad token,
+      # 5xx, a network error) is an UNKNOWN, and an unknown is not permission.
+      #
+      # It sits before npm ci for the same reason the guard above does: the answer
+      # needs no build, and a republish attempt should cost seconds, not a full
+      # Windows packaging run.
+      - name: Refuse to republish a published tag
+        env:
+          NVGW_RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+          NVGW_GH_OWNER: ${{ github.repository_owner }}
+          NVGW_FEED_REPOSITORY: ${{ steps.release-target.outputs.feed_repository }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/republish-guard.mjs
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Electron >= 42 no longer downloads its binary in postinstall; fetch it
+      # explicitly so tests and electron-builder find node_modules/electron/dist.
+      - name: Install the Electron binary
+        run: npx install-electron --no
+
+      # No GH_TOKEN here, deliberately. This step runs electron-builder and its
+      # whole transitive dependency tree plus the afterPack hook, so any credential
+      # in its environment is readable by all of that code — and GITHUB_TOKEN
+      # carries `contents: write` on this repository (see permissions: above).
+      #
+      # It is not needed, read out of the dependency rather than assumed (line refs re-checked against app-builder-lib / electron-publish 26.18.0):
+      #   * `--publish never` sets isPublish = false
+      #     (app-builder-lib/out/publish/PublishManager.js:64), so nothing is
+      #     uploaded from this step and createPublisher/scheduleUpload — the only
+      #     paths that construct GitHubPublisher, which is what actually reads
+      #     GH_TOKEN (electron-publish/out/gitHubPublisher.js:23-28) — never run.
+      #   * The token-sniffing fallback at PublishManager.js:363-366 sits behind
+      #     `if (publishers == null)`. electron-builder.yml:112-116 declares the
+      #     publish block explicitly, so publishers is never null and that branch
+      #     is unreachable.
+      #   * Baking app-update.yml goes through getAppUpdatePublishConfiguration
+      #     (:193-210) -> getResolvedPublishConfig (:413), which for provider
+      #     github with owner and repo already set resolves at :444-490 without
+      #     reading any token.
+      #
+      # If that analysis were ever wrong, electron-builder would throw
+      # InvalidConfigurationError("GitHub Personal Access Token is not set"). That
+      # is the failure this step can produce — it is NOT a claim about publishing.
+      #
+      # Measured correction to an earlier claim in this file: a duplicate publish
+      # does NOT fail loudly. action-gh-release logs
+      #   "asset <name> already exists and overwrite_files is false"
+      # and returns null, so the step goes GREEN having published nothing, and
+      # `fail_on_unmatched_files` does not apply because the local globs did match.
+      # Nothing in the upload action can be relied on to report a republish; that
+      # is why "Refuse to republish a published tag" above fails the job BEFORE
+      # any upload instead.
+      - name: Build and Package Release Artifacts
+        env:
+          NVGW_GH_OWNER: ${{ github.repository_owner }}
+        run: |
+          npm run build:release
+
+      # The update feed is BAKED into resources/app-update.yml at package time, and
+      # that file is the ONLY thing telling electron-updater which repository to
+      # poll. It is not written unconditionally: app-builder-lib returns early
+      # unless a target is updater-aware (26.18.0 PublishManager.js:81-85 +
+      # isSuitableWindowsTarget at :391-396 — nsis, nsis-*, updater-aware appx).
+      #
+      # So the CI `Packaged audit` job can NEVER see it: that job packages with
+      # `--dir`, which builds no installer target and therefore writes no
+      # app-update.yml. Measured against a real `npm run package:dir`:
+      # dist/win-unpacked/resources/ held app.asar and assets/ only.
+      #
+      # An absent or misdirected feed fails SILENTLY — the installer works, the app
+      # runs, and update checks just never find anything. The owner's installed
+      # build has no app-update.yml at all and nothing ever reported it. This gate
+      # runs AFTER packaging (the file cannot exist before) and BEFORE the upload,
+      # so a build that cannot auto-update never becomes a published release.
+      - name: Verify the update feed was baked into the package
+        env:
+          # Same owner packaging used, so the expectation cannot drift from what was
+          # baked. NVGW_GH_REPO stays UNSET: the feed is the literal publish block.
+          NVGW_GH_OWNER: ${{ github.repository_owner }}
+        run: node scripts/verify-baked-update-feed.mjs
+
+      - name: Archive Portable Distribution as ZIP
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          Compress-Archive -Path "dist/NV-Gateway $version.exe" -DestinationPath "dist/NV-Gateway-$version-win-x64.zip" -Force
+
+
+      # ONE checksum file for ONE release. The list is ENUMERATED, never globbed,
+      # so it cannot silently grow to describe artifacts the release does not
+      # contain, and it names exactly the files the upload step below ships.
+      - name: Generate Checksums
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $releaseFiles = @(
+            "dist/NV-Gateway-Setup-$version.exe"
+            "dist/NV-Gateway-Setup-$version.exe.blockmap"
+            "dist/latest.yml"
+            "dist/NV-Gateway-$version-win-x64.zip"
+          )
+          $lines = foreach ($file in $releaseFiles) {
+            if (-not (Test-Path -LiteralPath $file)) {
+              Write-Host "::error::release artifact missing: $file"
+              exit 1
+            }
+            $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLower()
+            "$hash  $(Split-Path -Leaf $file)"
+          }
+          Set-Content -LiteralPath dist/SHA256SUMS.txt -Value $lines -Encoding ascii
+          Get-Content dist/SHA256SUMS.txt
+
+      # ── Publish: the single destination, this repository (= the update feed)
+      #
+      # electron-updater on the user's machine reads latest.yml from the repo baked
+      # into app-update.yml, then downloads the installer that latest.yml names.
+      # Both must be here or an update check finds nothing (no latest.yml) or
+      # resolves to a 404 (no installer). Installs made before the rename still
+      # poll HaYkMnE/NV-Gateway-releases; GitHub redirects that name here.
+      #
+      # The .blockmap is listed SEPARATELY and on purpose: the installer glob ends in
+      # `.exe`, which does not match `NV-Gateway-Setup-<version>.exe.blockmap`. Without
+      # its own entry the blockmap is silently left behind and every update degrades
+      # from a differential download to a full ~82 MB one.
+      #
+      # `repository:` comes from the guard above rather than a second literal, so the
+      # upload target and the baked feed cannot drift apart. `token:` is the built-in
+      # GITHUB_TOKEN; the guard rejects any other secret in this workflow.
+      - name: Publish the release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        with:
+          repository: ${{ steps.release-target.outputs.feed_repository }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+          name: NV-Gateway ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+          draft: false
+          prerelease: false
+          # Published bytes are immutable. action-gh-release DEFAULTS this to true,
+          # so leaving it unset is the defect, not a neutral omission: a re-run
+          # would silently replace the installer under an identical asset name,
+          # and nobody who already downloaded it would know.
+          overwrite_files: false
+          # A glob that matches nothing must fail the release. A partially populated
+          # feed is worse than no release: it looks published and updates nobody.
+          fail_on_unmatched_files: true
+          # User block (which file, one-line install, verify) + the same CHANGELOG
+          # section the app shows in its update dialog, under "## What changed".
+          # Written by scripts/release-notes.mjs (npm prebuild:release) during the
+          # build step, next to build/release-notes.md.
+          body_path: build/release-body.md
+          files: |
+            dist/NV-Gateway-Setup-*.exe
+            dist/NV-Gateway-Setup-*.exe.blockmap
+            dist/latest.yml
+            dist/NV-Gateway-*-win-x64.zip
+            dist/SHA256SUMS.txt

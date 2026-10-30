@@ -1,0 +1,7 @@
+import { useId } from 'react';
+
+export const Logo = ({ className = 'w-12 h-12' }: { className?: string }) => {
+  const id = useId().replace(/:/g, '');
+  const glow = `${id}-glow`; const chassis = `${id}-chassis`; const bloom = `${id}-bloom`;
+  return <svg aria-hidden className={className} viewBox="0 0 120 120" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id={glow} x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stopColor="#59FF00"/><stop offset="100%" stopColor="#00FFD1"/></linearGradient><linearGradient id={chassis} x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stopColor="#2A322D"/><stop offset="100%" stopColor="#0D110E"/></linearGradient><filter id={bloom} x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="3.5" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs><path d="M60 10 L103.3 35 L103.3 85 L60 110 L16.7 85 L16.7 35 Z" fill={`url(#${chassis})`} stroke="#1A221C" strokeWidth="3"/><path d="M30 45h15l5-5h20l5 5h15M30 75h15l5 5h20l5-5h15" stroke="#2A322D" strokeWidth="1.5"/><path d="M45 50L60 38 75 50V75L60 87 45 75Z" fill="#060706" stroke={`url(#${glow})`} strokeWidth="2.5" filter={`url(#${bloom})`}/><circle cx="60" cy="38" r="3.5" fill="#59FF00"/><circle cx="45" cy="75" r="3" fill="#00FFD1"/><circle cx="75" cy="75" r="3" fill="#00FFD1"/><path d="M60 10V38M60 87V110" stroke="#59FF00" strokeWidth="1.5"/></svg>;
+};

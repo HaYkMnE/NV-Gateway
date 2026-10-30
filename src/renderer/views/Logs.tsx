@@ -1,0 +1,472 @@
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
+import { AlertTriangle, Lightbulb, Send, X } from 'lucide-react';
+import { api, queryKeys } from '../lib/api';
+import { CLIPBOARD_TEXT_MAX, classifyDataState, isOversizedForClipboard, safeError } from '../lib/frontend-state';
+import { classifyScrollEvent, createLogsQueryPolicy, isNearBottom, shouldCancelAutoScroll } from '../lib/frontend-behavior';
+import { formatLogLine } from '../lib/logs-format';
+import { useGatewayLifecycle } from '../lib/gateway-lifecycle';
+import { useModal } from '../lib/modal-context';
+import { useDialogFocus } from '../lib/use-dialog-focus';
+import { focusPendingSetting, focusSettingFrom } from '../pet/tips';
+
+type Log = Record<string, unknown> & { level?: string; message?: string; timestamp?: string; time?: string };
+
+/** Auto-scroll behaviour: instant when the OS asks for reduced motion. */
+export function prefersReducedMotion(): boolean {
+  try {
+    return typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  } catch {
+    return false;
+  }
+}
+interface LogLine { key: string; text: string; label: string; cls: string }
+
+/**
+ * The refresh clock must follow the ACTIVE UI language, not the host one: a
+ * 12-hour host locale printed "11:02:19 PM" inside a 24-hour UI language (the
+ * same defect class already fixed in Settings.tsx, whose formatRefreshTime this
+ * mirrors). The tag is validated first — a malformed tag ('en_US') throws
+ * RangeError during render, and a well-formed but unsupported one ('xx-YY') is
+ * ignored by Intl, which then silently formats with the HOST locale. Both
+ * resolve to 'en', the i18n default.
+ */
+export function formatRefreshTime(timestamp: number, locale?: string): string {
+  let resolved = 'en';
+  if (locale) {
+    try {
+      if (Intl.DateTimeFormat.supportedLocalesOf([locale]).length > 0) resolved = locale;
+    } catch {
+      resolved = 'en';
+    }
+  }
+  return new Date(timestamp).toLocaleTimeString(resolved);
+}
+
+export function Logs() {
+  const { t, i18n } = useTranslation();
+  const [paused, setPaused] = useState(false);
+  const [autoScroll, setAutoScroll] = useState(true);
+  const [feedback, setFeedback] = useState('');
+  const [copyError, setCopyError] = useState<string | null>(null);
+  const terminal = useRef<HTMLOListElement>(null);
+  const programmaticScroll = useRef(false);
+  const prevScrollTop = useRef(0);
+  const programmaticTimer = useRef<number | undefined>(undefined);
+  const lifecycle = useGatewayLifecycle();
+  const { activeModal, activeModalRequest, beginModalRequest, closeModal, isCurrentModalRequest, openFeedback, openSendErrors } = useModal();
+  const [errorCount, setErrorCount] = useState<number>(0);
+  const [errorPreview, setErrorPreview] = useState<ErrorEntry[] | null>(null);
+  const [errorPreviewLoading, setErrorPreviewLoading] = useState(false);
+  const [sending, setSending] = useState(false);
+  const unavailable = lifecycle.status?.state !== 'running';
+  const logsPolicy = createLogsQueryPolicy(paused);
+  const query = useQuery({
+    queryKey: queryKeys.logs,
+    queryFn: async () => {
+      if (unavailable) {
+        const err = new Error('Gateway is not running.');
+        err.name = 'GATEWAY_NOT_RUNNING';
+        throw err;
+      }
+      return api.logs();
+    },
+    refetchInterval: logsPolicy.refetchInterval,
+    refetchOnWindowFocus: logsPolicy.refetchOnWindowFocus,
+    refetchOnReconnect: logsPolicy.refetchOnReconnect,
+    retry: logsPolicy.retry,
+    enabled: !unavailable && !paused,
+  });
+  const logs = (query.data?.logs ?? []) as Log[];
+  const state = classifyDataState({
+    pending: query.isPending,
+    error: query.isError,
+    data: query.data?.logs,
+    stale: query.isError && Boolean(query.data),
+  });
+  // Format ONCE per log entry (previously the render called formatLog twice per
+  // row — aria-label + content — on every render) and hand memoized rows stable
+  // string props. Structural sharing keeps `logs` (and therefore `lines` and
+  // every row's strings) referentially stable across unchanged polls, so a
+  // poll/state-driven re-render of this view then costs ~zero row work instead
+  // of 2N formatLog calls + N element diffs for N rows.
+  //
+  // The formatter itself lives in ../lib/logs-format — extracted so it can be
+  // unit-tested against real gateway records (the repo has no jsdom, so this
+  // component cannot be rendered in a test).
+  const lines = useMemo<LogLine[]>(
+    () =>
+      logs.map((log, index) => {
+        const text = formatLogLine(log);
+        return {
+          key: log.id ? String(log.id) : `${log.timestamp ?? log.time ?? ''}-${index}-${log.message ?? ''}`,
+          text,
+          label: `${String(log.level ?? 'log')}: ${text}`,
+          cls: levelClass(log.level),
+        };
+      }),
+    [logs]
+  );
+  useEffect(
+    () => {
+      if (autoScroll) {
+        const element = terminal.current;
+        if (!element) return;
+        programmaticScroll.current = true;
+        // WCAG 2.3.3: a smooth scroll is motion the user did not ask for.
+        element.scrollTo({ top: element.scrollHeight, behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
+        if (programmaticTimer.current !== undefined)
+          window.clearTimeout(programmaticTimer.current);
+        programmaticTimer.current = window.setTimeout(() => {
+          programmaticScroll.current = false;
+          programmaticTimer.current = undefined;
+        }, 600);
+        return () => {
+          if (programmaticTimer.current !== undefined) {
+            window.clearTimeout(programmaticTimer.current);
+            programmaticTimer.current = undefined;
+          }
+          programmaticScroll.current = false;
+        };
+      }
+    },
+    [lines, autoScroll]
+  );
+  const trackScroll = () => {
+    const element = terminal.current;
+    if (!element) return;
+    const nextTop = element.scrollTop;
+    const metrics = { scrollTop: nextTop, clientHeight: element.clientHeight, scrollHeight: element.scrollHeight };
+    const prevTop = prevScrollTop.current;
+    prevScrollTop.current = nextTop;
+    const classification = classifyScrollEvent(
+      prevTop,
+      nextTop,
+      programmaticScroll.current,
+      metrics.scrollHeight,
+      metrics.clientHeight
+    );
+    if (classification === 'user-up') {
+      programmaticScroll.current = false;
+      if (programmaticTimer.current !== undefined) {
+        window.clearTimeout(programmaticTimer.current);
+        programmaticTimer.current = undefined;
+      }
+      setAutoScroll(false);
+      return;
+    }
+    if (classification === 'settle') {
+      if (isNearBottom(metrics)) {
+        programmaticScroll.current = false;
+        if (programmaticTimer.current !== undefined) {
+          window.clearTimeout(programmaticTimer.current);
+          programmaticTimer.current = undefined;
+        }
+      }
+      return;
+    }
+    if (!programmaticScroll.current && shouldCancelAutoScroll({ ...metrics, programmatic: false }))
+      setAutoScroll(false);
+  };
+  const resumeFollowing = () => {
+    setAutoScroll(true);
+    const element = terminal.current;
+    element?.scrollTo({ top: element.scrollHeight });
+  };
+  const announce = (message: string) => {
+    setFeedback('');
+    window.setTimeout(() => setFeedback(message), 0);
+  };
+  // Copy goes through the main process: navigator.clipboard rejects with
+  // NotAllowedError whenever this tray-resident window is not focused.
+  //
+  // A failure keeps its detail. Main refuses an oversized payload with the
+  // deliberately generic "Invalid clipboard text." -- generic because the text can
+  // be an API key or the local gateway token and must never be echoed -- so that
+  // message alone cannot tell the user WHY. The renderer knows both the payload
+  // length and the cap main enforces, so it names the size itself; any other
+  // failure carries the real error detail, like Dashboard, Endpoint and Models.
+  const copy = async () => {
+    // Nothing rendered means nothing to copy: announcing "Copied" for an empty
+    // string was a false success (empty/loading/error states all have no lines).
+    if (lines.length === 0) return;
+    const text = lines.map((line) => line.text).join('\n');
+    try {
+      await window.electronAPI.clipboard.writeText(text);
+      setCopyError(null);
+      announce(t('copied'));
+    } catch (error) {
+      announce(t('copy_failed'));
+      const detail = isOversizedForClipboard(text.length)
+        ? t('feedback_charCount', { count: text.length, max: CLIPBOARD_TEXT_MAX })
+        : safeError(error, t('unknown_error'));
+      setCopyError(`${t('clipboard_failed')} ${detail}`);
+    }
+  };
+
+  // --- Error reporting ---
+  const handleSendErrorsClick = useCallback(async () => {
+    const request = beginModalRequest();
+    try {
+      const count = await window.electronAPI.errorReport.getCount();
+      if (!isCurrentModalRequest(request)) return;
+      if (count === 0) {
+        announce(t('errors_noErrors'));
+        return;
+      }
+      setErrorCount(count);
+      if (!openSendErrors(request)) return;
+      setSending(false);
+      setErrorPreview(null);
+      setErrorPreviewLoading(true);
+      try {
+        const preview = await window.electronAPI.errorReport.preview();
+        if (isCurrentModalRequest(request)) setErrorPreview(preview);
+      } catch {
+        if (isCurrentModalRequest(request)) setErrorPreview(null);
+      } finally {
+        if (isCurrentModalRequest(request)) setErrorPreviewLoading(false);
+      }
+    } catch {
+      if (isCurrentModalRequest(request)) announce(t('errors_failed', { message: t('unknown_error') }));
+    }
+  }, [t, announce, beginModalRequest, isCurrentModalRequest, openSendErrors]);
+
+  const handleSendConfirm = useCallback(async () => {
+    const request = activeModalRequest;
+    if (request === null || !isCurrentModalRequest(request)) return;
+    setSending(true);
+    try {
+      const result = await window.electronAPI.errorReport.send();
+      if (!isCurrentModalRequest(request)) return;
+      if (result.success) {
+        announce(t('errors_success', { count: result.count }));
+        closeModal('send-errors', request);
+      } else {
+        announce(t('errors_failed', { message: result.message }));
+      }
+    } catch (error: unknown) {
+      if (isCurrentModalRequest(request)) {
+        announce(t('errors_failed', { message: error instanceof Error ? error.message : String(error) }));
+      }
+    } finally {
+      if (isCurrentModalRequest(request)) setSending(false);
+    }
+  }, [t, announce, activeModalRequest, closeModal, isCurrentModalRequest]);
+
+  const handleSendErrorsClose = useCallback(() => {
+    if (activeModalRequest !== null) closeModal('send-errors', activeModalRequest);
+  }, [activeModalRequest, closeModal]);
+
+  // Pet-advisor target page: see Dashboard for the same flow. Runs before the
+  // gateway-stopped early return so the hooks are unconditional.
+  const location = useLocation(); const navigate = useNavigate();
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const pendingFocus = useRef<unknown>(focusSettingFrom(location.state));
+  useLayoutEffect(() => { if (pendingFocus.current !== null) headingRef.current?.focus(); }, []);
+  useEffect(() => {
+    if (pendingFocus.current !== null && !unavailable && state !== 'loading') {
+      focusPendingSetting(pendingFocus.current);
+      pendingFocus.current = null;
+      navigate(location.pathname, { replace: true, state: null });
+    }
+  }, [state, unavailable]);
+
+  if (unavailable) {
+    return (
+      <div role="alert" className="p-4 sm:p-6 h-full flex flex-col min-w-0 items-center justify-center text-center">
+        <AlertTriangle aria-hidden size={40} className="text-warning mb-4" />
+        <p className="text-lg">{t('gateway_stopped')}</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-4 sm:p-6 h-full flex flex-col min-w-0">
+      <header className="flex flex-wrap items-start justify-between gap-3 mb-4">
+        <h2 ref={headingRef} tabIndex={-1} className="text-2xl font-bold">{t('logs')}</h2>
+        <div className="flex flex-wrap gap-2">
+          <button id="logs-pause" onClick={() => setPaused(!paused)} className="border border-border px-3 py-2">
+            {t(paused ? 'resume' : 'pause')}
+          </button>
+          <label className="flex items-center gap-2 border border-border px-3 py-2">
+            <input type="checkbox" checked={autoScroll} onChange={(event) => setAutoScroll(event.target.checked)} />
+            {t('auto_scroll')}
+          </label>
+          <button onClick={() => void copy()} disabled={lines.length === 0} className="border border-border px-3 py-2 disabled:opacity-50 disabled:cursor-not-allowed">
+            {t('copy_logs')}
+          </button>
+          <button onClick={() => void handleSendErrorsClick()} className="border border-border px-3 py-2">
+            {t('errors_sendButton')}
+          </button>
+          <button onClick={() => openFeedback()} className="border border-border px-3 py-2">
+            <Lightbulb aria-hidden size={16} className="inline me-1" />
+            {t('feedback_title')}
+          </button>
+        </div>
+      </header>
+
+      {!autoScroll && (
+        <button onClick={resumeFollowing} className="self-start mb-2 text-accent-neon">
+          {t('resume')}
+        </button>
+      )}
+      <div className="text-xs text-textMuted mb-2">
+        {feedback || (query.dataUpdatedAt ? `${t('last_refresh')} ${formatRefreshTime(query.dataUpdatedAt, i18n.language)}` : '')}
+      </div>
+      <p className="sr-only" aria-live="polite">{feedback}</p>
+      {copyError && <div role="alert" className="border border-error bg-error/10 text-error p-3 mb-2 break-words">{copyError}</div>}
+
+      {state === 'loading' && <div role="status">{t('loading')}</div>}
+      {state === 'error' && (
+        <div role="alert" className="border border-error p-4">
+          {t('logs_error')} <span className="break-all">{safeError(query.error, t('unknown_error'))}</span>
+          <button onClick={() => void query.refetch()} className="ms-3 text-nvidia">
+            {t('retry')}
+          </button>
+        </div>
+      )}
+      {state === 'stale' && (
+        <div role="status" className="mb-2 text-textMuted">
+          {t('stale')}
+        </div>
+      )}
+      {state === 'empty' && <div className="flex-1 grid place-items-center border border-border">{t('empty_logs')}</div>}
+
+      {(state === 'success' || state === 'stale') && (
+        <ol
+          dir="ltr"
+          ref={terminal}
+          onScroll={trackScroll}
+          role="log"
+          aria-live={autoScroll ? 'polite' : 'off'}
+          aria-label={t('logs')}
+          className="flex-1 bg-bg border border-border p-4 text-sm font-mono overflow-y-auto min-w-0"
+        >
+          {lines.map((line) => (
+            <LogRow key={line.key} label={line.label} cls={line.cls} text={line.text} />
+          ))}
+        </ol>
+      )}
+
+      {activeModal === 'send-errors' && (
+        <SendErrorsDialog
+          count={errorCount}
+          preview={errorPreview}
+          previewLoading={errorPreviewLoading}
+          sending={sending}
+          onClose={handleSendErrorsClose}
+          onConfirm={handleSendConfirm}
+        />
+      )}
+    </div>
+  );
+}
+
+interface SendErrorsDialogProps {
+  count: number;
+  preview: ErrorEntry[] | null;
+  previewLoading: boolean;
+  sending: boolean;
+  onClose: () => void;
+  onConfirm: () => void;
+}
+
+function SendErrorsDialog({ count, preview, previewLoading, sending, onClose, onConfirm }: SendErrorsDialogProps) {
+  const { t } = useTranslation();
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useDialogFocus(dialogRef, true);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [onClose]);
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/60 grid place-items-center p-4" onMouseDown={onClose}>
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        tabIndex={-1}
+        aria-label={t('errors_confirmTitle')}
+        onMouseDown={(e) => e.stopPropagation()}
+        className="bg-bg border border-border p-6 max-w-lg w-full max-h-[80vh] overflow-y-auto"
+      >
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-xl font-bold flex items-center gap-2">
+            <Send aria-hidden size={20} />
+            {t('errors_confirmTitle')}
+          </h2>
+          <button onClick={onClose} aria-label={t('errors_closeDialog')} className="p-1 text-textMuted hover:text-accent-neon">
+            <X aria-hidden size={20} />
+          </button>
+        </div>
+
+        <p className="text-sm text-textMuted mb-4">
+          {t('errors_sendSubtext', { count })}
+        </p>
+        <p className="text-sm mb-4">{t('errors_confirmBody', { count })}</p>
+
+        <div className="border border-border bg-surface p-3 mb-6 max-h-64 overflow-y-auto">
+          {previewLoading ? (
+            <div role="status" className="text-sm text-textMuted">
+              {t('loading')}
+            </div>
+          ) : preview && preview.length > 0 ? (
+            <ul dir="ltr" className="grid gap-2 text-xs font-mono">
+              {preview.slice(0, 50).map((entry, idx) => (
+                <li key={idx} className="border-b border-border pb-1 break-words">
+                  <span className="text-textMuted">{entry.timestamp}</span>{' '}
+                  <span className="text-warning">[{entry.type}]</span>{' '}
+                  <span className="text-textMain">{entry.message}</span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <div className="text-sm text-textMuted">{t('errors_noErrors')}</div>
+          )}
+        </div>
+
+        <div className="flex justify-end gap-3">
+          <button onClick={onClose} disabled={sending} className="border border-border px-4 py-2 text-textMuted disabled:opacity-50">
+            {t('errors_cancel')}
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={sending}
+            className="bg-nvidia text-bg px-4 py-2 disabled:opacity-50"
+          >
+            {t('errors_send')}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Memoized row: all props are stable strings (see the `lines` memo), so an
+// unchanged line bails out of re-render entirely when the view re-renders.
+const LogRow = memo(function LogRow({ label, cls, text }: { label: string; cls: string; text: string }) {
+  return (
+    <li aria-label={label} className={`py-1 whitespace-pre-wrap break-words ${cls}`}>
+      {text}
+    </li>
+  );
+});
+
+function levelClass(level?: string) {
+  const value = level?.toLowerCase();
+  return value === 'error'
+    ? 'text-error'
+    : value === 'warn' || value === 'warning'
+    ? 'text-warning'
+    : value === 'info'
+    ? 'text-nvidia'
+    : 'text-textMuted';
+}

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">
+  <url>
+    <loc>https://haykmne.github.io/NV-Gateway/</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://haykmne.github.io/NV-Gateway/"/>
+    <xhtml:link rel="alternate" hreflang="ru" href="https://haykmne.github.io/NV-Gateway/ru/"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://haykmne.github.io/NV-Gateway/"/>
+  </url>
+  <url>
+    <loc>https://haykmne.github.io/NV-Gateway/ru/</loc>
+    <lastmod>2026-10-29</lastmod>
+    <xhtml:link rel="alternate" hreflang="en" href="https://haykmne.github.io/NV-Gateway/"/>
+    <xhtml:link rel="alternate" hreflang="ru" href="https://haykmne.github.io/NV-Gateway/ru/"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://haykmne.github.io/NV-Gateway/"/>
+  </url>
+</urlset>

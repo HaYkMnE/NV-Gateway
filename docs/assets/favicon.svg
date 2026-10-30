@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+<title>NV Gateway</title><g transform="translate(0 0) scale(1.0)"><rect x="1" y="1" width="62" height="62" rx="14" fill="#0D110E" stroke="#2A322D" stroke-width="1.5"/>
+<mask id="fm" maskUnits="userSpaceOnUse" x="0" y="0" width="64" height="64"><rect width="64" height="64" fill="#fff"/><rect x="5" y="28.25" width="13" height="7.5" fill="#000"/><rect x="46" y="28.25" width="13" height="7.5" fill="#000"/></mask>
+<path d="M32 8 L52.78 20 L52.78 44 L32 56 L11.22 44 L11.22 20 Z" fill="none" stroke="#59FF00" stroke-width="5" stroke-linejoin="round" mask="url(#fm)"/>
+<path d="M6 32 H24.2" stroke="#59FF00" stroke-width="3" stroke-linecap="round"/>
+<path d="M39.8 32 H58" stroke="#00FFD1" stroke-width="3" stroke-linecap="round"/>
+<path d="M32 23 L39.79 27.5 L39.79 36.5 L32 41 L24.21 36.5 L24.21 27.5 Z" fill="#59FF00"/>
+</g></svg>

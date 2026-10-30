@@ -1,0 +1,23 @@
+/*
+ * DonationModal animation keyframes.
+ * MUST stay a static stylesheet (renderer CSP blocks inline <style>).
+ */
+
+@keyframes nv-donation-laser {
+          0%, 100% { top: 4%; opacity: 0.9; }
+          50% { top: 94%; opacity: 1; }
+        }
+        .nv-donation-laser {
+          animation: nv-donation-laser 2.2s ease-in-out infinite;
+        }
+        @keyframes nv-donation-bubble {
+          0% { transform: translateY(6px) scale(0.96); opacity: 0; }
+          12% { transform: translateY(0) scale(1); opacity: 1; }
+          88% { transform: translateY(0) scale(1); opacity: 1; }
+          100% { transform: translateY(-4px) scale(0.98); opacity: 0; }
+        }
+        .nv-donation-bubble { animation: nv-donation-bubble 4s ease forwards; }
+        @media (prefers-reduced-motion: reduce) {
+          .nv-donation-laser, .nv-donation-bubble { animation: none !important; }
+          .nv-donation-bubble { opacity: 1 !important; }
+        }

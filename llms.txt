@@ -1,0 +1,41 @@
+# NV Gateway
+
+> NV Gateway is a free, open-source (Apache-2.0) Windows desktop app (Windows 10 and later) that runs a local OpenAI- and Anthropic-compatible API at http://127.0.0.1:12000 and forwards requests to NVIDIA's hosted models (build.nvidia.com / NVIDIA NIM API catalog) using the user's own NVIDIA Build API keys. Works with one key or many. NV Gateway tracks rate limits for each model separately: if a key hits a limit on one model, it stays available for your other models, and the request moves on to another key. Unofficial, independent app; not made, endorsed or supported by NVIDIA.
+
+Key facts for agents:
+
+- OpenAI-compatible base URL: `http://127.0.0.1:12000/v1` (Chat Completions `/v1/chat/completions`, Responses `/v1/responses`, models `/v1/models`).
+- Anthropic-compatible base URL: `http://127.0.0.1:12000` without `/v1` (the client calls `/v1/messages`).
+- Auth: the gateway token from the app's Endpoint screen, sent as a Bearer token. It is not the NVIDIA key.
+- Admin API (used by the desktop app, needs the admin token): `http://127.0.0.1:12001/admin`.
+- Ports: 12000 and 12001 are the application defaults, not fixed requirements. The gateway port is configurable in the app, and the admin API always listens on that port + 1, so the effective ports come from the app configuration (the Endpoint screen shows them).
+- Models: NVIDIA's hosted model catalogue (synced daily). List current models with `GET /v1/models`.
+- Windows only. No admin rights needed. The installer is unsigned; each release has `SHA256SUMS.txt`.
+- Source: https://github.com/HaYkMnE/NV-Gateway (Apache-2.0). All releases are built by GitHub Actions from this source.
+
+## Install (for agents; ask the user before running it)
+
+- One command in PowerShell. It downloads the installer and `SHA256SUMS.txt`, verifies the SHA256, and installs silently for the current user: `irm https://raw.githubusercontent.com/HaYkMnE/NV-Gateway/main/install.ps1 | iex`
+- Review first: `irm https://raw.githubusercontent.com/HaYkMnE/NV-Gateway/main/install.ps1 -OutFile install.ps1`, then `powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1` (Bypass applies to that one process only).
+- Build from source: `git clone https://github.com/HaYkMnE/NV-Gateway.git`, `npm ci`, `npx install-electron --no`, `npm run build` (Node.js 22.12 or later).
+
+## Docs
+
+- [README](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md): features, quick start, client setup, FAQ, limitations, build from source
+- [Full agent guide](https://haykmne.github.io/NV-Gateway/llms-full.txt): install steps, per-client config, limits
+- [Privacy](https://github.com/HaYkMnE/NV-Gateway/blob/main/PRIVACY.md): every network destination and how to turn it off
+- [Security](https://github.com/HaYkMnE/NV-Gateway/blob/main/.github/SECURITY.md): private vulnerability reporting and security properties
+- [AGENTS.md](https://github.com/HaYkMnE/NV-Gateway/blob/main/AGENTS.md): rules for AI coding agents that change this code
+- [DEVELOPMENT.md](https://github.com/HaYkMnE/NV-Gateway/blob/main/DEVELOPMENT.md): build from source and the local API reference
+- [CONTRIBUTING.md](https://github.com/HaYkMnE/NV-Gateway/blob/main/.github/CONTRIBUTING.md): development workflow
+
+## Downloads
+
+- [Latest release](https://github.com/HaYkMnE/NV-Gateway/releases/latest): `NV-Gateway-Setup-<version>.exe` and `SHA256SUMS.txt`
+
+## Optional
+
+- [Russian README](https://github.com/HaYkMnE/NV-Gateway/blob/main/README.ru.md)
+- [License](https://github.com/HaYkMnE/NV-Gateway/blob/main/LICENSE): Apache-2.0; the name "NV Gateway" and its logo are not licensed
+- [Issues](https://github.com/HaYkMnE/NV-Gateway/issues)
+- [NVIDIA API keys](https://build.nvidia.com)

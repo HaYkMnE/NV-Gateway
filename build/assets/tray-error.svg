@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <!-- ERROR: solid red hexagon with bold dark "!". Distinct glyph = panicked state readable at 16px. -->
+  <path d="M12 2.5 L20.23 7.25 L20.23 16.75 L12 21.5 L3.77 16.75 L3.77 7.25 Z" fill="#E5484D" stroke="#0A0E0B" stroke-width="1.2" stroke-linejoin="round"/>
+  <rect x="10.9" y="7.4" width="2.2" height="6.2" rx="1.1" fill="#0A0E0B"/>
+  <circle cx="12" cy="16.5" r="1.4" fill="#0A0E0B"/>
+</svg>

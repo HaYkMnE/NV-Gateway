@@ -1,0 +1,128 @@
+# appId stays as-is: it is the basis of the NSIS installer GUID, so changing it breaks upgrades of existing installs.
+appId: com.susmnavorasem.nvgateway
+productName: NV-Gateway
+directories:
+  output: dist
+files:
+  - build/src/main/**/*
+  - build/src/test-support/**/*
+  - "!build/src/test-support/**/*"
+  - build/src/preload/**/*
+  - build/renderer/**/*
+  # The gateway engine bundle ships INSIDE app.asar, not as an extraResource.
+  # This is the whole point: ASAR integrity validation (see the
+  # EnableEmbeddedAsarIntegrityValidation fuse) only covers app.asar. While the
+  # engine sat in resources/ it was outside that envelope, so a substituted —
+  # still functional — engine ran with no complaint, and it receives the user's
+  # NVIDIA keys in the clear over the state:init IPC channel. Inside the archive
+  # each entry carries a per-file integrity block, so tampering is refused.
+  - build/gateway/**/*
+  - package.json
+  # Source maps are build-time debugging aids; nothing at runtime reads them.
+  # This global negation also filters the collected production node_modules
+  # (app-builder-lib applies the main matcher's patterns to them), so no
+  # present or future dependency can re-add map bytes to app.asar.
+  - "!**/*.map"
+# Ship only the Chromium locale packs for languages the app offers
+# (VALID_APP_LANGUAGES in src/main/gateway-runtime.ts). Matching is EXACT on
+# the pak basename (ElectronFramework.js removeUnusedLanguagesIfNeeded), so
+# regional variants are named in full. These paks carry Chromium's own UI
+# strings (context menus, error pages, PDF viewer) — app strings come from
+# i18next — so an unsupported OS locale degrades that built-in UI to the
+# en-US fallback instead of breaking anything. ru stays: the owner's own
+# processes launch with --lang=ru. en-US stays: it is the fallback.
+electronLanguages:
+  - ar
+  - en-GB
+  - en-US
+  - es
+  - es-419
+  - fr
+  - hi
+  - ru
+  - zh-CN
+  - zh-TW
+extraResources:
+  # Only the tray/window icons ship outside the archive. They are inert image
+  # assets: nothing executable lives here any more.
+  - from: build/assets
+    to: assets
+    filter:
+      - icon.png
+      - tray-*.svg
+      - tray-*-16.png
+      - tray-*-32.png
+# Licence files ship next to NV-Gateway.exe, beside Electron's own
+# LICENSE.electron.txt and LICENSES.chromium.html. They go in extraFiles, not
+# extraResources, because scripts/shipping-credential-scan.mjs pins the
+# extraResources rules to the icon mapping above.
+extraFiles:
+  - from: LICENSE
+    to: LICENSE.txt
+  - from: NOTICE
+    to: NOTICE.txt
+  - from: THIRD-PARTY-NOTICES.txt
+    to: THIRD-PARTY-NOTICES.txt
+# Windows package hardening, applied to the packed directory BEFORE the nsis /
+# portable artifacts are produced from it, so the installer carries the hardened
+# executable. The hook embeds the ASAR integrity resource and then flips the two
+# integrity fuses — see scripts/harden-windows-package.mjs for why this cannot be
+# expressed as config on electron-builder 24 (no electronFuses block, and its
+# Windows branch never injects the hash).
+afterPack: scripts/harden-windows-package.mjs
+# "What's new" for the in-app update offer. This file is baked into latest.yml
+# `releaseNotes` (app-builder-lib updateInfoBuilder.js:13-22), which
+# electron-updater hands to the offer dialog. It is generated from CHANGELOG.md
+# by scripts/release-notes.mjs (npm `prebuild:release`). Named explicitly rather
+# than relying on the buildResources default (build/, config.js:185): an explicit
+# path that is missing makes getResource throw, so a release can never silently
+# ship without notes.
+releaseInfo:
+  releaseNotesFile: build/release-notes.md
+win:
+  icon: build/assets/icon.png
+  target:
+    - nsis
+    - portable
+  forceCodeSigning: false
+  signAndEditExecutable: true
+nsis:
+  # Per-user install into %LOCALAPPDATA%\Programs\NV-Gateway. The installer GUID
+  # is derived from appId by electron-builder (not hardcoded here), so upgrades
+  # from the same appId reuse one install location.
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: false
+  createDesktopShortcut: true
+  shortcutName: NV-Gateway
+  runAfterFinish: true
+  deleteAppDataOnUninstall: false
+  # Custom NSIS hooks. The bare file name resolves against buildResources (the
+  # default build/), which is also where electron-builder looks for an
+  # `installer.nsh` when `include` is unset — naming it explicitly keeps the
+  # dependency visible instead of implicit. See the file's header for the two
+  # measurements it corrects:
+  #   customUnInstall  removes HKCU Run\electron.app.NV-Gateway (+ the
+  #                    StartupApproved twin) on uninstall, which no shipping
+  #                    template does;
+  #   customInstall    recreates an absent desktop shortcut on UPDATE, which the
+  #                    template deliberately skips (include/installer.nsh:234-238 in 26.18.0 gates
+  #                    the recreate on ${ifNot} ${isUpdated}).
+  include: installer.nsh
+  # Explicit, stable artifact naming (product + version). The portable target
+  # naming is intentionally left at its default ("NV-Gateway <version>.exe").
+  artifactName: ${productName}-Setup-${version}.${ext}
+# GitHub Releases auto-update source: this public repository, HaYkMnE/NV-Gateway.
+# electron-builder bakes these values into resources/app-update.yml, the file
+# electron-updater reads at runtime, so they are NOT runtime-configurable.
+# Releases are published into the same repository (release.yml), and
+# scripts/packaging-env-guard.mjs fails packaging if this block drifts from the
+# owner/repo the release pipeline publishes to. Installs made before the
+# NV-Gateway-releases -> NV-Gateway rename keep working through GitHub's
+# repository redirect. releaseType: release means only full stable releases are
+# served, never drafts/prereleases.
+publish:
+  - provider: github
+    owner: HaYkMnE
+    repo: NV-Gateway
+    releaseType: release

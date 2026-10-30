@@ -1,0 +1,51 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :focus-visible { outline: 3px solid theme('colors.accent-neon'); outline-offset: 3px; position: relative; z-index: 1; }
+  @media (prefers-reduced-motion: reduce) {
+    /* NOTE: the pet widget subtree is deliberately EXEMPT — the animated
+       mascot/hacker IS the product feature (a desktop pet). Freezing it via
+       the global kill-switch made the widget appear completely broken for
+       users with OS animations disabled. The pet's motion is decorative but
+       essential to its function; all other UI still honors the preference. */
+    *:not(.nv-pet-wrap, .nv-pet-wrap *),
+    *:not(.nv-pet-wrap, .nv-pet-wrap *)::before,
+    *:not(.nv-pet-wrap, .nv-pet-wrap *)::after {
+      scroll-behavior: auto !important;
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@keyframes cyberGlowPulse {
+  0%, 100% {
+    opacity: 1;
+    filter: drop-shadow(0 0 6px rgba(89, 255, 0, 0.6));
+  }
+  50% {
+    opacity: 0.75;
+    filter: drop-shadow(0 0 14px rgba(89, 255, 0, 0.9));
+  }
+}
+
+@keyframes tactileTick {
+  0% { transform: scale(1); }
+  50% { transform: scale(0.96); }
+  100% { transform: scale(1); }
+}
+
+@layer utilities {
+  .glow-red {
+    box-shadow: 0 0 10px theme('colors.error');
+  }
+  .animate-glow-pulse {
+    animation: cyberGlowPulse 2.5s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+  .animate-tactile-tick:active {
+    animation: tactileTick 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+}

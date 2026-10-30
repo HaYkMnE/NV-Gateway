@@ -1,0 +1,383 @@
+name: Test Suite
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege, stated explicitly. Both jobs below only read the repository,
+# install dependencies, run tests and package with `--dir`: neither creates a
+# release, pushes a commit, nor touches an issue or a PR. Without this block the
+# workflow inherits the REPOSITORY DEFAULT, which on this repo can hand the
+# GITHUB_TOKEN write access to contents, issues and pull requests for every
+# `npm ci` / `npm test` run — and a release workflow already exists to publish,
+# so nothing here needs it.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }} (Node ${{ matrix.node-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows-only product: state encryption uses Electron safeStorage/DPAPI,
+        # file hardening spawns icacls.exe, and electron-builder ships only
+        # Windows targets (nsis, portable). POSIX legs assert environment
+        # semantics that are never shipped, so they cannot be meaningfully green.
+        os: [windows-latest]
+        # 22.x, not 20.x. Three independent reasons, each measured rather than
+        # assumed:
+        #   * @electron/fuses 2.1.3 declares engines.node >=22.12.0 (read from
+        #     node_modules/@electron/fuses/package.json and package-lock.json).
+        #     scripts/harden-windows-package.mjs:100 and
+        #     scripts/packaged-security-smoke.mjs:7 both import it, and this job's
+        #     sibling runs the afterPack hook, so on 20.x the packaging path loads
+        #     a module that declares itself unsupported there. It only degrades to
+        #     EBADENGINE today (no engine-strict, no .npmrc), which is exactly the
+        #     kind of silent incompatibility that breaks on the next install.
+        #   * Nothing in the app requires Node 20. The declared floors are
+        #     electron 44.9.3 >=22.12.0, electron-builder 26.18.0 >=14,
+        #     vite 5.4.21 "^18.0.0 || >=20.0.0", typescript 5.9.3 >=14.17,
+        #     esbuild 0.28.2 >=18 — every one of them admits 22.x.
+        #   * release.yml already builds on 22.x for this same reason, so the two
+        #     workflows now test and ship on one runtime instead of two.
+        node-version: [22.x]
+
+    steps:
+      # Pinned to commit SHAs, not tags: a tag is a movable pointer, so whoever
+      # controls the action's repository can repoint v4 at new code that then runs
+      # here. The trailing comment records the tag each SHA came from so Dependabot
+      # (.github/dependabot.yml tracks github-actions) can still offer bumps.
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # No step pushes or fetches; keep the token out of .git/config.
+          persist-credentials: false
+
+      - name: Set up Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Electron >= 42 no longer downloads its binary in postinstall; fetch it
+      # explicitly so tests and electron-builder find node_modules/electron/dist.
+      - name: Install the Electron binary
+        run: npx install-electron --no
+
+
+      - name: Run test suite
+        run: npm test
+
+  # The strongest packaging assertions are DIST-GATED: without dist/win-unpacked
+  # they skip (or, in final-migration, return early and still print "ok"). The job
+  # above therefore never exercised them, and that blind spot is exactly how an
+  # `asarUnpack` rule could put the engine back outside app.asar behind a fully
+  # green CI. This job produces a package and runs them for real.
+  #
+  # `--dir` on purpose: it packs win-unpacked (which is all the audits need) and
+  # skips building the nsis/portable installers. The afterPack hook still runs, so
+  # the ASAR integrity resource and the fuses are applied exactly as in a release.
+  packaged-audit:
+    name: Packaged audit on ${{ matrix.os }} (Node ${{ matrix.node-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest]
+        # Same reasoning as the `test` job above: @electron/fuses 2.1.3 (loaded by
+        # the afterPack hook this job exercises) declares >=22.12.0, and no
+        # dependency or app requirement needs 20.x.
+        node-version: [22.x]
+
+    steps:
+      # Pinned to commit SHAs, not tags: a tag is a movable pointer, so whoever
+      # controls the action's repository can repoint v4 at new code that then runs
+      # here. The trailing comment records the tag each SHA came from so Dependabot
+      # (.github/dependabot.yml tracks github-actions) can still offer bumps.
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Full history: the installer smoke below decides whether to run by
+          # diffing against the pull request's base commit, and the default
+          # depth-1 PR checkout carries neither that commit nor a merge base.
+          # The repository is small, so this costs seconds.
+          fetch-depth: 0
+          # The scope diff is local git only; keep the token out of .git/config.
+          persist-credentials: false
+
+      - name: Set up Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Electron >= 42 no longer downloads its binary in postinstall; fetch it
+      # explicitly so tests and electron-builder find node_modules/electron/dist.
+      - name: Install the Electron binary
+        run: npx install-electron --no
+
+
+      - name: Package the app (dir target, no installers)
+        env:
+          # scripts/run-electron-builder.mjs fails fast without this; NVGW_GH_REPO
+          # defaults to NV-Gateway inside that wrapper.
+          NVGW_GH_OWNER: HaYkMnE
+        run: npm run package:dir
+
+      # RELEASE-NOTES GATE, and the reason it is a step of its own.
+      # build/release-notes.md is GENERATED from CHANGELOG.md + package.json#version,
+      # is GITIGNORED (.gitignore:46), and ships twice: electron-builder bakes it into
+      # latest.yml `releaseNotes` (the in-app update offer) and release.yml uses it as
+      # the GitHub release body. On a clean runner it therefore does not exist.
+      #
+      # MEASURED BEFORE THIS STEP EXISTED: the verifier reports an absent notes file
+      # as `BUILD_FRESHNESS_UNCHECKED` and exits 0, so on every CI run the notes half
+      # of the freshness gate was never armed — a version bump that shipped the
+      # PREVIOUS release's notes (or an empty body) went green. Generating the file
+      # here with the repo's own generator makes it present, and
+      # --require-release-notes turns absence or a byte-level mismatch into exit 1
+      # instead of a printed "unchecked".
+      #
+      # Placed BEFORE both verify steps on purpose: the verifier reads the file, so a
+      # generator that ran afterwards would be judged a run late, and a failing
+      # generator must stop the job before anything is declared fresh. It also has to
+      # precede the nsis smoke's own generation at the bottom of this job, or that
+      # step's copy would be the only one that ever existed.
+      - name: Generate build/release-notes.md from CHANGELOG.md
+        run: node scripts/release-notes.mjs
+
+      # BUILD STALENESS GATE. Three subtrees are generated by `npm run build` and
+      # copied straight into app.asar (electron-builder.yml `files:`), and nothing
+      # used to check that the bytes on disk came from the CURRENT sources. Two of
+      # them were measurably stale in a shipped build:
+      #   build/gateway/server.mjs 161,217 B vs a clean 163,151 B, missing
+      #     "no reasoning output observed" from src/gateway/capability-probe.mjs:693
+      #   build/renderer           no `endpoint_creds_error` key from
+      #     src/renderer/i18n/resources.ts:142, in any of the 7 locales
+      # build/src was clean only because it happens to be rebuilt every time.
+      #
+      # The step RE-EMITS each subtree into a throwaway directory and compares
+      # file-by-file on size + SHA-256, so it fails closed on a stale file, an
+      # orphaned one, and a stale content-hashed renderer bundle alike. Measured
+      # cost on this machine: 8.8 s for all three subtrees (tsc 4.3 s, vite 5.2 s,
+      # esbuild 0.4 s) — it reuses the same producers the build ran, so it cannot
+      # drift from them.
+      #
+      # Placed AFTER package:dir on purpose. That step runs `npm run build`, whose
+      # `postbuild` hook already invokes this same verifier; running it again here
+      # is what gives the gate its OWN step and its own verdict in the log, so it
+      # still fails the PR if the postbuild hook is ever removed from package.json.
+      #
+      # --require-release-notes is passed EXPLICITLY, not inherited from the postbuild
+      # hook (which runs without it): without the flag a notes file that the generator
+      # above did not produce is reported UNCHECKED and the step still exits 0, which
+      # is exactly the unarmed gate this step exists to be. With it, absence is exit 1.
+      - name: Verify build artifacts are fresh (not stale vs sources)
+        run: npm run verify:build-freshness -- --require-release-notes
+
+      # PACKAGED-ARCHIVE GATE. Everything above compares build/ against the sources;
+      # this compares what a user actually RUNS against build/. Nothing did, and the
+      # gap was real: measured on this tree, dist/win-unpacked/resources/app.asar was
+      # written at 03:28 while the sources were 03:51. A packaging step that reused a
+      # previous archive, or a `files:` glob that stopped matching, therefore shipped
+      # a stale engine behind a fully green build-freshness gate.
+      #
+      # --asar reads the archive electron-builder just produced (package:dir above)
+      # and compares build/gateway/server.mjs, every build/src/main/*.js and the
+      # renderer assets byte for byte; an entry the current build does not produce is
+      # a stale leftover and also fails. It needs no reference emit, so it costs
+      # milliseconds. `npm run verify:asar` is the same command.
+      - name: Verify the packaged app.asar is fresh (not stale vs build/)
+        run: npm run verify:asar
+
+      # package:dir already chains package:audit, but it is run again explicitly so
+      # the audit still happens if that chain is ever changed, and so its verdict
+      # has its own step in the log.
+      - name: Audit the packaged output
+        run: npm run package:audit
+
+      - name: Run the packaged (dist-gated) tests
+        shell: pwsh
+        run: |
+          node --test --test-reporter=tap tests/gateway-bundle-shipping.test.mjs tests/packaged-security-smoke.test.mjs tests/final-migration.test.mjs 2>&1 |
+            Tee-Object -FilePath packaged-tests.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Was inline PowerShell that grepped for "# SKIP" and "# fail 0". That was a
+      # TEXTUAL guard and it had a hole: node:test can also neutralise a test with
+      # t.todo() / { todo: true }, which TAP reports as `ok N - <name> # TODO` — read
+      # as a clean pass by a SKIP-only check — while a test that THROWS under todo
+      # prints `not ok` yet still leaves `# fail 0` and exit code 0. Measured on
+      # Node v20.20.2 and v22.22.2 alike. The logic now lives in a script with its
+      # own regression test (tests/assert-tap-proof.test.mjs) covering that bypass,
+      # and it fails CLOSED if the TAP summary cannot be parsed at all.
+      - name: Prove the packaged assertions EXECUTED (not skipped)
+        shell: pwsh
+        run: |
+          # The name must be the FULL test title. The guard compares with ===
+          # (never a substring), so a truncated name is a MISSING failure: the
+          # real title is `…and nothing executable is left in resources`
+          # (tests/gateway-bundle-shipping.test.mjs:108). Measured: the short
+          # form exits 1 MISSING against a real green TAP log; the full form
+          # exits 0. tests/w5c-docs-ci.test.mjs asserts this list still matches
+          # a declared test name, so the two cannot drift apart again.
+          node scripts/assert-tap-proof.mjs packaged-tests.log `
+            --require-ok='the packaged engine lives INSIDE app.asar and nothing executable is left in resources' `
+            --require-ok='packaged credential smoke statically audits the existing unpacked output when present' `
+            --require-marker=PACKAGED_LAYOUT_VERIFIED
+
+      # THE BLIND SPOT THIS CLOSES. `electron-builder.yml:99` wires
+      # `nsis.include: installer.nsh`, and that file defines the two macros the
+      # release installer depends on (customUnInstall removes the HKCU autostart
+      # value; customInstall restores an absent desktop shortcut on UPDATE). The
+      # step above packages with `--dir`, which builds NO installer target, so
+      # the include was never handed to makensis in CI: a syntax error, a typo'd
+      # NSIS command, or a macro that no longer compiles against the shipping
+      # templates stayed invisible until a release tag was already pushed.
+      #
+      # This runs the REAL nsis target through the REAL entry point
+      # (scripts/run-electron-builder.mjs, so electron-builder.yml is the only
+      # config read) against the REAL `dist/win-unpacked` that package:dir just
+      # produced — not a hand-rolled makensis invocation, so the flag set
+      # (-WX, -INPUTCHARSET UTF8), the define set and the include resolution all
+      # come from the shipping path. Measured on this machine: 30.2 s, producing
+      # a 73 MB installer from the 229 MB unpacked tree.
+      #
+      # The tree is COPIED to RUNNER_TEMP first, and that copy is load-bearing
+      # rather than tidiness. MEASURED: the nsis target writes
+      # `resources/elevate.exe` into whatever directory `--prepackaged` names
+      # (app-builder-lib out/targets/nsis/nsisUtil.js:105 — `path.join(appOutDir,
+      # "resources", "elevate.exe")`). Pointing it at dist/win-unpacked adds a
+      # file to the output the dist-gated tests above just audited, so this step
+      # would mutate the artifact under test. The copy costs 0.2 s.
+      #
+      # `--prepackaged` is also what keeps it cheap AND keeps the hardening
+      # single-pass: with it, platformPackager.doPack returns early
+      # (out/platformPackager.js:143), so there is no repack and NO afterPack
+      # run — the fuse-flipping hook never executes a second time.
+      #
+      # Non-publishing by construction: `--publish never` sets isPublish = false,
+      # and no token is in this step's environment. `forceCodeSigning: false` in
+      # electron-builder.yml means no certificate is required.
+      #
+      # MEASURED FAILURE MODE (the reason this is worth a step): compiling the
+      # same target with an include whose customInstall calls an undefined
+      # command exits 1 with
+      #   `Invalid command: "this_command_does_not_exist"`
+      #   `Error in macro customInstall on macroline 1`
+      # so this step fails CLOSED on exactly the defect it exists to catch.
+      # The smoke is the slowest step here (30-33 s plus a 229 MB copy) and it can
+      # only fail when the packaging surface changed, so it is SCOPED rather than
+      # run on every pull request. The decision is a real changed-files check, not
+      # a paths filter on the workflow: a `paths:` trigger would skip the whole
+      # test/packaged-audit job for unrelated PRs, and GitHub has no job-level
+      # paths filter.
+      #
+      # A push to main and a manual dispatch always run it (the expression on the
+      # step below is `event_name != 'pull_request' || ...`), so main-branch
+      # coverage is unchanged.
+      #
+      # Fail-open on purpose: if the diff cannot be computed (shallow clone, moved
+      # base), `run=true` and the smoke still executes. Skipping a real check is
+      # worse than spending 30 s, so an unreadable answer never means "skip".
+      - name: Decide whether the installer smoke covers this change
+        id: nsis_scope
+        shell: pwsh
+        env:
+          # The base commit of the pull request. Passed through env, never
+          # interpolated into the script body: a ref is attacker-influenced text.
+          NVGW_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if ($env:GITHUB_EVENT_NAME -ne 'pull_request') {
+            "run=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding ascii
+            Write-Output "not a pull request: the installer smoke always runs"
+            exit 0
+          }
+          # Every file that can change what the nsis target compiles or reads.
+          # build/ is broad on purpose: it carries installer.nsh, build/assets and
+          # the generated build/release-notes.md. electron-builder.yml holds the
+          # nsis and publish config, package.json supplies the version baked into
+          # the artifact name and the notes, and these are the scripts the smoke
+          # path itself executes or reads: release-notes.mjs (it reads
+          # CHANGELOG.md), the run-electron-builder wrapper, its
+          # packaging-env-guard, and the afterPack hardening hook the config
+          # points at.
+          $scope = '^(?:build/|CHANGELOG\.md$|electron-builder\.yml$|package\.json$|scripts/harden-windows-package\.mjs$|scripts/packaging-env-guard\.mjs$|scripts/release-notes\.mjs$|scripts/run-electron-builder\.mjs$|\.github/workflows/test\.yml$)'
+          # An empty base would turn the range below into `HEAD...HEAD`: exit 0,
+          # no paths, and the smoke would be skipped on an answer git never gave.
+          if ([string]::IsNullOrWhiteSpace($env:NVGW_PR_BASE_SHA)) {
+            "run=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding ascii
+            Write-Output "NVGW_PR_BASE_SHA is empty; running the smoke instead of skipping a check"
+            exit 0
+          }
+          # `-c core.quotePath=false` with `-z`, not the plain form: with the
+          # default quotePath=true git renders a non-ASCII path as
+          # `"build/\303\257..."`, which the anchored pattern below cannot match,
+          # so a real packaging change was silently skipped. -z additionally keeps
+          # a path containing a newline intact.
+          $raw = git -c core.quotePath=false diff --name-only -z "$($env:NVGW_PR_BASE_SHA)...HEAD"
+          $diffExit = $LASTEXITCODE
+          if ($diffExit -ne 0) {
+            "run=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding ascii
+            Write-Output "git diff exited $diffExit; running the smoke instead of skipping a check"
+            exit 0
+          }
+          $changed = @((@($raw) -join "`0") -split "`0" | Where-Object { $_ -ne '' })
+          $hit = @($changed | Where-Object { $_ -match $scope })
+          if ($hit.Count -gt 0) {
+            "run=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding ascii
+          } else {
+            "run=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding ascii
+          }
+          Write-Output "packaging-scope changes: $($hit -join ', ')"
+
+      - name: Compile the NSIS installer to prove build/installer.nsh still builds
+        # Runs on push/dispatch unconditionally; on a pull request only when the
+        # scope step above found a packaging file in the diff.
+        if: ${{ github.event_name != 'pull_request' || steps.nsis_scope.outputs.run == 'true' }}
+        shell: pwsh
+        env:
+          # scripts/run-electron-builder.mjs fails fast without this, and it is
+          # the same non-secret owner the packaging step above already uses. It
+          # is only interpolated into the temp copy's app-update.yml; nothing is
+          # uploaded because --publish never is passed.
+          NVGW_GH_OWNER: HaYkMnE
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'nsis-smoke'
+          $app = Join-Path $root 'win-unpacked'
+          $out = Join-Path $root 'out'
+          Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+          # Copy, never build in place: see the elevate.exe note above.
+          Copy-Item -Path dist/win-unpacked -Destination $app -Recurse -Force
+          # build/release-notes.md is GITIGNORED and produced only by
+          # `npm run build:release` -> prebuild:release (release.yml:204), but
+          # electron-builder.yml:68-69 names it unconditionally as
+          # releaseInfo.releaseNotesFile. On a clean runner it therefore does not
+          # exist and the packaging path exits 1 with
+          #   cannot find specified resource "build/release-notes.md"
+          # MEASURED on a clean copy: exit 1 without this line, exit 0 with it.
+          # The repo's own generator is used rather than a placeholder, so a
+          # missing CHANGELOG section fails here for the same reason it would fail
+          # a release.
+          node scripts/release-notes.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/run-electron-builder.mjs --win nsis --publish never `
+            --prepackaged $app --config.directories.output $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # A zero exit is not enough: makensis can be skipped entirely and the
+          # step would still look green. The artifact is the proof it compiled.
+          $installer = Get-ChildItem $out -Filter 'NV-Gateway-Setup-*.exe' -ErrorAction SilentlyContinue
+          if (-not $installer) { Write-Error "no installer produced in $out"; exit 1 }
+          Write-Output "INSTALLER_COMPILED $($installer.Name) $($installer.Length) bytes"

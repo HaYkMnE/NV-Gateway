@@ -1,0 +1,216 @@
+# NV Gateway: full guide for agents
+
+> NV Gateway is a free, open-source (Apache-2.0) Windows desktop app (Windows 10 and later) that runs a local OpenAI- and Anthropic-compatible API on the user's PC and forwards requests to NVIDIA's hosted models (build.nvidia.com / NVIDIA NIM API catalog) with the user's own NVIDIA Build API keys (build.nvidia.com). Version described: 1.0.0. Unofficial, independent app; not made, endorsed or supported by NVIDIA.
+
+## What it does
+
+- Serves three APIs on one local port: OpenAI Chat Completions, Anthropic Messages and OpenAI Responses.
+- Works with one key or many. Rate limits are tracked for each model separately: if a key hits a limit on one model, it stays available for other models, and the request moves on to another key. A key that NVIDIA rejects, that has run out of credits, or that returns server errors is paused for all models until it recovers. When every key is limited for a model, requests for it fail.
+- Keys are checked with NVIDIA when added; each key can be switched off without deleting it; per-key counters show successes, failures and tokens.
+- Models can be switched off (they leave `/v1/models`), sorted, filtered (free endpoint, downloadable) and searched. NVIDIA's catalogue refreshes every 24 h.
+- Per-model waiting mode: Day (300 s to first byte), Night (120 s) or Auto. An optional total request deadline returns a clear timeout error.
+- Claude Code's thinking setting maps to the model's reasoning level. Streamed answers report token usage at the end.
+- For curated model profiles, reports context and output limits in `/v1/models`.
+- Listens on 127.0.0.1 only, requires a local gateway token, stores NVIDIA keys encrypted with Windows DPAPI, and keeps keys out of logs.
+- Has ready setups for 17 client configurations and 7 UI languages (en, ru, zh, hi, es, fr, ar).
+
+## Endpoints
+
+| Protocol | Base URL to configure | Path the client calls |
+|---|---|---|
+| OpenAI Chat Completions | `http://127.0.0.1:12000/v1` | `POST /v1/chat/completions` |
+| OpenAI Responses (Codex CLI) | `http://127.0.0.1:12000/v1` | `POST /v1/responses` |
+| Model list | `http://127.0.0.1:12000/v1` | `GET /v1/models` |
+| Anthropic Messages | `http://127.0.0.1:12000` (no `/v1`) | `POST /v1/messages` |
+
+- Auth: the gateway token from the app's **Endpoint** screen, sent as a Bearer token. Do not use the NVIDIA key as the client's API key.
+- Port: 12000 by default; the admin port is always API port + 1 (12001). The user picks the port in the first-run wizard and can change it later in Settings → Change port. Always use the port shown in the app.
+- `/v1/responses` is stateless: `previous_response_id` is rejected with HTTP 400. Hosted tools such as web search are dropped.
+
+## Install steps (an agent should ask the user before installing)
+
+### A. One command (recommended)
+
+Run in PowerShell, without admin rights:
+```powershell
+irm https://raw.githubusercontent.com/HaYkMnE/NV-Gateway/main/install.ps1 | iex
+```
+The script (https://github.com/HaYkMnE/NV-Gateway/blob/main/install.ps1) resolves the latest release, downloads `NV-Gateway-Setup-<ver>.exe` and `SHA256SUMS.txt` into a temp folder, stops on a SHA256 mismatch, runs the installer with `/S /currentuser`, checks the per-user uninstall entry, and deletes the temp folder. It does not request admin rights or change security, Defender or execution-policy settings.
+
+To review it first:
+```powershell
+irm https://raw.githubusercontent.com/HaYkMnE/NV-Gateway/main/install.ps1 -OutFile install.ps1
+notepad install.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+```
+`-ExecutionPolicy Bypass` applies only to that process. It is needed because the Windows client default policy, Restricted, blocks local scripts. Add `-WhatIf` to download and verify without installing.
+
+### B. Manual path (no script)
+
+In PowerShell (set `$v` to the release version, without the leading `v`):
+```powershell
+$v = "<version>"
+curl.exe -L -o "$env:TEMP\NV-Gateway-Setup-$v.exe" "https://github.com/HaYkMnE/NV-Gateway/releases/download/v$v/NV-Gateway-Setup-$v.exe"
+curl.exe -L -o "$env:TEMP\SHA256SUMS.txt" "https://github.com/HaYkMnE/NV-Gateway/releases/download/v$v/SHA256SUMS.txt"
+$expected = ((Select-String -Path "$env:TEMP\SHA256SUMS.txt" -Pattern ([regex]::Escape("NV-Gateway-Setup-$v.exe") + '$')).Line -split '\s+')[0]
+(Get-FileHash "$env:TEMP\NV-Gateway-Setup-$v.exe" -Algorithm SHA256).Hash -eq $expected
+& "$env:TEMP\NV-Gateway-Setup-$v.exe" /S /currentuser
+```
+Run the installer only if the comparison prints `True`.
+
+### C. Browser download
+
+Download the `.exe` from https://github.com/HaYkMnE/NV-Gateway/releases/latest. A browser download triggers SmartScreen ("Windows protected your PC") because the installer is unsigned: More info → Run anyway.
+
+Notes: command-line downloads skip the browser warning and the SmartScreen prompt. Microsoft Defender still scans the installer. If Smart App Control is on (Windows 11), Windows may block the unsigned installer with any method. The app installs to `%LOCALAPPDATA%\Programs\NV-Gateway`.
+
+### After installing
+
+1. Get a free NVIDIA API key at https://build.nvidia.com (an NVIDIA account is required).
+2. In the first-run wizard, paste the key and keep port 12000.
+3. Open the **Endpoint** screen and copy the gateway token.
+4. Configure the client (below). Closing the window keeps the app running in the system tray.
+
+## Model IDs
+
+Use any model from NVIDIA's hosted catalogue. The catalogue syncs daily; the app's Models screen shows the current list, and `GET /v1/models` returns it. Replace `<model-id>` in the examples below with one of those IDs.
+
+NVIDIA can retire a model at any time; the app keeps working with the rest of the catalogue.
+
+## Client configuration
+
+Replace `<gateway-token>` with the token from the Endpoint screen and 12000 with the app's port if different.
+
+### Claude Code (Anthropic Messages)
+
+PowerShell:
+```powershell
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:12000"
+$env:ANTHROPIC_AUTH_TOKEN = "<gateway-token>"
+claude --model <model-id>
+```
+Bash/Zsh:
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:12000"
+export ANTHROPIC_AUTH_TOKEN="<gateway-token>"
+claude --model <model-id>
+```
+Use `ANTHROPIC_AUTH_TOKEN` (Bearer), not `ANTHROPIC_API_KEY`. No `/v1` in the base URL.
+
+### OpenCode
+
+The app can write this config for the user. Manual config in `%USERPROFILE%\.config\opencode\opencode.json` or `opencode.jsonc`:
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "nvidia-gateway": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "NV-Gateway",
+      "options": {
+        "baseURL": "http://127.0.0.1:12000/v1",
+        "apiKey": "{env:NVGW_TOKEN}"
+      },
+      "models": {
+        "<model-id>": { "name": "<model name>" }
+      }
+    }
+  }
+}
+```
+Set the environment variable `NVGW_TOKEN` to the gateway token.
+
+### Codex CLI (OpenAI Responses)
+
+`%USERPROFILE%\.codex\config.toml`:
+```toml
+model = "<model-id>"
+model_provider = "nv-gateway"
+
+[model_providers.nv-gateway]
+name = "NV-Gateway"
+base_url = "http://127.0.0.1:12000/v1"
+env_key = "NV_GATEWAY_TOKEN"
+wire_api = "responses"
+```
+Then set `NV_GATEWAY_TOKEN` to the gateway token and run `codex`.
+
+### Cline / Roo Code
+
+Provider: OpenAI Compatible. Base URL: `http://127.0.0.1:12000/v1`. API key: the gateway token. Model ID: any ID from `GET /v1/models`.
+
+### Aider
+
+```powershell
+$env:OPENAI_API_BASE = "http://127.0.0.1:12000/v1"
+$env:OPENAI_API_KEY  = "<gateway-token>"
+aider --model openai/<model-id>
+```
+
+### Continue
+
+`%USERPROFILE%\.continue\config.yaml`:
+```yaml
+name: NV-Gateway
+version: 1.0.0
+schema: v1
+models:
+  - name: NV-Gateway model
+    provider: openai
+    model: <model-id>
+    apiBase: http://127.0.0.1:12000/v1
+    apiKey: <gateway-token>
+```
+
+### Windsurf / OpenClaw
+
+Provider: OpenAI. Base URL: `http://127.0.0.1:12000/v1`. API key: the gateway token.
+
+### Cursor
+
+Custom OpenAI base URL `http://127.0.0.1:12000/v1` with the gateway token. Cursor cannot reach localhost, so it needs a paid Cursor plan and a public tunnel to the gateway.
+
+### Others
+
+The app's Endpoint screen has setups for more clients, including Kilo Code, Zed, GitHub Copilot and Open WebUI, with copy buttons for the base URL, token and model ID. Any OpenAI-compatible client works with `http://127.0.0.1:12000/v1`.
+
+## Network destinations
+
+- `integrate.api.nvidia.com`: prompts with one of the user's keys, model lists, capability checks (disable with `GATEWAY_CAPABILITY_PROBE_DISABLE=1`), key check when a key is added.
+- `api.ngc.nvidia.com`: public catalogue data, no key.
+- GitHub (`HaYkMnE/NV-Gateway`): update check at start and every 6 h; nothing installs without the user's consent.
+- `api.zeroeval.com`: model rankings, on by default, at most once per 24 h, no key or model IDs; turn off in Settings → Model ranking (LLM Stats).
+- `nv-gateway-reports.nvgw-sys.workers.dev`: error report, only when the user clicks Send.
+- No telemetry or analytics.
+
+## Troubleshooting
+
+- `429` from upstream: NVIDIA rate-limited the key. With several keys the gateway moves on; when all are limited, requests fail until a limit resets. Community reports put NVIDIA's per-key limit at about 40 requests per minute, varying by model; NVIDIA publishes no fixed number.
+- Gateway does not start with `EADDRINUSE`: another program holds the port or the port after it. Free both or pick another port in Settings → Change port.
+- Tray icon missing on Windows 11: it is in the overflow behind the `^` arrow next to the clock.
+
+## Limitations
+
+- Windows 10 and later only. No macOS or Linux.
+- Unsigned installer; SmartScreen warns on every new version. Some antivirus tools may flag it.
+- NVIDIA's free-tier limits apply. The user is responsible for using their keys in line with NVIDIA's terms.
+- A model that keeps failing is not hidden or marked automatically.
+- No published performance benchmarks.
+- Uninstall (Settings → Apps → NV-Gateway → Uninstall) keeps keys, config and logs in `%APPDATA%\NV-Gateway`; delete that folder to remove them.
+
+## Source and license
+
+- Source: https://github.com/HaYkMnE/NV-Gateway, Apache-2.0. Anyone can audit that keys stay on the user's PC.
+- All releases are built by GitHub Actions from this source. Every release has `SHA256SUMS.txt`.
+- The name "NV Gateway" and its logo are not licensed (Apache-2.0 §6); forks must use another name.
+- Build: `git clone https://github.com/HaYkMnE/NV-Gateway.git`, `npm ci`, `npx install-electron --no`, `npm run build`, `npm test`. Node.js 22.12 or later.
+- Security reports: private vulnerability reporting at https://github.com/HaYkMnE/NV-Gateway/security/advisories/new
+
+## Links
+
+- Releases: https://github.com/HaYkMnE/NV-Gateway/releases
+- README: https://github.com/HaYkMnE/NV-Gateway/blob/main/README.md
+- Privacy: https://github.com/HaYkMnE/NV-Gateway/blob/main/PRIVACY.md
+- Security: https://github.com/HaYkMnE/NV-Gateway/blob/main/.github/SECURITY.md
+- Issues: https://github.com/HaYkMnE/NV-Gateway/issues
+- NVIDIA API keys: https://build.nvidia.com

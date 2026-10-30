@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <!-- NV-Gateway app icon: dark chassis square, hollow green hexagon ring with
+       dark keyline, solid energized core. Source for icon.png; regenerate with
+       tools/rasterize-icons.mjs --icon. See ICONS.md. -->
+  <rect x="0" y="0" width="1024" height="1024" rx="96" fill="#0D110E" stroke="#1A221C" stroke-width="8"/>
+  <path d="M512 132 L841.2 322 L841.2 702 L512 892 L182.8 702 L182.8 322 Z" fill="none" stroke="#0A0E0B" stroke-width="85" stroke-linejoin="round"/>
+  <path d="M512 132 L841.2 322 L841.2 702 L512 892 L182.8 702 L182.8 322 Z" fill="none" stroke="#76B900" stroke-width="60" stroke-linejoin="round"/>
+  <path d="M512 384 L622.9 448 L622.9 576 L512 640 L401.1 576 L401.1 448 Z" fill="#76B900" stroke="#0A0E0B" stroke-width="12" stroke-linejoin="round"/>
+</svg>

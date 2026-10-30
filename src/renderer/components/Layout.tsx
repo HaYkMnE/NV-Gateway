@@ -1,0 +1,316 @@
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Outlet, NavLink, useNavigate, useLocation } from 'react-router-dom';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useTranslation } from 'react-i18next';
+import { AlertTriangle, Boxes, KeyRound, Lightbulb, Loader2, Menu, Plug, RefreshCw, ScrollText, Settings, X } from 'lucide-react';
+import { useConfigStore } from '../stores/config';
+import { Logo } from './Logo';
+import { reduceMenu } from '../lib/frontend-behavior';
+import { GatewayLifecycleContext, type GatewayLifecycleSnapshot } from '../lib/gateway-lifecycle';
+import { useModal } from '../lib/modal-context';
+import { ErrorBoundary } from './ErrorBoundary';
+import { PetWidget } from '../pet/PetWidget';
+
+const navClass = (active: boolean) =>
+  `flex items-center gap-3 px-3.5 py-2.5 short:py-2 rounded-sm text-sm transition-colors ${
+    active
+      ? 'bg-surface text-accent-neon font-medium border-s-2 border-accent-neon'
+      : 'text-textMuted hover:bg-surface hover:text-accent-neon'
+  }`;
+
+const Navigation = memo(function Navigation({ onNavigate }: { onNavigate?: () => void }) {
+  const { t } = useTranslation();
+  return (
+    <nav className="flex flex-col gap-1.5 short:gap-1">
+      <NavLink onClick={onNavigate} to="/dashboard" className={({ isActive }) => navClass(isActive)}>
+        <KeyRound aria-hidden size={18} />
+        {t('keys')}
+      </NavLink>
+      <NavLink onClick={onNavigate} to="/models" className={({ isActive }) => navClass(isActive)}>
+        <Boxes aria-hidden size={18} />
+        {t('models')}
+      </NavLink>
+      <NavLink onClick={onNavigate} to="/endpoint" className={({ isActive }) => navClass(isActive)}>
+        <Plug aria-hidden size={18} />
+        {t('endpoint')}
+      </NavLink>
+      <NavLink onClick={onNavigate} to="/logs" className={({ isActive }) => navClass(isActive)}>
+        <ScrollText aria-hidden size={18} />
+        {t('logs')}
+      </NavLink>
+      <NavLink onClick={onNavigate} to="/settings" className={({ isActive }) => navClass(isActive)}>
+        <Settings aria-hidden size={18} />
+        {t('settings')}
+      </NavLink>
+    </nav>
+  );
+});
+
+const StatusDisplay = memo(function StatusDisplay({
+  status,
+  gatewayPort,
+  retrying,
+  onRetry,
+  onChangePort,
+}: {
+  status: GatewayStatus;
+  gatewayPort: number;
+  retrying: boolean;
+  onRetry: () => void;
+  onChangePort: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="min-w-0 break-words">
+      <div className="flex items-center gap-2">
+        <span
+          aria-hidden
+          className={`w-2 h-2 rounded-full ${
+            status.state === 'running'
+              ? 'bg-nvidia'
+              : status.state === 'starting'
+              ? 'bg-warning animate-pulse'
+              : status.state === 'error'
+              ? 'bg-error'
+              : 'bg-textMuted'
+          }`}
+        />
+        <span className="text-sm font-medium">{t(`gateway_${status.state}`)}</span>
+      </div>
+      <div className="text-xs text-textMuted font-mono">
+        {t('port_label')} <bdi dir="ltr">{status.port ?? gatewayPort}</bdi>
+      </div>
+      {status.state === 'error' && (
+        <div role="alert" className="mt-2 border border-error/60 bg-error/10 p-2 text-xs text-error break-words">
+          <div className="flex gap-1">
+            <AlertTriangle aria-hidden size={15} />
+            <span>{t(status.code === 'PORT_IN_USE' ? 'port_conflict' : status.code === 'RUNTIME_EXIT' ? 'runtime_exit' : 'start_failed')}</span>
+          </div>
+          <div className="mt-2 flex gap-3">
+            <button onClick={onRetry} disabled={retrying} className="text-textMain hover:text-accent-neon">
+              {retrying ? (
+                <Loader2 aria-label={t('loading')} size={13} className="animate-spin" />
+              ) : (
+                <>
+                  <RefreshCw aria-hidden size={13} className="inline me-1" />
+                  {t('retry')}
+                </>
+              )}
+            </button>
+            <button onClick={onChangePort} className="text-textMain hover:text-accent-neon">
+              {t('change_port')}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+});
+
+export function Layout() {
+  const { t } = useTranslation();
+  const navigate = useNavigate();
+  // Path of the routed view: the error boundary's reset key (navigating away
+  // from a crashed view must clear it).
+  const viewPath = useLocation().pathname;
+  const { gatewayPort } = useConfigStore();
+  const { openFeedback, openDonation } = useModal();
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const menuButton = useRef<HTMLButtonElement>(null);
+  const queryClient = useQueryClient();
+
+  const statusQuery = useQuery({
+    queryKey: ['gateway-status'],
+    queryFn: () => window.electronAPI.getGatewayStatus(),
+    // Primary delivery is now the main->renderer push on 'gateway-status-changed'
+    // (subscribed below). This poll is only the SAFETY NET: a push is lost
+    // whenever the window is absent or destroyed at the moment of the transition
+    // (sendGatewayStatus is inert then, by design), so a slow backup poll must
+    // remain — but 1 Hz is no longer paying for anything, so it drops to 30 s.
+    refetchInterval: 30000,
+    // Default refetchIntervalInBackground (false) follows document.visibilityState,
+    // so the poll pauses when the window is hidden or minimised to tray — polling
+    // a window nobody can see burns IPC round-trips for nothing. The status
+    // display itself cannot go stale while hidden BECAUSE it is hidden; on
+    // reveal, refetchOnWindowFocus: 'always' and staleTime: 0 (overriding the
+    // global staleTime: 3000 in App.tsx) guarantee an immediate refetch
+    // regardless of whether the window was hidden for <3s, eliminating up to
+    // 1.0s of reveal staleness (51fb01d; measured 15.5 ms after that fix).
+    refetchOnWindowFocus: 'always',
+    staleTime: 0,
+  });
+
+  // The push half of the channel: main hands every gateway transition to the
+  // renderer, so the tree updates in milliseconds instead of at the next poll
+  // tick. setQueryData — NOT invalidateQueries: the push already carries the
+  // full four-field status, and invalidating would reintroduce one IPC
+  // round-trip per transition (the exact cost this channel exists to remove).
+  // The returned unsubscribe is the effect cleanup, so a remount cannot stack
+  // listeners on a channel that fires on every transition.
+  // A backup/focus fetch may already be in flight when the push arrives. Cancel
+  // it before committing the newer transition; otherwise its older response can
+  // resolve afterward and roll the cache back (for example error -> running).
+  useEffect(() => window.electronAPI.onGatewayStatusChanged((status) => {
+    void queryClient.cancelQueries({ queryKey: ['gateway-status'] });
+    queryClient.setQueryData(['gateway-status'], status);
+  }), [queryClient]);
+
+  const status: GatewayStatus = useMemo(() => {
+    if (statusQuery.data) return statusQuery.data;
+    if (statusQuery.error) {
+      return {
+        state: 'error',
+        code: 'START_FAILED',
+        message: statusQuery.error instanceof Error ? statusQuery.error.message : t('unknown_error'),
+      };
+    }
+    return { state: 'starting' };
+  }, [statusQuery.data, statusQuery.error, t]);
+
+  const lifecycleValue = useMemo<GatewayLifecycleSnapshot>(
+    () => ({
+      status,
+      isError: statusQuery.isError,
+      refetch: statusQuery.refetch,
+    }),
+    [status, statusQuery.isError, statusQuery.refetch]
+  );
+
+  const closeMenu = useCallback((returnFocus = false) => {
+    setMenuOpen(false);
+    if (returnFocus) window.setTimeout(() => menuButton.current?.focus(), 0);
+  }, []);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const key = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setMenuOpen((open) => reduceMenu(open, { type: 'escape' }));
+        window.setTimeout(() => menuButton.current?.focus(), 0);
+      }
+    };
+    document.addEventListener('keydown', key);
+    return () => document.removeEventListener('keydown', key);
+  }, [menuOpen]);
+
+  const retry = useCallback(async () => {
+    setRetrying(true);
+    try {
+      await window.electronAPI.retryGateway();
+      await statusQuery.refetch();
+    } finally {
+      setRetrying(false);
+    }
+  }, [statusQuery.refetch]);
+
+  const handleNavigate = useCallback(() => {
+    closeMenu();
+  }, [closeMenu]);
+
+  const handleRetry = useCallback(() => {
+    void retry();
+  }, [retry]);
+
+  const handleChangePort = useCallback(() => {
+    navigate('/wizard?mode=change');
+  }, [navigate]);
+
+  return (
+    <div className="flex h-full min-w-0 overflow-hidden">
+      <aside className="hidden md:flex w-[250px] shrink-0 bg-bg border-e border-border flex-col overflow-hidden">
+        <div className="shrink-0 p-5 pb-2 short:pt-3">
+          <div className="flex items-center gap-3 mb-4 short:mb-2">
+            <Logo className="w-9 h-9" />
+            <h1 className="font-bold text-lg">{t('product_name')}</h1>
+          </div>
+          <Navigation onNavigate={handleNavigate} />
+        </div>
+        {/* §12 pet scroller: only the pet region scrolls; nav and status stay pinned. */}
+        <div className="flex-1 min-h-0 flex flex-col overflow-y-auto overflow-x-hidden overscroll-contain">
+          <div className="px-5 my-auto py-2 short:py-1">
+            <PetWidget onOpenDonation={openDonation} />
+          </div>
+        </div>
+        <div className="shrink-0 bg-bg p-5 pt-3 short:pt-2 short:pb-3 border-t border-border-soft">
+          <StatusDisplay
+            status={status}
+            gatewayPort={gatewayPort}
+            retrying={retrying}
+            onRetry={handleRetry}
+            onChangePort={handleChangePort}
+          />
+          <button
+            onClick={() => openFeedback()}
+            className="mt-3 short:mt-2 w-full flex items-center justify-center gap-2 border border-border px-3 py-2 short:py-1.5 text-xs font-medium text-textMuted hover:text-accent-neon hover:border-accent-neon/50 transition-colors"
+            aria-label={t('feedback_title')}
+          >
+            <Lightbulb aria-hidden size={15} />
+            {t('feedback_title')}
+          </button>
+        </div>
+      </aside>
+      <div className="flex flex-1 min-w-0 flex-col">
+        <header className="md:hidden border-b border-border bg-bg p-3 flex items-center gap-3">
+          <button
+            ref={menuButton}
+            aria-label={t('menu')}
+            aria-expanded={menuOpen}
+            aria-controls="mobile-navigation"
+            onClick={() => setMenuOpen((open) => reduceMenu(open, { type: 'toggle' }))}
+            className="p-2 text-accent-neon"
+          >
+            {menuOpen ? <X aria-hidden /> : <Menu aria-hidden />}
+          </button>
+          <Logo className="w-8 h-8" />
+          <h1 className="font-bold text-lg">{t('product_name')}</h1>
+          <div className="ms-auto flex items-center gap-2 max-w-[60%]">
+            <StatusDisplay
+              status={status}
+              gatewayPort={gatewayPort}
+              retrying={retrying}
+              onRetry={handleRetry}
+              onChangePort={handleChangePort}
+            />
+            <button
+               onClick={() => openFeedback()}
+              className="p-2 text-textMuted hover:text-accent-neon transition-colors"
+              aria-label={t('feedback_title')}
+              title={t('feedback_title')}
+            >
+              <Lightbulb aria-hidden size={18} />
+            </button>
+          </div>
+        </header>
+        {menuOpen && (
+          <>
+            <button
+              aria-label={t('close_menu')}
+              className="md:hidden fixed inset-0 z-20 bg-black/60"
+              onClick={() => closeMenu(true)}
+            />
+            <aside
+              id="mobile-navigation"
+              className="md:hidden fixed inset-y-0 start-0 z-30 w-[min(250px,85vw)] bg-bg border-e border-border p-5"
+            >
+              <div className="mb-8">
+                <Logo className="w-9 h-9" />
+              </div>
+              <Navigation onNavigate={handleNavigate} />
+            </aside>
+          </>
+        )}
+        <main className="flex-1 min-w-0 overflow-hidden bg-bg">
+          <GatewayLifecycleContext.Provider value={lifecycleValue}>
+            {/* A throw inside a view used to blank the whole window. The
+                boundary keeps the nav/pet/modals alive and offers Retry;
+                resetKey clears it on navigation. */}
+            <ErrorBoundary resetKey={viewPath}>
+              <Outlet />
+            </ErrorBoundary>
+          </GatewayLifecycleContext.Provider>
+        </main>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,824 @@
+// Error reporter for the NV-Gateway main process.
+//
+// Writes JSONL entries to %APPDATA%\NV-Gateway\logs\errors.log, applies
+// secret / local-path / email sanitization, expires entries older than 10
+// days, keeps an on-disk report snapshot, and uploads a bundle to the
+// Cloudflare Worker reporting endpoint (/v1/error).
+//
+// Sanitization (applied before writing and again before sending):
+//   nvapi-<...>      -> nvapi-***
+//   sk-<...>         -> sk-***   (word boundary + min 20 chars to avoid
+//                              matching "disk", "task", "risk", etc.)
+//   C:\Users\<user>\ -> C:\Users\***\
+//   <addr>@<domain>  -> ***@***.***
+
+import { app } from "electron";
+import * as fs from "node:fs";
+import * as path from "node:path";
+
+import { sanitizeReportEntry } from "./report-sanitizer";
+import { REPORTS_BASE_URL } from "./reports-endpoint";
+
+// Reporting endpoint of the deployed Cloudflare Worker (POST /v1/error).
+// No auth headers — the worker accepts unauthenticated writes.
+const REPORT_ENDPOINT = `${REPORTS_BASE_URL}/v1/error`;
+// The worker rejects serialized `report` bodies above this size; oversized
+// bundles drop their oldest entries until they fit (see fitReportForWorker).
+const MAX_REPORT_BODY_BYTES = 65536;
+const SEND_TIMEOUT_MS = 15000;
+
+const RETENTION_DAYS = 10;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+// Size cap for errors.log, DELIBERATELY the same scheme and the same numbers as
+// app-logger.ts:5-6 (5 MB x 3) rather than a second scheme invented here.
+//
+// WHY IT WAS NEEDED. Retention was the ONLY bound on this file, and it is
+// evaluated in exactly two places: on READ (withinRetention, which filters what
+// is counted and previewed but never shrinks the file) and in cleanupOldErrors(),
+// whose single call site is init(). So a session that never restarts never
+// reclaims anything: no init(), no cleanup, no cap.
+//
+// MEASURED before this cap existed, with one fault repeating in a single session
+// (tests/error-reporter-bounds.test.mjs): 1,400 entries carrying an 8,000-unit
+// stack wrote 11,359,890 bytes to one file at 8,114 bytes per entry, with zero
+// rotated files. That is 2.2x the 5 MB the app logger caps at, still climbing,
+// and the projection is linear in the fault rate: a loop logging a handful of
+// times a second fills a disk in a long-running session.
+//
+// TWO CONSEQUENCES, STATED RATHER THAN HIDDEN, both inherited from the app-logger
+// scheme this deliberately matches:
+//
+//   * readErrors() reads the ACTIVE log only, so once a generation rotates out its
+//     entries stop being counted by getErrorCount(), previewed, or sent. That is
+//     the point of a cap — the alternative is an unbounded read of up to 20 MB into
+//     memory to build a 64 KB report — but it does mean a fault storm can now push
+//     older still-in-retention entries out of the report. Before this change they
+//     were retained; before this change the file was also unbounded.
+//   * cleanupOldErrors() rewrites the active log only, so rotated generations are
+//     bounded by SIZE (3 x 5 MB) rather than by the 10-day clock. Retention on the
+//     active log is unchanged, which is the behaviour the counters and the preview
+//     actually read.
+const MAX_LOG_SIZE = 5 * 1024 * 1024;
+const MAX_ROTATED_LOGS = 3;
+
+// Per-field caps for a stored error record, in UTF-16 CODE UNITS.
+//
+// WHY THIS MODULE STATES ITS OWN BOUND. Until now the only thing limiting these
+// fields was `redaction.ts:83` ending `.slice(0, 16_384)` — a truncation that
+// exists for REDACTION reasons, in a module this one does not own and which has
+// no stake in how big a log record may be. MEASURED before this cap existed:
+// `logError({ message: 'a'.repeat(100000) })` stored exactly 16,384 units, the
+// slice bound to the character, with nothing in the record indicating that 83,616
+// units had been dropped. Raise or remove that slice and this path is unbounded
+// again, silently. `feedback-validation.ts` was made independent of the same slice
+// for the same reason (see its header); this is the remaining caller that was not.
+//
+// 4,000 MATCHES THAT PRECEDENT rather than inventing a second scheme: the feedback
+// paths bound their fields so the worst case is 3,998 units against the same
+// 16,384 threshold. 4,000 units holds a full diagnostic message and roughly 40-50
+// stack frames, so nothing diagnostically useful is lost, and it sits at a quarter
+// of the slice so this module's bound is what binds.
+//
+// TRUNCATION IS VISIBLE, NOT SILENT. The record says what was dropped and how big
+// the input was. It cannot say so in a NEW FIELD: sanitizeReportEntry keeps a
+// fail-closed ALLOW-LIST of fields (report-sanitizer.ts:29) and drops everything
+// else, so a `truncated` flag would be discarded on the way out. The note goes in
+// the value, in the same untranslated-marker style as `[REDACTED]`, `[omitted]`
+// and `[Circular]`, so it adds no user-facing string and no i18n key.
+//
+// THE SIZE IS NAMED, THE CONTENT IS NEVER ECHOED — same discipline as
+// assertClipboardText (index.ts:715) and assertText (feedback-validation.ts:86):
+// an error message can carry an NVIDIA key or the gateway token.
+const MAX_MESSAGE_UNITS = 4000;
+const MAX_STACK_UNITS = 4000;
+// `source` is a short origin discriminator — the call sites in this file pass
+// "main", and the renderer passes a view name. It is still renderer-supplied
+// free text, so it needs its own bound or it inherits the slice exactly as the
+// other fields did.
+const MAX_SOURCE_UNITS = 200;
+// A `timestamp` this module accepts is one Date.parse understands, and every such
+// spelling is far shorter than this; the cap only stops an unparsed-but-long value
+// from being stored. No marker is appended to this field — it is PARSED by
+// withinRetention, so a note inside the value would make the entry unexpirable.
+const MAX_TIMESTAMP_UNITS = 64;
+
+/**
+ * Every LONE UTF-16 surrogate: a high surrogate not followed by a low, or a low
+ * not preceded by a high. A well-formed pair never matches. Same pattern as
+ * feedback-service.ts:33 — a per-field cut here can split a pair exactly as a
+ * cut there could.
+ */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+// Sanitization lives in ./report-sanitizer, which builds on ./redaction — the
+// same redactor the app logger uses. The regex-only sanitizer that used to live
+// here could not see gatewayToken / adminToken (random, unprefixed base64url) and
+// inspected values only, never key names.
+
+export interface ErrorEntry {
+  timestamp: string;
+  type: "uncaughtException" | "unhandledRejection" | "gateway" | "renderer";
+  message: string;
+  stack?: string;
+  source?: string;
+}
+
+export interface ErrorReportResult {
+  success: boolean;
+  count: number;
+  message: string;
+  reportPath?: string;
+}
+
+let initialized = false;
+
+// Per-process protector hook, set by an optional `init(protectFile)` argument.
+// Defaults to a no-op so existing `init()` call sites keep working unchanged.
+// Mirrors app-logger.ts:9 — the hook exists so the main process can re-apply the
+// 0o600 + Windows ACL hardening this log family was missing while the ACL wiring
+// stays out of this module (error-reporter owns size/retention, not ACLs).
+let protectFile: (filePath: string) => void = () => {};
+
+function dataDir(): string {
+  // app.getPath("userData") resolves to %APPDATA%\NV-Gateway once the app
+  // name is aligned with electron-builder productName.
+  return app.getPath("userData");
+}
+
+function errorsLogPath(): string {
+  return path.join(dataDir(), "logs", "errors.log");
+}
+
+function reportsDir(): string {
+  return path.join(dataDir(), "reports");
+}
+
+// Delegates to the shared, fail-closed sanitizer: allow-listed fields only, each
+// passed through ./redaction (runtime secrets by exact match + sensitive key
+// names + Bearer stripping). The previous local implementation forwarded every
+// field it was handed and could not see an unprefixed gatewayToken/adminToken.
+function sanitizeEntry(entry: Record<string, unknown>): Record<string, unknown> {
+  return sanitizeReportEntry(entry);
+}
+
+/**
+ * Bound one already-sanitized field and record the loss inside the value.
+ *
+ * ORDER MATTERS, AND IT IS SANITIZE-THEN-BOUND. Cutting first would be a
+ * security regression, not merely a cosmetic difference: `redact()` removes
+ * registered runtime secrets by EXACT MATCH (redaction.ts:83), so a cut landing
+ * inside the gateway or admin token would leave a PREFIX of that token, which no
+ * longer matches, is no longer removed, and is written to disk verbatim. Bounding
+ * the redacted text cannot resurrect a secret, because every secret is already
+ * `[REDACTED]` by then.
+ *
+ * THE SIZE REPORTED IS THE ORIGINAL INPUT'S, not the sanitized string's, for two
+ * reasons. It is the number an operator actually wants ("the renderer sent us
+ * 100,000 units"), and it is invariant: redaction both shrinks text (a token
+ * becomes `[REDACTED]`) and grows it (`nvapi-a`, 7 units, becomes `[REDACTED]`,
+ * 10), so quoting the post-redaction size would make the recorded figure depend on
+ * the very slice this bound exists to be independent of.
+ *
+ * @param value Sanitized field value.
+ * @param originalUnits Length in UTF-16 units of the value as the caller supplied it.
+ * @param max Cap for this field.
+ * @param field Field name, used in the marker. The VALUE is never echoed.
+ * @returns The value unchanged, or a truncated value carrying a size marker.
+ */
+function boundField(value: unknown, originalUnits: number, max: number, field: string): string {
+  const text = typeof value === "string" ? value : "";
+  // THE MARKER FOLLOWS THE CUT, NOT THE INPUT SIZE. The condition was
+  // `text.length <= max && originalUnits <= max`, which appended the marker
+  // whenever the CALLER's value was long — even when the value being stored was
+  // not cut at all. MEASURED: `nvapi-` + 4,200 units is one runtime secret, so
+  // redaction collapses it to `[REDACTED]` (10 units) and nothing is lost, yet
+  // the record read `[REDACTED][truncated: message was 4206 units, cap 4000]` —
+  // 55 units claiming 4,196 units of loss that never happened. A diagnostic
+  // record that reports imaginary data loss sends an operator hunting a
+  // truncation that is not there, so the marker is now attached only when this
+  // function actually cuts something.
+  if (text.length <= max) return text;
+  // LONE SURROGATE REPAIR, same substitution and same reason as
+  // encodeFieldForUrl (feedback-service.ts:93). A cut at an arbitrary UTF-16
+  // index lands between the halves of a surrogate pair, MANUFACTURING a lone
+  // surrogate that was not in the input. MEASURED at this cap: 3,999 units then
+  // U+1F600 stored U+D83D at index 3,999 with no low surrogate after it. It does
+  // not break this file (JSON.stringify emits `\ud83d`, and the line re-parses),
+  // but it is invalid text this module invented, and one U+FFFD per broken half
+  // is what a UTF-8 encoder produces anyway. The substitution is 1:1, so the cap
+  // still binds at exactly `max` units.
+  const cut = text.slice(0, max).replace(LONE_SURROGATE, "\uFFFD");
+  // THE SIZE NAMED IS THE ONE THAT EXPLAINS THE CUT. Normally that is the
+  // caller's own figure, which is what an operator wants and the only figure
+  // independent of the slice. But redaction can GROW text (`nvapi-a`, 7 units,
+  // becomes `[REDACTED]`, 10), so a 3,900-unit message of many such tokens
+  // exceeds a 4,000 cap only AFTER sanitizing; quoting 3,900 against a cap of
+  // 4,000 would read as a contradiction in the one record meant to explain
+  // itself. Whichever size actually crossed the cap is reported.
+  const reportedUnits = Math.max(originalUnits, text.length);
+  // Names the field and the sizes, never the content — assertClipboardText and
+  // assertText (feedback-validation.ts:86) hold the same line, because this text
+  // can contain a credential the redactor did not recognise.
+  //
+  // A FORGED MARKER IS DETECTABLE BY ARITHMETIC, so it needs no mechanism. Text
+  // ending in something SHAPED like this marker is stored verbatim on a field that
+  // was never cut (measured: a 160-unit stack ending in `[truncated: stack was
+  // 999999 units, cap 4000]` is stored exactly as sent), which could mislead a
+  // human reader. A `truncated` BOOLEAN cannot be the answer — sanitizeReportEntry
+  // keeps a fail-closed allow-list of five fields (report-sanitizer.ts:29) and
+  // would drop a sixth on the way out — but none is needed, because a genuine
+  // marker satisfies a size relation a forgery CANNOT:
+  //
+  //   genuine  =>  value.length === max + `[truncated: <field> was <n> units, cap <max>]`.length
+  //
+  // holds by construction, since the value was cut to exactly `max` before the
+  // marker was appended. A forger has only two moves and the arithmetic refuses
+  // both: stay within the cap and the stored length is <= max, which is strictly
+  // less than max + markerLength, so the relation cannot hold; exceed the cap and
+  // the text is cut at `max`, discarding their trailing marker along with
+  // everything past the cut, and the genuine marker is appended after it. The
+  // trailing marker of a truncated value is therefore always this function's own.
+  // Pinned by tests/error-reporter-rotation-obstructed.test.mjs so it cannot decay
+  // into a comment that used to be true.
+  return `${cut}[truncated: ${field} was ${reportedUnits} units, cap ${max}]`;
+}
+
+// Clamps the report bundle to the worker's serialized-size limit by dropping
+// the oldest entries first.  Mutates the report in place; `count` is kept
+// consistent with the retained entries.  A single entry larger than the
+// limit is still sent once — the HTTP failure path handles that gracefully.
+function fitReportForWorker(report: { timestamp: string; count: number; errors: unknown[] }): void {
+  while (Buffer.byteLength(JSON.stringify(report), "utf8") > MAX_REPORT_BODY_BYTES && report.errors.length > 1) {
+    report.errors.shift();
+    report.count = report.errors.length;
+  }
+}
+
+function readErrors(): Record<string, unknown>[] {
+  const file = errorsLogPath();
+  if (!fs.existsSync(file)) return [];
+  const out: Record<string, unknown>[] = [];
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch {
+    return [];
+  }
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      out.push(JSON.parse(trimmed) as Record<string, unknown>);
+    } catch {
+      // Ignore malformed lines — JSONL is append-only and best-effort.
+    }
+  }
+  return out;
+}
+
+// Rotate errors.log once it reaches MAX_LOG_SIZE, keeping MAX_ROTATED_LOGS
+// generations. Same algorithm as app-logger.ts:19-41 — oldest generation removed
+// first, then each generation shifted up from the highest down so nothing is
+// overwritten — with two deliberate differences:
+//
+//   * the extension is `.log`, not `.jsonl`, so the basename is stripped with a
+//     `\.log$` rule. Copying app-logger's `\.jsonl$` rule verbatim would have
+//     produced `errors.log.1.jsonl`.
+//   * protectFile is applied BOTH from init(protect) at startup AND from
+//     rotateIfNeeded, exactly as app-logger.ts:19-71 does. It originally ran
+//     only from init(), on the argument that init() alone "hardens the active
+//     file that a rotation re-creates". MEASURED FALSE (see the note on the
+//     rotation loop): rotation renames the protected active inode OUT of the
+//     active path and the append re-creates the path with the process DEFAULT
+//     mode and NO ACL call, so from the first rotation onward the file the
+//     reporter keeps writing to is unprotected. init()'s one-shot protection is
+//     gone the moment the first rotation moves it. Re-applying here costs one
+//     openSync + one protectFile per rotation — rotations are rare by
+//     construction (only past 5 MB) — which is the same trade app-logger already
+//     makes. An unwired protector (the default) still preserves the pre-existing
+//     no-ACL behaviour exactly, because protectFile defaults to a no-op.
+//
+// Every failure is swallowed: a logger must never throw into its caller, and a
+// failed rotation must still leave the append below to run.
+//
+// THE FAILURES STAY SWALLOWED; THE FACT OF THEM NO LONGER IS. Swallowing was
+// never the defect — appending REGARDLESS was. When all three generation names
+// are occupied and can be neither unlinked nor renamed onto (an antivirus
+// scanner, a backup tool, an editor, a stale handle), every step here fails, the
+// caller appends anyway, and the 5 MB x 3 cap becomes fiction.
+//
+// MEASURED with the cap lowered to 64 KiB so the same branch is exercised
+// cheaply (tests/error-reporter-rotation-obstructed.test.mjs): with all three
+// generation names occupied, 900 appends grew the active log to 1,904,290 B —
+// 29.06x the cap — and a second identical batch added exactly 1,904,290 B more,
+// reaching 58.11x. Linear in the fault rate, with no ceiling at all.
+//
+// The signal is deliberately the POST-CONDITION rather than a caught error: what
+// the caller needs to know is not which syscall failed but whether the active log
+// is still over its cap now that rotation has been attempted. A partial rotation
+// that frees the active name is a success by that measure, and correctly so.
+//
+// @returns true when the active log is STILL at/over MAX_LOG_SIZE afterwards.
+function rotateIfNeeded(file: string): boolean {
+  try {
+    if (fs.statSync(file).size < MAX_LOG_SIZE) return false;
+  } catch {
+    // No file yet, or it cannot be stat'ed: nothing to rotate. As in
+    // app-logger.ts:24-33, the append that follows will RE-CREATE the active
+    // path at the process default mode with no ACL, so a MISSING active file
+    // must be (re-)protected here too. Guarded + isolated so a protector
+    // failure can never escape into logError.
+    try {
+      fs.closeSync(fs.openSync(file, "a", 0o600));
+      protectFile(file);
+    } catch {
+      // Best-effort, like every other protect path here.
+    }
+    return false;
+  }
+
+  const baseName = file.replace(/\.log$/, "");
+  try {
+    fs.unlinkSync(`${baseName}.${MAX_ROTATED_LOGS}.log`);
+  } catch {
+    // The oldest generation may not exist yet.
+  }
+
+  // Highest generation first so a rename never clobbers a file still needed.
+  // i === 1 moves the active log itself; i > 1 moves generation i-1 up to i.
+  //
+  // EACH ROTATED TARGET IS RE-PROTECTED, and the ACTIVE path is re-protected
+  // after the rename, mirroring app-logger.ts:49 and :65-70. MEASURED DEFECT
+  // this replaces, against the real compiled module with a real protector
+  // recorded: 0 protect calls occurred during a rotation, and the re-created
+  // active errors.log was left with the process default protections while every
+  // rotated generation kept the ACL it was born with. `activeRotated` alone is
+  // NOT a sufficient guard for the same reason it was insufficient in
+  // app-logger (tests/app-logger-rotation-reprotection.test.mjs, the "F3" case):
+  // if protectFile(newPath) throws on the rotated target, the whole line is
+  // caught and `activeRotated` is never set — yet the active file has already
+  // been renamed away, so the append re-creates it UNPROTECTED. The guard is
+  // therefore `activeRotated || !fs.existsSync(file)`.
+  let activeRotated = false;
+  for (let i = MAX_ROTATED_LOGS; i >= 1; i -= 1) {
+    const from = i === 1 ? file : `${baseName}.${i - 1}.log`;
+    const to = `${baseName}.${i}.log`;
+    try {
+      fs.renameSync(from, to);
+      if (i === 1) activeRotated = true;
+      protectFile(to);
+    } catch {
+      // A missing generation is normal before the log has rotated that often,
+      // and a failed protect of one generation must not stop the others.
+    }
+  }
+
+  // Re-create + re-protect the ACTIVE file. The rename moved the protected inode
+  // OUT of the active path and the append below re-creates it with the process
+  // default mode and no ACL; this is the file the reporter keeps writing to, so
+  // it gets the same 0o600 open and the same protector init() applied at
+  // startup. Best-effort: a failed re-protection must not cost the log entry
+  // below, and must never escape into logError.
+  if (activeRotated || !fs.existsSync(file)) {
+    try {
+      fs.closeSync(fs.openSync(file, "a", 0o600));
+      protectFile(file);
+    } catch {
+      // Ignore.
+    }
+  }
+
+  // THE POST-CONDITION, not a tally of caught errors. A rotation that fails to
+  // drop the oldest generation but still succeeds in moving the ACTIVE log aside
+  // has done the only job that matters here, and reporting it as obstructed would
+  // suppress appends for no reason. So the question asked is simply: is the active
+  // log still at its cap?
+  //
+  // A successful rotation renames the active log away, so statSync throws ENOENT
+  // and this returns false — rotation worked, the next append starts a new file.
+  try {
+    return fs.statSync(file).size >= MAX_LOG_SIZE;
+  } catch {
+    return false;
+  }
+}
+
+// ---- Suppression state while rotation is obstructed ----
+//
+// THE DISK BUDGET OUTRANKS LOG COMPLETENESS. When rotation cannot proceed and the
+// active log is already at its cap, the choice is between growing without bound
+// and dropping entries. Growing without bound is the worse failure: it is what
+// fills the volume the app, the gateway logs and the user's own data share, and it
+// is unbounded in the one situation where the machine is already unhealthy.
+//
+// THREE SCALARS, NEVER THE CONTENT. The suppressed ENTRIES are not queued for
+// later — that would move an unbounded disk problem into unbounded memory, which
+// is the same defect with a worse failure mode. What is kept is a count and the
+// two wall-clock instants that delimit the gap, so the state is O(1) whether ten
+// entries or ten million were dropped.
+let suppressingAppends = false;
+let suppressedCount = 0;
+let suppressedSince = "";
+let suppressedUntil = "";
+
+/** Record that one entry was dropped. Pure arithmetic — cannot throw. */
+function noteSuppressed(): void {
+  const now = new Date().toISOString();
+  if (suppressedCount === 0) suppressedSince = now;
+  suppressedUntil = now;
+  suppressedCount += 1;
+}
+
+/**
+ * The ONE record that makes the gap visible after rotation recovers.
+ *
+ * TYPE IS THE CATCH-ALL BUCKET, DELIBERATELY. This is not a renderer fault, but
+ * `type` may only be one of four values: sanitizeReportEntry normalises anything
+ * else to "renderer" (report-sanitizer.ts:67), and that module is not this one's
+ * to change. Inventing a fifth value would therefore be silently rewritten to the
+ * same bucket, so it is chosen openly instead, and the TRUE origin is carried in
+ * `source`, which is free text that survives intact. The message names itself, so
+ * a reader is not relying on `type` to tell what this record is.
+ *
+ * NO i18n KEY. `[log-suppressed: …]` is an internal log marker in the same
+ * untranslated style as `[REDACTED]`, `[omitted]` and `[Circular]`, and the locale
+ * files hold a fixed key count each — a count the i18n parity suites pin
+ * (feedback-save-path-visible and logs-copy-failure-detail assert it for every
+ * locale; app-hydration-i18n-loop asserts it for en and ru).
+ *
+ * IT IS SANITIZED AND BOUNDED LIKE EVERY OTHER RECORD, in that order, and it did
+ * NOT USED TO BE. The argument for skipping both was that no caller data reaches
+ * this record: every part is generated here, an integer counter, two ISO timestamps
+ * from new Date(), and one fixed English sentence, so there is no secret to redact
+ * and nothing whose length a caller controls. That argument is true TODAY and it is
+ * still the wrong place to rely on it, for two measured reasons.
+ *
+ * MEASURED, cost of routing it through: NONE. sanitizeReportEntry leaves this
+ * record byte-identical (179-unit message in, 179 out, whole object deep-equal),
+ * and at ~170 units against a 4,000-unit cap boundField returns it untouched with
+ * no marker. So the bypass bought nothing and the defence is free.
+ *
+ * MEASURED, cost of keeping the bypass: a plausible near-future edit leaks. With
+ * the log PATH interpolated into the message, which is the obvious next thing an
+ * operator asks for, the record reached disk as
+ * `C:\Users\victim\AppData\errors.log nvapi-DEADBEEFCAFE [log-suppressed: ...]`:
+ * the local ACCOUNT NAME and an nvapi key stored verbatim, and an extra field on
+ * the object survived to disk as well. Through this path the same edit stores
+ * `C:\Users\***\`, `[REDACTED]`, and the extra field is dropped by the allow-list.
+ * A path that skips the sanitizer is how secrets leak; "nobody interpolates caller
+ * text here today" is a property of today's code, not an invariant of this record.
+ *
+ * SANITIZE THEN BOUND, never the reverse, for the reason boundField states: redact()
+ * removes runtime secrets by EXACT match, so a cut landing inside a token leaves an
+ * unmatched prefix that is written out verbatim.
+ *
+ * The fields set here are all inside sanitizeReportEntry's allow-list, so the record
+ * survives this pass intact and previewErrors() forwards it unchanged when it is
+ * later READ back.
+ */
+function suppressionNotice(): Record<string, unknown> {
+  const raw = {
+    timestamp: new Date().toISOString(),
+    type: "renderer",
+    message:
+      `[log-suppressed: ${suppressedCount} entries between ${suppressedSince} and ${suppressedUntil} ` +
+      `were dropped: errors.log was at its ${MAX_LOG_SIZE}-byte cap and rotation was obstructed]`,
+    source: "error-reporter"
+  };
+  const record = sanitizeEntry(raw);
+  record.message = boundField(record.message, raw.message.length, MAX_MESSAGE_UNITS, "message");
+  if (typeof record.source === "string") {
+    record.source = boundField(record.source, raw.source.length, MAX_SOURCE_UNITS, "source");
+  }
+  return record;
+}
+
+/**
+ * Append one entry, or drop it while rotation is obstructed and the log is full.
+ *
+ * MEASURED DEFECT this replaces (tests/error-reporter-rotation-obstructed.test.mjs,
+ * cap lowered to 64 KiB to exercise the same branch cheaply). With all three
+ * generation names occupied by something that can be neither unlinked nor renamed
+ * onto, rotateIfNeeded failed silently on every call and this function appended
+ * anyway: 900 appends reached 1,904,290 B — 29.06x the cap — and a second
+ * identical batch added exactly 1,904,290 B more, for 58.11x. Perfectly linear,
+ * with nothing on disk or in the log saying anything was wrong.
+ *
+ * THE FIRST ENTRY THROUGH IS ALWAYS WRITTEN, one record past the cap on purpose.
+ * The first error of a storm is normally the diagnostic one — the cause, with the
+ * rest being consequences — so suppression begins with the SECOND entry to meet
+ * the obstruction, not the first. In the ordinary case the storm's first error was
+ * already written long before the cap was reached; this rule covers the case where
+ * the log was ALREADY over cap and obstructed when the storm began (a session that
+ * started that way), where the first error would otherwise be the one lost.
+ */
+function appendEntry(entry: Record<string, unknown>): void {
+  const file = errorsLogPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+
+  if (rotateIfNeeded(file)) {
+    // Still at/over the cap after attempting rotation: the file cannot be moved
+    // aside, so appending grows it without bound.
+    if (suppressingAppends) {
+      noteSuppressed();
+      return;
+    }
+    // First entry to meet the obstruction — written, then suppression starts.
+    suppressingAppends = true;
+    fs.appendFileSync(file, JSON.stringify(entry) + "\n", "utf8");
+    return;
+  }
+
+  // Rotation is working again (or was never needed). SELF-HEALING, with no
+  // restart: this runs on the very next append after the obstruction clears,
+  // because every append re-attempts rotation.
+  suppressingAppends = false;
+
+  // THE GAP IS REPORTED WHEN THERE IS ONE, not merely when this call is the one
+  // that observed the recovery. The condition used to be nested inside `if
+  // (suppressingAppends)`, which is what made the counters unreachable after a
+  // failed write (see below); asking `is there an unreported gap` instead is the
+  // actual invariant and it holds on every healthy append.
+  if (suppressedCount > 0) {
+    const notice = suppressionNotice();
+    // THE COUNTERS ARE CLEARED ONLY ON A SUCCESSFUL WRITE, and that is a
+    // correction. They used to be reset BEFORE the append, reasoning that a
+    // failed write must not leave them primed to emit the same notice twice.
+    // MEASURED consequence, with an EPERM injected on the notice append only:
+    // 5 suppressed entries produced 0 recovery records, and three further healthy
+    // appends produced 0 as well — the count was gone for good and the operator
+    // had no signal at all that anything had been dropped. The write that failed
+    // is precisely the write that must be retried: nothing reached disk, so a
+    // later attempt is not a duplicate.
+    //
+    // The one imperfect case is stated rather than hidden: appendFileSync can
+    // write some bytes and then fail (ENOSPC mid-write), so a retry can leave a
+    // half-written line ahead of the good record. That costs nothing here —
+    // readErrors() and expireFile() both skip unparseable lines by design — and a
+    // truncated fragment is a far smaller loss than a silently missing gap report.
+    try {
+      fs.appendFileSync(file, JSON.stringify(notice) + "\n", "utf8");
+      suppressedCount = 0;
+      suppressedSince = "";
+      suppressedUntil = "";
+    } catch {
+      // Kept for the next append to retry. `suppressedSince` is preserved with
+      // it, so the gap keeps its true start rather than restarting the clock.
+    }
+  }
+
+  fs.appendFileSync(file, JSON.stringify(entry) + "\n", "utf8");
+}
+
+function withinRetention(entry: Record<string, unknown>): boolean {
+  const ts = entry?.timestamp ? Date.parse(String(entry.timestamp)) : NaN;
+  return Number.isFinite(ts) && ts >= Date.now() - RETENTION_DAYS * MS_PER_DAY;
+}
+
+// ---- Public API ----
+
+export function init(protect: (filePath: string) => void = () => {}): void {
+  if (initialized) return;
+  initialized = true;
+  protectFile = protect;
+
+  try {
+    fs.mkdirSync(path.dirname(errorsLogPath()), { recursive: true });
+  } catch {
+    // Directory creation is best-effort.
+  }
+
+  // F3(b): errors.log gets the SAME 0o600 + ACL treatment as app.jsonl /
+  // gateway-stdio.jsonl. Previously this module had no protector at all (see the
+  // note that used to sit at :281), so the rotated generations AND the active
+  // file were left at the default mode. Best-effort, like app-logger: a failed
+  // protection must never block startup.
+  try {
+    fs.closeSync(fs.openSync(errorsLogPath(), "a", 0o600));
+    protectFile(errorsLogPath());
+  } catch {
+    // Best-effort.
+  }
+
+  try {
+    cleanupOldErrors();
+  } catch {
+    // Cleanup must never block startup.
+  }
+
+  process.on("uncaughtException", (err: unknown) => {
+    // The existing main-process handler owns fatal shutdown; this listener
+    // only records the structured error entry for the report bundle.
+    try {
+      logError({
+        type: "uncaughtException",
+        message: err instanceof Error ? err.message : String(err),
+        ...(err instanceof Error && err.stack ? { stack: err.stack } : {}),
+        source: "main"
+      });
+    } catch {
+      // A logger must never throw.
+    }
+  });
+
+  process.on("unhandledRejection", (reason: unknown) => {
+    const message = reason instanceof Error ? reason.message : String(reason);
+    const stack = reason instanceof Error && reason.stack ? reason.stack : undefined;
+    try {
+      logError({
+        type: "unhandledRejection",
+        message,
+        ...(stack ? { stack } : {}),
+        source: "main"
+      });
+    } catch {
+      // Best-effort.
+    }
+  });
+}
+
+export function logError(entry: Partial<ErrorEntry> & { message?: string }): void {
+  const source = entry && typeof entry === "object" ? entry : {};
+
+  // ONE READ PER FIELD, into a local. The original UTF-16 length is captured here,
+  // BEFORE sanitization, for two reasons: it is the size an operator actually wants
+  // to see, and it is the only figure independent of redaction, which both shrinks
+  // text (a token becomes `[REDACTED]`) and grows it (`nvapi-a` -> `[REDACTED]`).
+  // Reading once also means the value that is measured is by construction the value
+  // that is stored — the lesson snapshotFeedbackData records in feedback-validation.ts.
+  const readTimestamp = source.timestamp;
+  const readType = source.type;
+  const readMessage = source.message;
+  const readStack = source.stack;
+  const readSource = source.source;
+
+  const rawMessage = typeof readMessage === "string" ? readMessage : String(readMessage ?? "");
+  const rawStack = typeof readStack === "string" ? readStack : "";
+  const rawSource = typeof readSource === "string" ? readSource : "";
+
+  const record = sanitizeEntry({
+    timestamp: readTimestamp || new Date().toISOString(),
+    type: readType || "renderer",
+    message: rawMessage,
+    ...(rawStack ? { stack: rawStack } : {}),
+    ...(rawSource ? { source: rawSource } : {})
+  });
+
+  // BOUND AFTER SANITIZING — see boundField for why that order is a security
+  // property and not a preference. Each field is given its own pre-sanitization
+  // size, so the marker names what the caller actually sent rather than whatever
+  // survived the redactor.
+  record.message = boundField(record.message, rawMessage.length, MAX_MESSAGE_UNITS, "message");
+  if (typeof record.stack === "string") {
+    record.stack = boundField(record.stack, rawStack.length, MAX_STACK_UNITS, "stack");
+  }
+  if (typeof record.source === "string") {
+    record.source = boundField(record.source, rawSource.length, MAX_SOURCE_UNITS, "source");
+  }
+  // Bounded WITHOUT a marker, unlike the fields above: withinRetention PARSES this
+  // value, and appending a note would make the entry unparseable and therefore
+  // unexpirable. An over-long timestamp is garbage input; cutting it makes it fail
+  // Date.parse, so the entry is simply not counted and is reclaimed at cleanup.
+  if (typeof record.timestamp === "string" && record.timestamp.length > MAX_TIMESTAMP_UNITS) {
+    record.timestamp = record.timestamp.slice(0, MAX_TIMESTAMP_UNITS);
+  }
+
+  try {
+    appendEntry(record);
+  } catch {
+    // Logging must never throw into the caller.
+  }
+}
+
+export function getErrorCount(): number {
+  return readErrors().filter(withinRetention).length;
+}
+
+export function previewErrors(): ErrorEntry[] {
+  return readErrors().filter(withinRetention).map((entry) => sanitizeEntry(entry) as unknown as ErrorEntry);
+}
+
+/**
+ * Expire entries past RETENTION_DAYS in ONE log file, rewriting it in place.
+ *
+ * @param file Path to an active or rotated log.
+ * @returns Count of entries dropped; 0 if the file is absent or unreadable.
+ */
+function expireFile(file: string): number {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch {
+    // Absent or unreadable: nothing to expire, and a logger must not throw.
+    return 0;
+  }
+  const entries: Record<string, unknown>[] = [];
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      entries.push(JSON.parse(trimmed) as Record<string, unknown>);
+    } catch {
+      // Malformed lines are dropped, exactly as readErrors() ignores them.
+    }
+  }
+  const kept = entries.filter(withinRetention);
+  if (kept.length === entries.length) return 0;
+  try {
+    if (kept.length === 0) {
+      // An emptied GENERATION is removed rather than left as a 0-byte file, so a
+      // stale generation does not keep occupying a rotation slot.
+      if (file === errorsLogPath()) fs.writeFileSync(file, "", "utf8");
+      else fs.unlinkSync(file);
+    } else {
+      fs.writeFileSync(file, kept.map((entry) => JSON.stringify(entry)).join("\n") + "\n", "utf8");
+    }
+  } catch {
+    return 0;
+  }
+  return entries.length - kept.length;
+}
+
+export function cleanupOldErrors(): number {
+  const file = errorsLogPath();
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+  } catch {
+    // Directory creation is best-effort.
+  }
+  let removed = expireFile(file);
+
+  // ROTATED GENERATIONS ARE SWEPT TOO, which is the point of this loop.
+  //
+  // Rotation alone turned the 10-day retention this module DOCUMENTS (see the
+  // file header) into a size bound for anything that had rotated out: cleanup
+  // rewrote the ACTIVE log only, so an entry pushed into errors.N.log was never
+  // reached by the clock again. MEASURED with the cap lowered to 64 KiB so the
+  // same code path is exercised cheaply: 40 entries stamped 400 days old were
+  // rotated out, cleanupOldErrors() reported 0 reclaimed, and all 40 were still
+  // on disk afterwards. That is strictly WORSE than before the cap existed —
+  // there the same entries sat in the active log and the next init() reclaimed
+  // them — so stale data outlived its retention because of a change made to
+  // bound the file.
+  //
+  // The cost objection does not survive measurement either: reading and parsing
+  // three FULL 5 MiB generations takes 98 ms, once, and only from init(). The
+  // read path (getErrorCount / previewErrors / sendErrors) is deliberately left
+  // reading the active log only, so nothing pulls 20 MB in to build a 64 KB
+  // report — expiry and reporting simply do not need the same scope.
+  const baseName = file.replace(/\.log$/, "");
+  for (let i = 1; i <= MAX_ROTATED_LOGS; i += 1) {
+    removed += expireFile(`${baseName}.${i}.log`);
+  }
+  return removed;
+}
+
+export async function sendErrors(): Promise<ErrorReportResult> {
+  const errors = previewErrors();
+  const count = errors.length;
+
+  // ALWAYS persist a local snapshot of the report bundle — independent of
+  // whether the upload path is configured or succeeds, so an operator always
+  // has an on-disk copy to send manually.
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  let reportPath = "";
+  try {
+    const dir = reportsDir();
+    fs.mkdirSync(dir, { recursive: true });
+    reportPath = path.join(dir, `report-${stamp}.json`);
+    fs.writeFileSync(
+      reportPath,
+      JSON.stringify({ timestamp: new Date().toISOString(), count, errors }, null, 2),
+      "utf8"
+    );
+  } catch {
+    // Best-effort snapshot.
+  }
+
+  // Network copy of the bundle — trimmed to the worker's size limit.  The
+  // local snapshot above intentionally keeps every entry regardless.
+  const report = { timestamp: new Date().toISOString(), count, errors };
+  fitReportForWorker(report);
+  try {
+    const response = await fetch(REPORT_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ report, appVersion: app.getVersion() || "0.0.0" }),
+      signal: AbortSignal.timeout(SEND_TIMEOUT_MS)
+    });
+    if (response.status >= 200 && response.status < 300) {
+      return { success: true, count, message: `Sent ${count} errors`, ...(reportPath ? { reportPath } : {}) };
+    }
+    return { success: false, count, message: `HTTP ${response.status}`, ...(reportPath ? { reportPath } : {}) };
+  } catch (err: unknown) {
+    return {
+      success: false,
+      count,
+      message: `HTTP request failed: ${err instanceof Error ? err.message : String(err)}`,
+      ...(reportPath ? { reportPath } : {})
+    };
+  }
+}

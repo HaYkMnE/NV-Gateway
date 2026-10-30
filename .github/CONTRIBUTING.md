@@ -1,0 +1,93 @@
+# Contributing to NV Gateway
+
+Thank you for your interest in contributing to **NV Gateway**! This document outlines our development workflows, coding conventions, testing standards, and pull request guidelines.
+
+---
+
+## 1. Code Style & Architecture
+
+Our repository relies on modern JavaScript and web technologies:
+
+- **Runtime & Modules**: Node.js 22.12+ with native ESM (`"type": "module"`).
+- **Desktop Framework**: Electron 44 with strict process isolation (`contextIsolation: true`, `nodeIntegration: false`, CSP headers).
+- **Frontend Stack**: React 18, Vite 5, Tailwind CSS, Zustand, i18next.
+- **Language**: TypeScript 5.5 (strictly typed without implicit `any`).
+- **Code Standards**:
+  - Keep modules focused, modular, and single-responsibility.
+  - Follow standard naming conventions: `PascalCase` for React components and types, `camelCase` for functions and variables.
+  - Prefer immutable data patterns and modern `async`/`await` control flow.
+  - Maintain absolute separation of concerns between Electron Main (secrets/lifecycle), Gateway (proxy/failover), and Renderer (HUD/UI).
+
+---
+
+## 2. Local Development & Testing Workflow
+
+Before submitting changes, verify that your code compiles with zero errors and passes the full automated test suite.
+
+### Setup & Build
+```bash
+# 1. Install the exact dependency versions from package-lock.json
+npm ci
+
+# 2. Download the Electron runtime (the CI workflows run this step too)
+npx install-electron --no
+
+# 3. Compile TypeScript and build the renderer and gateway bundles
+npm run build
+
+# 4. Start the Vite renderer, then run `npm start` in a second terminal
+npm run dev
+```
+
+### Running Tests
+```bash
+# Run full automated test suite (must pass with zero failures)
+npm test
+
+# Run individual test files
+node --test tests/failover-policy.test.mjs
+node --test tests/capability-registry.test.mjs
+```
+
+### Static Security & Packaging Audits
+```bash
+# Run complete packaging audit suite
+npm run package:audit
+
+# Individual smoke checks
+npm run test:packaged-security     # Validates CSP, ASAR boundaries, and isolation
+npm run test:packaged-credentials  # Scans for hardcoded keys and credential literals
+npm run test:packaged-migration    # Tests safe configuration migration
+npm run test:packaged-gateway-link # Verifies ESM dependency graph
+```
+
+---
+
+## 3. Pull Request Guidelines
+
+To ensure repository stability, security, and cleanliness:
+
+1. **Branch Naming**: Use descriptive prefixes:
+   - `feat/add-new-capability-probe`
+   - `fix/upstream-stream-timeout`
+   - `docs/update-agent-guidelines`
+   - `perf/lru-rotation-cache`
+2. **Commit Messages**: Follow Conventional Commits format (`feat:`, `fix:`, `docs:`, `chore:`, `refactor:`, `test:`).
+3. **No Secret Leakage**:
+   - Never commit API keys, tokens, environment variables, or private test credentials.
+   - Run `node scripts/shipping-credential-scan.mjs` before committing.
+4. **Verification Evidence**:
+   - Include exact commit SHAs and command execution outputs in your PR description.
+   - Confirm that the full test suite passes with zero failures (`npm test`).
+
+---
+
+## 4. PR Review Criteria
+
+Whether submitted by human developers or AI coding agents, all Pull Requests must satisfy:
+1. **Zero Secret Leakage**: Passed `scripts/shipping-credential-scan.mjs`.
+2. **100% Test Suite Green**: The full automated test suite must pass with zero failures.
+3. **Exact Commit SHA Evidence**: Clear trace of commit SHA and reproduction verification.
+4. **Architectural Isolation**: Strict preservation of process boundaries between Electron Main, Gateway, and Renderer.
+
+Thank you for helping build NV Gateway!

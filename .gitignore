@@ -1,0 +1,51 @@
+# Runtime keys and user-specific state. DO NOT COMMIT.
+keys.json
+/config.json
+/config/config.json
+!/config/config.example.json
+telemetry-bundle.json
+runtime/
+logs/
+*.log
+*.jsonl
+node_modules/
+dist/
+build/out/
+.env
+.DS_Store
+.env*
+dist-electron/
+release/
+.wrangler/
+coverage/
+
+# A test must never create a literal "NUL" directory in the repo root
+# (Windows device-name hazard — keeps git status clean on Windows).
+NUL
+
+# TypeScript build bookkeeping and generated compiler/bundler output
+# (build/assets/ stays committed: it holds the checked-in icon sources/PNGs).
+*.tsbuildinfo
+build/vite.config.js
+build/vite.config.d.ts
+build/src/
+build/renderer/
+# Generated gateway engine bundle (scripts/build-gateway-bundle.mjs). Produced by
+# `npm run build`; never committed, so the repo keeps exactly one copy of the
+# engine — the readable sources in src/gateway.
+build/gateway/
+# Generated per release from CHANGELOG.md by scripts/release-notes.mjs
+# (npm prebuild:release); CHANGELOG.md is the source of truth.
+build/release-notes.md
+build/release-body.md
+
+# Local audit / review working documents. These are notes exchanged with external
+# reviewers, not product source, and they can quote findings or logs. They live on
+# disk for the audit but must never enter history. The two `ЗАДАНИЕ-*` files are
+# the audit task briefs handed to external models.
+AUDIT-BRIEF.md
+AUDIT-BRIEF-*.md
+AUDIT-REPORT-*.md
+CONSOLIDATED-AUDIT-FINDINGS.md
+/ЗАДАНИЕ-НА-ПОЛНЫЙ-АУДИТ.md
+/ЗАДАНИЕ-ПОЛНЫЙ-АУДИТ-ФИНАЛ.md

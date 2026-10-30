@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <!-- RUNNING: solid green hexagon donut. Negative center hole reads on any taskbar. -->
+  <path fill-rule="evenodd" d="M12 2.5 L20.23 7.25 L20.23 16.75 L12 21.5 L3.77 16.75 L3.77 7.25 Z M12 8.4 L15.12 10.2 L15.12 13.8 L12 15.6 L8.88 13.8 L8.88 10.2 Z" fill="#76B900" stroke="#0A0E0B" stroke-width="1.2" stroke-linejoin="round"/>
+</svg>

@@ -1,0 +1,1249 @@
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, safeStorage, session, Tray } from "electron";
+import * as crypto from "node:crypto";
+import { spawn } from "node:child_process";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { autoUpdater } from "electron-updater";
+import { createAutoUpdateService, getUpdateMenuText, type AutoUpdateService, type UpdaterStatus } from "./auto-update";
+import { initAppLogger, logAppEvent } from "./app-logger";
+import { GatewayLifecycle, type GatewayStatus } from "./gateway-lifecycle";
+import { createFatalShutdown } from "./fatal-shutdown";
+import { ensureGatewayRuntime, invalidateAppConfigCache, readAppConfig, readAppConfigCached, readGatewayPort, readRuntimeAppConfigCached, writeAppConfig, writeGatewayPort, type AppLanguage, type GatewayRuntimePaths } from "./gateway-runtime";
+import { checkPorts, findFreePort } from "./port-scanner";
+import { configureSingleInstance } from "./single-instance";
+import { validateIpcSender, validators } from "./ipc-security";
+import { requestAdmin } from "./admin-client";
+import { createAdminIpcDispatcher } from "./admin-ipc";
+import { createAppConfigUpdateHandler, type AppConfigUpdate } from "./app-config-ipc";
+import { createModelsHandlers } from "./models-ipc";
+import { wrapIpcHandler as wrapIpcHandlerWithLogError } from "./ipc-handler";
+import { createSafeStorageAdapter, SecureStore } from "./secure-state";
+import { createRuntimeAclProtector } from "./windows-acl";
+import { installElectronSecurity } from "./electron-security";
+import { redact, setRuntimeSecrets } from "./redaction";
+import { mergeChildKeyProjection, type ChildKeyProjection } from "./state-ownership";
+import { runExplicitLegacyNvidiaMigration } from "./final-migration-workflow";
+import { startMainProcess } from "./main-process-startup";
+import { validateFixedLegacyNvidiaSource } from "./legacy-nvidia-migration";
+import { acquireLegacyMigrationExclusionLock } from "./legacy-migration-exclusion";
+import { createControlledStartupShutdown } from "./controlled-startup-shutdown";
+import { handleBeforeQuit } from "./before-quit-guard";
+import { createMigrationPhaseAudit } from "./migration-phase-audit";
+import { createTrayIconCache } from "./tray-icons";
+import { createWindowCloseGuard } from "./window-close-guard";
+import { buildApplicationMenu, buildContextMenu, getMenuStrings } from "./app-menu";
+import { saveFeedback, openGitHubIssue } from "./feedback-service";
+import { snapshotFeedbackData } from "./feedback-validation";
+import { openExternalUrl, REPO_URL } from "./external-open";
+import { exportDiagnostic } from "./diagnostic-export";
+import { loginItemPath, readOpenAtLogin } from "./login-item";
+import { init as initErrorReporter, logError, getErrorCount, previewErrors, sendErrors, type ErrorEntry } from "./error-reporter";
+import { clearGpuCrashMarker, gpuCrashMarkerPresent, planGpuCrashRecovery, shouldDisableHardwareAcceleration, writeGpuCrashMarker } from "./gpu-fallback";
+
+// On hosts where Chromium's GPU process cannot start (a VM without GPU
+// passthrough, an RDP session, corrupted drivers) the GPU process crash-loops
+// and fires a native abort() — no JS exception, no uncaughtException, no
+// fatalShutdownAndExit, no keys.json flush. The HUD is simple forms and
+// tables, so software rendering is sufficient. The mitigation is layered:
+//   1. an operator opt-out — NV_GATEWAY_DISABLE_GPU=1 or --disable-gpu;
+//   2. automatic remote-session detection (SESSIONNAME=RDP-Tcp#… / CLIENTNAME),
+//      so an RDP deployment never has to discover the env var first;
+//   3. a crash marker left by the GPU child-process-gone handler, which arms
+//      software rendering on the relaunch that follows a GPU crash.
+// Must run before app.whenReady().
+// The marker lives under userData so an isolated run (--user-data-dir, applied
+// by Electron's PreSandboxStartup before any JS) never reads or clears the live
+// install's marker. Chromium caches userData on its first resolution, so the
+// product name is fixed FIRST: a normal install then resolves userData to
+// %APPDATA%/NV-Gateway (startMainProcess repeats the same idempotent setName).
+app.setName("NV-Gateway");
+const gpuCrashMarkerArmed = gpuCrashMarkerPresent(app.getPath("userData"));
+if (gpuCrashMarkerArmed) clearGpuCrashMarker(app.getPath("userData"));
+const softwareRenderingActive = shouldDisableHardwareAcceleration({
+  env: {
+    disableGpu: process.env.NV_GATEWAY_DISABLE_GPU,
+    sessionName: process.env.SESSIONNAME,
+    clientName: process.env.CLIENTNAME
+  },
+  argv: process.argv
+}) || gpuCrashMarkerArmed;
+if (softwareRenderingActive) app.disableHardwareAcceleration();
+
+// Align the Electron app name with electron-builder productName so that
+// app.getPath("userData") resolves to %APPDATA%/NV-Gateway, not the
+// package.json "name" field.  Must be called before app.whenReady().
+let mainWindow: BrowserWindow | null;
+/** True once startNormal() has built the first window, so ensureMainWindow only ever REBUILDS. */
+let windowWasCreated = false;
+let tray: Tray | null = null;
+let gatewayLifecycle: GatewayLifecycle | null = null;
+let gatewayRuntime: GatewayRuntimePaths | null = null;
+let updaterService: AutoUpdateService | null = null;
+let isQuiting = false;
+let credentials: { gatewayToken: string; adminToken: string } | null = null;
+let secureStore: SecureStore | null = null;
+let secureState: any = null;
+/** Serializes every child-state persist; only settles — never throws. */
+let persistChain: Promise<void> = Promise.resolve();
+
+/**
+ * Single writer for child key projections. Durable requests are REFUSED with a
+ * retry-later error while a migration merge buffer is open: acknowledging those
+ * against the in-memory buffer would tell the child its state is durable when
+ * it is not. Only after the on-disk write succeeds does the authoritative
+ * secureState move, so an ack is always a truth.
+ */
+async function persistChildProjection(projection: ChildKeyProjection, context?: { durable?: boolean }): Promise<void> {
+  if (pendingMigrationState) {
+    if (context?.durable === true) {
+      const error = new Error("Migration in progress; durable key mutations are temporarily unavailable.");
+      (error as Error & { code?: string }).code = "MIGRATION_IN_PROGRESS";
+      throw error;
+    }
+    pendingMigrationState = mergeChildKeyProjection(pendingMigrationState, projection);
+    return;
+  }
+  let nextState: any;
+  try {
+    nextState = mergeChildKeyProjection(secureState, projection);
+  } catch (error) {
+    logAppEvent("error", "persist_state_failed", { message: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
+  try {
+    await secureStore?.persist(nextState);
+  } catch (error) {
+    // The channel turns this throw into state:persist:rejected for durable
+    // writes (and swallows it for background ones) — main must never crash.
+    logAppEvent("error", "persist_state_failed", { message: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
+  secureState = nextState;
+}
+let pendingMigrationState: Record<string, unknown> | null = null;
+const migrationPhaseAudit = createMigrationPhaseAudit();
+
+// Error reporter is a regular TypeScript module (error-reporter.ts) compiled
+// into the CommonJS main bundle alongside the rest of src/main; it is imported
+// statically above (init as initErrorReporter, logError, getErrorCount,
+// previewErrors, sendErrors).
+
+function getAboutInfo(): {
+  appVersion: string;
+  electronVersion: string;
+  chromeVersion: string;
+  nodeVersion: string;
+  proxyPort: number;
+  adminPort: number;
+  repoUrl: string;
+} {
+  let proxyPort = 12000;
+  if (gatewayRuntime) {
+    try {
+      proxyPort = readGatewayPort(gatewayRuntime.configPath);
+    } catch {
+      // Fall back to the default gateway port if the config can't be read.
+    }
+  }
+  return {
+    appVersion: app.getVersion() || "0.0.0",
+    electronVersion: process.versions.electron,
+    chromeVersion: process.versions.chrome,
+    nodeVersion: process.versions.node,
+    proxyPort,
+    adminPort: proxyPort + 1,
+    repoUrl: REPO_URL
+  };
+}
+function migrationPhaseAuditPath(): string {
+  return path.join(app.getPath("userData"), "logs", "migration-phase.jsonl");
+}
+function getGatewayServerPath(): string {
+  // PACKAGED: inside app.asar (app.getAppPath() IS the archive), so the engine
+  // is covered by ASAR integrity validation. It used to live in
+  // process.resourcesPath/gateway, which is OUTSIDE the archive and therefore
+  // outside the integrity envelope — a substituted engine ran unnoticed, and the
+  // engine is handed the user's NVIDIA keys in the clear over IPC.
+  // Electron patches fs and the module loaders with asar support in both the main
+  // process and ELECTRON_RUN_AS_NODE children, so the existsSync check below and
+  // spawning this path as the child's entry script both work unchanged.
+  // DEV: unchanged — the readable sources, so `npm run dev` is unaffected.
+  return app.isPackaged
+    ? path.join(app.getAppPath(), "build", "gateway", "server.mjs")
+    : path.join(app.getAppPath(), "src", "gateway", "server.mjs");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Gateway child model-limits delivery (bound IPC channel).
+//
+// The packaged app cannot rely on the child resolving config.json from disk
+// (no repo-relative example, env paths not guaranteed across deployed builds),
+// so main attaches a sanitized, NUMBERS-ONLY copy of the operator's
+// config.json `modelLimits` to the gateway initial state. The field rides the
+// existing challenge-bound `state:init` channel into server.mjs, which hands
+// it to model-limits.mjs via setModelLimits(). No credentials, no paths —
+// spawn argv/env remain untouched (production-security-wiring tests). The
+// on-disk keys.json stays pristine: injection happens in-memory only, after
+// secureStore.persist().
+// ─────────────────────────────────────────────────────────────────────────────
+const MAX_MODEL_LIMIT_ENTRIES = 512;
+const MAX_MODEL_LIMIT_KEY_LENGTH = 256;
+
+function isValidModelLimitEntry(entry: unknown): entry is { context: number; output: number } {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+  const candidate = entry as Record<string, unknown>;
+  return typeof candidate.context === "number" && Number.isSafeInteger(candidate.context) && candidate.context > 0
+    && typeof candidate.output === "number" && Number.isSafeInteger(candidate.output) && candidate.output > 0;
+}
+
+function readGatewayModelLimits(configPath: string): Record<string, { context: number; output: number }> {
+  const sanitized: Record<string, { context: number; output: number }> = {};
+  try {
+    const raw = fs.readFileSync(configPath, "utf8");
+    const parsed = JSON.parse(raw.codePointAt(0) === 0xFEFF ? raw.slice(1) : raw) as Record<string, unknown> | null;
+    const limits = parsed?.modelLimits;
+    if (!limits || typeof limits !== "object" || Array.isArray(limits)) return sanitized;
+    for (const [key, entry] of Object.entries(limits as Record<string, unknown>)) {
+      if (Object.keys(sanitized).length >= MAX_MODEL_LIMIT_ENTRIES) break;
+      if (typeof key !== "string" || key.length === 0 || key.length > MAX_MODEL_LIMIT_KEY_LENGTH) continue;
+      if (isValidModelLimitEntry(entry)) sanitized[key] = { context: entry.context, output: entry.output };
+    }
+  } catch {
+    // Config absent or malformed — inject nothing; the gateway falls back internally.
+  }
+  return sanitized;
+}
+
+function withGatewayModelLimits(state: unknown): unknown {
+  if (!gatewayRuntime || typeof state !== "object" || state === null || Array.isArray(state)) return state;
+  const limits = readGatewayModelLimits(gatewayRuntime.configPath);
+  if (Object.keys(limits).length === 0) return state;
+  return { ...(state as Record<string, unknown>), modelLimits: limits };
+}
+
+function initializeGatewayLifecycle(): GatewayLifecycle {
+  const acl = createRuntimeAclProtector();
+  gatewayRuntime = ensureGatewayRuntime(app.getPath("userData"), acl);
+  secureStore = new SecureStore(gatewayRuntime.statePath, createSafeStorageAdapter(safeStorage), acl.protectFile);
+  secureState = secureStore.initialize();
+  credentials = secureState.credentials && typeof secureState.credentials.gatewayToken === "string" && typeof secureState.credentials.adminToken === "string"
+    ? secureState.credentials : { gatewayToken: crypto.randomBytes(32).toString("base64url"), adminToken: crypto.randomBytes(32).toString("base64url") };
+  secureState.credentials = credentials;
+  setRuntimeSecrets([credentials.gatewayToken, credentials.adminToken]);
+  secureStore.persist(secureState);
+  const serverPath = getGatewayServerPath();
+  if (!fs.existsSync(serverPath)) {
+    throw new Error(`Gateway runtime is missing: ${serverPath}`);
+  }
+
+  // Initialize main-process logger
+  initAppLogger(gatewayRuntime.appLogPath, acl.protectFile);
+  migrationPhaseAudit.setFilePath(path.join(path.dirname(gatewayRuntime.appLogPath), "migration-phase.jsonl"));
+
+  gatewayLifecycle = new GatewayLifecycle({
+    executablePath: process.execPath,
+    runtimePaths: gatewayRuntime,
+    serverPath,
+    spawnChild: spawn,
+    stdioLogPath: gatewayRuntime.stdioLogPath,
+    workingDirectory: app.getPath("userData"),
+    // One hook, two consumers. updateTray stays exactly as it was; the renderer
+    // push is added beside it so the renderer can stop polling at 1 Hz.
+    //
+    // `mainWindow` raw, NOT ensureMainWindow(): a background gateway transition
+    // (stop, retry, child error, quit) must never RESURRECT a window the user
+    // closed. sendGatewayStatus is inert when the window is absent or destroyed.
+    //
+    // This is a TRANSITION hook, not a per-request path: every setStatus() call
+    // site in gateway-lifecycle.ts is a real state change (start/stop/retry/
+    // child error), so this adds no work per renderer request and nothing on a
+    // timer. It must stay that way.
+    onStatusChange: (status: GatewayStatus) => {
+      updateTray(status);
+      sendGatewayStatus(mainWindow, status);
+    },
+    onLifecycleEvent: (event: string, data: Record<string, unknown>) => {
+      logAppEvent("info", event, data);
+      // Forward gateway lifecycle errors to the structured error reporter so
+      // they appear in errors.log and the operator can bundle/preview/send them.
+      if (event === "gateway_lifecycle" && data.state === "error") {
+        const message = typeof data.message === "string" ? data.message : "Gateway lifecycle error";
+        const stack = typeof data.stack === "string" ? data.stack : undefined;
+        logError({ type: "gateway", message, ...(stack ? { stack } : {}), source: "gateway" });
+      }
+    },
+    initialState: withGatewayModelLimits(secureState),
+    persistState: (projection, context) => {
+      // Serialized persistence chain: every projection write — durable admin
+      // mutation or background refresh — lands in arrival order even when the
+      // underlying store is asynchronous, so a later write can never commit an
+      // earlier checkout of secureState. Failures empty into the channel ack/
+      // rejection protocol (the chain itself absorbs them so the next persist
+      // still runs).
+      const task = persistChain.then(() => persistChildProjection(projection, context));
+      persistChain = task.then(() => undefined, () => undefined);
+      return task;
+    },
+    protectFile: acl.protectFile
+    ,
+    // Bounded crash recovery. WITHOUT this the lifecycle's whole auto-restart
+    // path is dead code in production: `scheduleAutoRestart` returns at its
+    // first guard, so an unexpected child exit is diagnosed (exit 1,
+    // RUNTIME_EXIT) and then the gateway stays DOWN until the user clicks
+    // retry. Opt-in by design in gateway-lifecycle.ts, which is why the call
+    // site has to pass it. Never an infinite loop: 3 consecutive crashes end in
+    // the truthful RUNTIME_EXIT status plus a terminal event, backoff doubles
+    // from 1 s to a 30 s ceiling, and a child that stayed up for 60 s resets
+    // the counter. The admin/retry/quit paths still win over a pending restart.
+    autoRestart: { maxAttempts: 3, baseDelayMs: 1_000, maxDelayMs: 30_000, stableUptimeMs: 60_000 },
+    onPreparedChildSpawn: (phase, childPid) => {
+      migrationPhaseAudit.emit(phase === "requested" ? "child_spawn_requested" : "child_spawned", { pid: process.pid, childPid });
+    }
+  });
+  return gatewayLifecycle;
+}
+
+async function startGateway(): Promise<GatewayStatus> {
+  if (!gatewayRuntime || !gatewayLifecycle) {
+    throw new Error("Gateway runtime is not initialized.");
+  }
+  const port = readGatewayPort(gatewayRuntime.configPath);
+  logAppEvent("info", "gateway_start_request", { port });
+  return gatewayLifecycle.start(port);
+}
+
+async function retryGateway(port?: number): Promise<GatewayStatus> {
+  if (!gatewayRuntime || !gatewayLifecycle) {
+    throw new Error("Gateway runtime is not initialized.");
+  }
+  const requestedPort = port ?? readGatewayPort(gatewayRuntime.configPath);
+  const previousPort = gatewayLifecycle.getStatus().port ?? null;
+  logAppEvent("info", "gateway_retry_request", { requestedPort, previousPort });
+  const status = await gatewayLifecycle.retry(requestedPort);
+  if (status.state === "running") {
+    writeGatewayPort(gatewayRuntime.configPath, requestedPort, createRuntimeAclProtector().protectFile);
+    logAppEvent("info", "gateway_port_written", { port: requestedPort });
+  }
+  return status;
+}
+
+function trayAssetsDir(): string {
+  return app.isPackaged
+    ? path.join(process.resourcesPath, "assets")
+    : path.join(app.getAppPath(), "src", "renderer", "assets");
+}
+
+function appIconPath(): string {
+  return app.isPackaged
+    ? path.join(process.resourcesPath, "assets", "icon.png")
+    : path.join(app.getAppPath(), "build", "assets", "icon.png");
+}
+
+const trayIcons = createTrayIconCache({ resolveAssetsDir: trayAssetsDir, nativeImage });
+
+// Owns the "announce the first hide once" state for this process.
+const handleWindowClose = createWindowCloseGuard();
+
+function createTrayIcon(state?: string): Electron.NativeImage {
+  return trayIcons(state) as Electron.NativeImage;
+}
+
+/** The one main->renderer push channel for gateway status. Send-only, by design. */
+export const GATEWAY_STATUS_CHANNEL = "gateway-status-changed";
+
+/** Mirrors MAX_OUTPUT_LENGTH in gateway-lifecycle.ts, which is not exported. */
+const GATEWAY_STATUS_MESSAGE_CAP = 4_000;
+/** Generous input bound so the redaction regexes can never run on an unbounded string. */
+const GATEWAY_STATUS_MESSAGE_INPUT_BOUND = 16_000;
+
+/**
+ * Redact + cap the one free-text field that crosses the bridge.
+ *
+ * WHY, given the producer already sanitizes: every status reaching the hook today
+ * has been through sanitizeGatewayStatus, so this is a no-op in production. But
+ * sendGatewayStatus is EXPORTED and its contract says no secret crosses, and that
+ * contract was resting entirely on the discipline of its callers. MEASURED by
+ * calling it directly with `message: "child failed: token=nvapi-AAAA…"`: the raw
+ * 70-character token arrived at webContents.send verbatim. The projection drops
+ * fields a caller ATTACHES; it did nothing about what a caller puts in a field
+ * that is meant to be there.
+ *
+ * ORDER: bound the input, redact, then cap. Redacting first is what makes a whole
+ * token match and disappear rather than being sliced into a partial secret; the
+ * leading bound keeps the regexes off an unbounded string (a sibling agent spent
+ * 300 s pushing ~90 MB through them). Anything past the final cap is discarded,
+ * so a token straddling the input bound cannot survive as a fragment.
+ */
+function redactGatewayStatusMessage(message: string): string {
+  return String(redact(String(message).slice(0, GATEWAY_STATUS_MESSAGE_INPUT_BOUND)))
+    .slice(0, GATEWAY_STATUS_MESSAGE_CAP);
+}
+
+/**
+ * Push a gateway status change to the renderer.
+ *
+ * WHY THIS EXISTS: gatewayLifecycle already told main about every transition
+ * (onStatusChange) and main told nobody but the tray, so the renderer polled
+ * `get-gateway-status` at 1 Hz forever just to notice a state it could have been
+ * handed. This is that push.
+ *
+ * SEND-ONLY. There is deliberately no ipcMain.handle/on counterpart: an inbound
+ * edge would be a new attack surface needing validateIpcSender like every invoke
+ * channel here, and would let a renderer forge status transitions. Because
+ * nothing arrives FROM the renderer, secure()/validateIpcSender do not apply —
+ * the equivalent discipline for an outbound channel is (a) one fixed
+ * destination, this window's webContents, never a broadcast to all windows, and
+ * (b) an explicit payload projection instead of a spread.
+ *
+ * NO SECRET CROSSES. The projection copies exactly the four GatewayStatus fields
+ * and drops anything else a caller may have attached. `message` has already been
+ * through redact() + length-capped in sanitizeGatewayStatus (gateway-lifecycle.ts),
+ * which is what keeps the gateway/admin tokens out of it; a raw spread here would
+ * forward whatever a future caller adds, and this repo has already had a raw
+ * JSON.stringify leak both tokens verbatim.
+ *
+ * MUST NOT THROW. A status change fires exactly when a window may be gone —
+ * stop, retry, child error, quit. A throw here would escape into an Electron
+ * event callback, reach process.on("uncaughtException") -> fatalShutdownAndExit
+ * -> process.exit(1), and that raw exit SKIPS before-quit -> cleanupAndQuit ->
+ * gatewayLifecycle.stop(), i.e. the ipc shutdown that flushes keys.json. Hence
+ * the ENTIRE body is inside the try/catch, liveness checks included: those checks
+ * are themselves calls into a native object that may already be destroyed, and
+ * `window.webContents` throws on property access for a destroyed window rather
+ * than returning null. Checks first for a clean early return, try/catch around
+ * everything for the shapes a check cannot survive.
+ *
+ * The window is a PARAMETER, not ensureMainWindow(): a background gateway event
+ * must never resurrect a window the user closed, and passing it in is what makes
+ * the destroyed-window path testable.
+ */
+export function sendGatewayStatus(window: BrowserWindow | null | undefined, status: GatewayStatus): void {
+  // THE WHOLE BODY IS GUARDED, not just the send. The liveness checks were
+  // outside the try/catch, and every one of them is a call INTO a native object
+  // that may already be gone. Electron's destroyed-object wrapper throws
+  // "Object has been destroyed" on property ACCESS, so `window.webContents` is
+  // itself a throwing expression — not a safe read. MEASURED against the real
+  // built module, four realistic shapes escaped the old guard and would have
+  // become an uncaughtException:
+  //   window.webContents getter throws   -> THREW  (destroyed window, real Electron shape)
+  //   window.isDestroyed() throws        -> THREW
+  //   contents.isDestroyed() throws      -> THREW
+  //   window is not a BrowserWindow      -> THREW  (window.isDestroyed is not a function)
+  // Only `webContents === null` was contained. This is the same HIGH already
+  // found in this codebase: the throw escapes into an Electron event callback,
+  // reaches process.on("uncaughtException") -> fatalShutdownAndExit ->
+  // process.exit(1), and that raw exit SKIPS before-quit -> cleanupAndQuit ->
+  // gatewayLifecycle.stop(), the ipc shutdown that flushes keys.json. Losing one
+  // push costs nothing (the renderer keeps a backup poll); losing keys.json
+  // costs the user their keys.
+  //
+  // The ORDER still matters and is preserved: a destroyed window returns before
+  // webContents is ever touched, so a dead window is detected rather than caught.
+  try {
+    if (!window || window.isDestroyed()) return;
+    const contents = window.webContents;
+    if (!contents || contents.isDestroyed()) return;
+    contents.send(GATEWAY_STATUS_CHANNEL, {
+      state: status.state,
+      ...(status.port === undefined ? {} : { port: status.port }),
+      ...(status.code === undefined ? {} : { code: status.code }),
+      ...(status.message === undefined ? {} : { message: redactGatewayStatusMessage(status.message) })
+    });
+  } catch (error) {
+    // The native object can die between the liveness check and the send; there
+    // is no atomic way to do this in Electron. Losing one push is harmless
+    // because the renderer keeps a slow backup poll; crashing the main process
+    // past the keys.json flush would not be.
+    logAppEvent("warn", "gateway_status_push_failed", { message: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+/** Main->renderer push of the window's real on-screen state (pet ALIVE gate). Send-only. */
+export const WINDOW_STATE_CHANNEL = "window-state";
+
+export interface WindowState { visible: boolean; focused: boolean; minimized: boolean }
+
+/**
+ * Main's own view of the window: isVisible()/isFocused()/isMinimized(). The
+ * renderer's document.visibilityState + hasFocus() can say "visible + focused"
+ * while the window is not on screen (measured: the pet's ALIVE clock ran 3.4 h
+ * under CDP), so the pet gate also requires this. null for an absent/dead window.
+ * Never throws: the native object can die mid-read (same reasoning as sendGatewayStatus).
+ */
+export function readWindowState(window: BrowserWindow | null | undefined): WindowState | null {
+  try {
+    if (!window || window.isDestroyed()) return null;
+    return { visible: window.isVisible() === true, focused: window.isFocused() === true, minimized: window.isMinimized() === true };
+  } catch {
+    return null;
+  }
+}
+
+/** Push readWindowState to this window only. Explicit 3-field projection; never throws. */
+export function sendWindowState(window: BrowserWindow | null | undefined): void {
+  try {
+    const state = readWindowState(window);
+    if (!state || !window) return;
+    const contents = window.webContents;
+    if (!contents || contents.isDestroyed()) return;
+    contents.send(WINDOW_STATE_CHANNEL, { visible: state.visible, focused: state.focused, minimized: state.minimized });
+  } catch (error) {
+    logAppEvent("warn", "window_state_push_failed", { message: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+// Returns a window that is safe to call, rebuilding it if it was destroyed.
+//
+// `mainWindow?.show()` guards NULL but NOT a DESTROYED native object. MEASURED in
+// a real launched app (tray alive, window destroyed): a tray click threw
+// "TypeError: Object has been destroyed". That throw happens inside an Electron
+// event callback, so it reaches process.on("uncaughtException") ->
+// fatalShutdownAndExit -> process.exit(1) — the raw exit that skips before-quit ->
+// cleanupAndQuit -> gatewayLifecycle.stop(), i.e. the ipc shutdown that flushes
+// keys.json and the model-key affinity cache. window-all-closed deliberately
+// early-returns while a tray exists, so this state is a LIVE trayed process with
+// no window: the same "invisible app" failure class the tray fix addresses.
+function ensureMainWindow(): BrowserWindow | null {
+  const usable = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+  if (usable) return usable;
+  // Only ever REBUILD a window that existed and died. Never create the FIRST
+  // window here: startNormal() owns initial creation, and a second-instance
+  // arriving in that gap would otherwise leave two windows. And never resurrect
+  // one during teardown, which would only have to be closed again.
+  if (!windowWasCreated || isQuiting) return null;
+  createWindow();
+  return mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+}
+
+/** The one way to bring the app back into view, from the tray, menu or a second instance. */
+function revealMainWindow(): void {
+  const window = ensureMainWindow();
+  if (!window) return;
+  if (window.isMinimized()) window.restore();
+  window.show();
+  window.focus();
+}
+
+// UI language for main-process surfaces (tray menu, update dialogs) comes from
+// the persisted config.json "language" field; the renderer toggles the same
+// field through set-app-config, so both stay in sync.
+function currentLanguage(): AppLanguage {
+  try {
+    // Cached: updateTray() calls this, and updateTray() runs on every gateway
+    // status change and every updater status change. A synchronous readFileSync
+    // here is exactly what turned 5,000 download ticks into 5.3 s of blocked
+    // main thread (fea558f). See readAppConfigCached for the staleness tradeoff.
+    return gatewayRuntime ? readAppConfigCached(gatewayRuntime.configPath).language : "en";
+  } catch {
+    return "en";
+  }
+}
+
+function updaterTrayMenuItems(): Electron.MenuItemConstructorOptions[] {
+  if (!updaterService) return [];
+  const menuText = getUpdateMenuText(updaterService.getStatus(), currentLanguage());
+  return [
+    { type: "separator" },
+    {
+      label: menuText.checkLabel,
+      enabled: menuText.checkEnabled,
+      click: () => { void updaterService?.checkForUpdates({ manual: true }); }
+    },
+    ...(menuText.statusLabel ? [{ label: menuText.statusLabel, enabled: false }] as Electron.MenuItemConstructorOptions[] : [])
+  ];
+}
+
+function updateAppMenu(): void {
+  const lang = currentLanguage();
+  const menu = buildApplicationMenu({
+    language: lang,
+    onCheckUpdates: () => {
+      if (updaterService) void updaterService.checkForUpdates({ manual: true });
+    },
+    onOpenSettings: () => {
+      revealMainWindow();
+    }
+  });
+  Menu.setApplicationMenu(menu);
+}
+
+function updateTray(status: GatewayStatus = gatewayLifecycle?.getStatus() ?? { state: "stopped" }): void {
+  if (!tray) return;
+  const lang = currentLanguage();
+  const menuStr = getMenuStrings(lang);
+  tray.setImage(createTrayIcon(status.state));
+  const stateKey = `gateway_${status.state}` as keyof typeof menuStr;
+  const stateLabel = (menuStr[stateKey] as string) ?? (status.state[0].toUpperCase() + status.state.slice(1));
+  const details = status.port ? ` (port ${status.port})` : "";
+  tray.setToolTip(`NVIDIA Gateway — ${stateLabel}${details}`);
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: `${menuStr.status_label}: ${stateLabel}${details}`, enabled: false },
+    ...(status.state === "error" && status.message ? [{ label: status.message, enabled: false }] : []),
+    { type: "separator" },
+    {
+      label: menuStr.show_app,
+      click: () => revealMainWindow()
+    },
+    {
+      label: menuStr.retry_gateway,
+      enabled: status.state !== "starting",
+      click: () => { void retryGateway(); }
+    },
+    ...updaterTrayMenuItems(),
+    {
+      label: menuStr.quit,
+      click: () => app.quit()
+    }
+  ]));
+
+  logAppEvent("info", "tray_status_update", { state: status.state, port: status.port ?? null });
+}
+
+function createTray(): void {
+  // A throwing Tray constructor used to escape into the bare `void
+  // startMainProcess(...)` call below, surface as an unhandledRejection, and be
+  // turned into process.exit(1) by fatalShutdownAndExit — a hard quit with the
+  // cause buried. Contain it here instead: the app stays usable, `tray` stays
+  // null so handleWindowClose degrades to a real close, and the reason is
+  // logged rather than silently swallowed.
+  try {
+    tray = new Tray(createTrayIcon(gatewayLifecycle?.getStatus().state));
+    logAppEvent("info", "tray_created", {});
+    updateTray();
+    tray.on("click", () => revealMainWindow());
+  } catch (error) {
+    tray = null;
+    logAppEvent("error", "tray_create_failed", {
+      message: error instanceof Error ? error.message : String(error),
+      outcome: "window_close_will_quit_instead_of_hiding"
+    });
+  }
+}
+
+// Tells the user, once, that closing the window did not close the app. This is
+// the other half of the reported defect: Windows 11 files new tray icons in the
+// hidden overflow flyout by default, and no supported API can promote them, so
+// without this notice the first X press looks exactly like a crash.
+function notifyHiddenToTray(): void {
+  if (!tray) return;
+  const menuStr = getMenuStrings(currentLanguage());
+  tray.displayBalloon({
+    title: menuStr.hidden_to_tray_title,
+    content: menuStr.hidden_to_tray_body,
+    iconType: "info"
+  });
+  logAppEvent("info", "window_hidden_to_tray_notice", {});
+}
+
+function createWindow(): void {
+  windowWasCreated = true;
+  const windowIcon = appIconPath();
+  mainWindow = new BrowserWindow({
+    width: 1024,
+    height: 768,
+    minWidth: 800,
+    minHeight: 600,
+    backgroundColor: "#0D0D0D",
+    ...(fs.existsSync(windowIcon) ? { icon: windowIcon } : {}),
+    webPreferences: {
+      preload: path.join(__dirname, "../preload/index.js"),
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true
+    }
+  });
+  if (process.env.NODE_ENV === "development" || !app.isPackaged) {
+    void mainWindow.loadURL("http://localhost:5173");
+  } else {
+    void mainWindow.loadFile(path.join(__dirname, "../../renderer/index.html"));
+  }
+  const exactUrl = app.isPackaged ? new URL(`file://${path.join(__dirname, "../../renderer/index.html")}`).href : "http://localhost:5173/";
+  installElectronSecurity({ targetSession: mainWindow.webContents.session, contents: mainWindow.webContents, exactUrl });
+
+  updateAppMenu();
+
+  mainWindow.webContents.on("context-menu", (_event, params) => {
+    if (!mainWindow) return;
+    buildContextMenu(currentLanguage(), params).popup({ window: mainWindow });
+  });
+
+  mainWindow.on("close", (event) => {
+    handleWindowClose({
+      event,
+      isQuitting: () => isQuiting,
+      // The decisive condition. Hiding is only safe when there is a tray icon to
+      // restore from; otherwise the close proceeds and window-all-closed quits.
+      hasTray: () => tray !== null,
+      hide: () => mainWindow?.hide(),
+      onFirstHide: notifyHiddenToTray,
+      log: logAppEvent
+    });
+  });
+
+  // Drop the pointer as soon as the native object dies. Without this the
+  // destroyed window stays truthy, and `mainWindow?.show()` (optional chaining
+  // guards null, NOT destroyed) throws "Object has been destroyed" from a tray
+  // click — measured in a real launched app — which escalates through
+  // uncaughtException to a raw process.exit(1) that skips the keys.json flush.
+  mainWindow.on("closed", () => {
+    mainWindow = null;
+  });
+
+  // Pet ALIVE gate: tell the renderer main's view of the window on every change.
+  const created = mainWindow;
+  const pushWindowState = (): void => sendWindowState(created);
+  for (const event of ["show", "hide", "minimize", "restore", "focus", "blur", "ready-to-show"] as const) {
+    created.on(event as "show", pushWindowState);
+  }
+  created.webContents.on("did-finish-load", pushWindowState);
+}
+
+app.on("before-quit", (event) => {
+  handleBeforeQuit({
+    event,
+    isQuitting: () => isQuiting,
+    setQuitting: () => { isQuiting = true; },
+    isControlled: () => controlledStartupShutdown.isControlled(),
+    // An update install is in flight (gateway child stop -> quitAndInstall):
+    // ignore Quit requests so no quit path can bypass the stop ordering.
+    isBlocked: () => updaterService?.isInstalling() ?? false,
+    log: logAppEvent,
+    cleanupAndQuit
+  });
+});
+
+app.on("will-quit", () => {
+  // Diagnostic: the last JS-visible step of a quit (Electron NotifyAndShutdown).
+  // Its absence after app_shutdown_complete means Electron never reached it.
+  logAppEvent("info", "app_will_quit", {});
+  updaterService?.stopPeriodicChecks();
+  // Last-resort: if the gateway child is still alive when Electron is
+  // about to exit, force-kill it synchronously so the OS does not leave
+  // an orphaned process holding the port.
+  if (gatewayLifecycle) {
+    try {
+      void gatewayLifecycle.stop();
+    } catch {
+      // Best-effort
+    }
+  }
+});
+
+// MASTER-010 recovery: a GPU process that died (crash, oom, launch failure,
+// integrity failure) leaves Chromium crash-looping towards a native abort() —
+// past every JS-level guard. Instead of that, record the crash and relaunch
+// ONCE with software rendering armed. The relaunch goes through app.quit(),
+// i.e. the normal before-quit -> cleanupAndQuit path, so the gateway child is
+// stopped and keys.json is flushed. The marker is consumed at startup, so the
+// relaunched process cannot crash-relaunch again (no loop), and a machine
+// whose GPU recovers is not locked into software rendering. `recoveryRequested`
+// is belt-and-braces for the same single-relaunch guarantee.
+let gpuRecoveryRequested = false;
+
+app.on("child-process-gone", (_event, details) => {
+  const verdict = planGpuCrashRecovery(details, {
+    alreadySoftwareRendering: softwareRenderingActive,
+    recoveryRequested: gpuRecoveryRequested
+  });
+  if (verdict === "ignore") return;
+  logAppEvent("warn", "gpu_process_gone", {
+    processType: details?.type ?? null,
+    reason: details?.reason ?? null,
+    exitCode: typeof details?.exitCode === "number" ? details.exitCode : null,
+    action: verdict
+  });
+  if (verdict !== "record-and-relaunch") return;
+  gpuRecoveryRequested = true;
+  writeGpuCrashMarker(app.getPath("userData"), { reason: details?.reason, exitCode: details?.exitCode });
+  app.relaunch();
+  app.quit();
+});
+
+const QUIT_WATCHDOG_MS = 3_000;
+
+async function cleanupAndQuit(): Promise<void> {
+  try {
+    // GatewayLifecycle.stop() never rejects: an unconfirmed child shutdown
+    // RESOLVES with { state: "error" }. Reporting app_shutdown_complete here
+    // without inspecting that status would claim a clean stop that did not
+    // happen, so the failure gets its own truthful event.
+    const status = await gatewayLifecycle?.stop();
+    if (status?.state === "error") {
+      logAppEvent("error", "app_shutdown_incomplete", {
+        code: status.code ?? null,
+        message: status.message ?? "gateway child shutdown could not be confirmed"
+      });
+    } else {
+      logAppEvent("info", "app_shutdown_complete", {});
+    }
+  } catch (err) {
+    logAppEvent("error", "app_shutdown_error", {
+      message: err instanceof Error ? err.message : String(err)
+    });
+  }
+  app.quit();
+  // Safety watchdog. Armed only here, AFTER the awaited gatewayLifecycle.stop()
+  // above (the ipc shutdown that flushes keys.json), so it can never cut a flush
+  // short. A measured CDP Browser.close left the process alive with no window
+  // after app_shutdown_complete and no app_will_quit; if Electron's quit stalls
+  // like that, exit anyway. unref() keeps it from holding a clean exit open.
+  setTimeout(() => {
+    logAppEvent("warn", "app_quit_watchdog_exit", {});
+    app.exit(0);
+  }, QUIT_WATCHDOG_MS).unref();
+}
+
+const fatalShutdownAndExit = createFatalShutdown({
+  stop: async () => { await gatewayLifecycle?.stop(); },
+  exit: (code) => process.exit(code),
+  deadlineMs: 5_000,
+  onFatalShutdown: () => migrationPhaseAudit.emit("fatal_shutdown", { pid: process.pid })
+});
+
+const controlledStartupShutdown = createControlledStartupShutdown({
+  setControlled: () => {},
+  setExitCode: (exitCode) => { process.exitCode = exitCode; },
+  quit: () => app.quit()
+});
+
+// Crash recovery: ensure the gateway child is cleaned up if the Electron
+// main process crashes unexpectedly.  Without these handlers an uncaught
+// exception would leave an orphaned child holding the port.
+process.on("uncaughtException", (err) => {
+  logAppEvent("error", "uncaught_exception", {
+    message: err.message,
+    stack: err.stack ?? null
+  });
+  void fatalShutdownAndExit();
+});
+
+process.on("unhandledRejection", (reason) => {
+  logAppEvent("error", "unhandled_rejection", {
+    message: reason instanceof Error ? reason.message : String(reason),
+    stack: reason instanceof Error ? (reason.stack ?? null) : null
+  });
+  void fatalShutdownAndExit();
+});
+
+// This chooses only the fixed audit target; the file itself is created only
+// when the explicit command emits a phase record.
+migrationPhaseAudit.setFilePath(migrationPhaseAuditPath());
+
+void startMainProcess({
+  argv: process.argv,
+  app,
+  // ensureMainWindow(), not the raw pointer: single-instance.ts calls
+  // isMinimized()/show()/focus() unguarded, which throws on a destroyed window.
+  configureSingleInstance: () => configureSingleInstance(app, () => ensureMainWindow()),
+  acquireLegacyMigrationLock: () => acquireLegacyMigrationExclusionLock(app.getPath("userData")),
+  createApplicationStartupOptions: () => ({
+    validateLegacySource: validateFixedLegacyNvidiaSource,
+    initializeLifecycle: initializeGatewayLifecycle,
+    runMigration: async (source) => {
+      if (!gatewayRuntime || !secureStore || !secureState || !gatewayLifecycle) throw new Error("MIGRATION_RUNTIME_UNAVAILABLE");
+      const acl = createRuntimeAclProtector();
+      // The migration workflow writes config.json DIRECTLY (final-migration-workflow.ts
+      // renames over it at :240 and :261), bypassing writeAppConfig/writeGatewayPort
+      // and so their invalidation. It runs before any window exists, so nothing
+      // should have armed the cache yet — but relying on that ordering would make a
+      // future reordering a silent staleness bug, so drop the cache explicitly.
+      //
+      // In a FINALLY, and this is the part a trailing statement gets wrong: the
+      // workflow performs verification reads AFTER it has renamed the new config
+      // into place and FAILS HARD on a mismatch (MIGRATION_CONFIG_CONCURRENT_MODIFICATION).
+      // On that throw the file is already replaced, so a trailing invalidate never
+      // runs and the cache would outlive the write it was supposed to follow. Same
+      // defect class as the two writers in gateway-runtime.ts.
+      let migration: Awaited<ReturnType<typeof runExplicitLegacyNvidiaMigration>>;
+      try {
+        migration = await runExplicitLegacyNvidiaMigration({ runtime: gatewayRuntime, store: secureStore, state: secureState, protectFile: acl.protectFile, source, lifecycle: {
+          startPrepared: async (state, port) => {
+            pendingMigrationState = structuredClone(state);
+            const status = await gatewayLifecycle.startPrepared(withGatewayModelLimits(state), port);
+            if (status.state !== "running") pendingMigrationState = null;
+            return status;
+          },
+          stopPrepared: async () => {
+            const status = await gatewayLifecycle.stopPrepared();
+            pendingMigrationState = null;
+            return status;
+          },
+          commitPreparedState: (state) => {
+            const committed = pendingMigrationState ? { ...state, keys: pendingMigrationState.keys } : state;
+            pendingMigrationState = null;
+            secureState = committed;
+            return committed;
+          }
+        } });
+      } finally {
+        invalidateAppConfigCache();
+      }
+      secureState = migration.state;
+      credentials = secureState.credentials && typeof secureState.credentials.gatewayToken === "string" && typeof secureState.credentials.adminToken === "string"
+        ? secureState.credentials as { gatewayToken: string; adminToken: string }
+        : null;
+      if (!credentials) throw new Error("MIGRATION_CREDENTIALS_UNAVAILABLE");
+      setRuntimeSecrets([credentials.gatewayToken, credentials.adminToken]);
+      gatewayLifecycle.replaceInitialState(withGatewayModelLimits(secureState));
+      return migration;
+    },
+    startNormal: async () => {
+      logAppEvent("info", "app_start", {
+        version: app.getVersion(),
+        platform: process.platform,
+        arch: process.arch,
+        electronVersion: process.versions.electron,
+        nodeVersion: process.versions.node
+      });
+      // Initialize the error reporter process hooks before the gateway starts so
+      // gateway/IPC errors are captured from the first moment.
+      //
+      // The SAME protector form as the other call sites (:306, :758, :932, :1088):
+      // errors.log gets the 0o600 + Windows ACL hardening its siblings get. This
+      // call passed NOTHING before, so error-reporter's no-op default silently
+      // disabled the one hardening site in the module (init()'s protectFile call)
+      // in production. `createRuntimeAclProtector().protectFile` is cheap and
+      // degrades to a no-op on non-Windows / non-zero icacls, exactly like the
+      // other call sites.
+      try {
+        initErrorReporter(createRuntimeAclProtector().protectFile);
+      } catch (error) {
+        logAppEvent("error", "error_reporter_init_failed", { message: error instanceof Error ? error.message : String(error) });
+      }
+      createWindow();
+      createTray();
+      updaterService = createAutoUpdateService({
+        updater: autoUpdater,
+        dialog: {
+          showMessageBox: (options) => {
+            const owner = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+            return owner ? dialog.showMessageBox(owner, options) : dialog.showMessageBox(options);
+          }
+        },
+        getLanguage: currentLanguage,
+        log: logAppEvent,
+        setQuitting: () => { isQuiting = true; },
+        // The gateway child must fully exit (ports freed, never orphaned)
+        // before quitAndInstall runs — same stop path as cleanupAndQuit.
+        stopGateway: async () => gatewayLifecycle?.stop(),
+        onStatusChanged: () => updateTray(),
+        enabled: app.isPackaged
+      });
+      updateTray();
+      if (app.isPackaged) {
+        // Silent background check at startup: no update -> log only; a new
+        // version shows the download offer dialog; errors stay in the log.
+        // ENOENT (app-update.yml missing on --dir builds) is swallowed here;
+        // the auto-updater already reports it through the "error" event,
+        // which handleError downgrades to a quiet info line.
+        void updaterService.checkForUpdates({ manual: false }).catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          if (message.includes("ENOENT")) {
+            // Already logged quietly via the "error" event handler.
+            return;
+          }
+          logAppEvent("error", "update_initial_check_failed", { message: message.length > 300 ? message.slice(0, 300) : message });
+        });
+        // Re-check every 6 h ± 15 min while the app keeps running (unref'd
+        // timer, cleared on will-quit). Same silent background semantics.
+        updaterService.startPeriodicChecks();
+      }
+      // Auto-start gateway if configured
+      if (gatewayRuntime) {
+        const config = readAppConfig(gatewayRuntime.configPath);
+        if (config.autoStartGateway !== false) {
+          await gatewayLifecycle.start(config.gatewayPort);
+        }
+      }
+      app.on("activate", () => {
+        if (BrowserWindow.getAllWindows().length === 0) createWindow();
+      });
+    },
+    log: (_level, event, data) => {
+      // The app logger is intentionally unavailable before source validation, so
+      // this writes straight to stderr. It must still pass through redact() like
+      // every other path that leaves the app: the local gatewayToken/adminToken
+      // are unprefixed base64url, so nothing in their VALUE marks them secret --
+      // they are caught only by field name or via setRuntimeSecrets. A raw
+      // JSON.stringify here defeated both and leaked them verbatim.
+      console.error(JSON.stringify(redact({ event, ...data })));
+    },
+    audit: migrationPhaseAudit,
+  }),
+  close: (exitCode) => {
+    controlledStartupShutdown.close(exitCode);
+  }
+});
+
+app.on("window-all-closed", () => {
+  // Normally a no-op: the application remains available from the tray.
+  //
+  // With no tray there is neither a way back nor a way out, which is the state
+  // the bug report describes — a live, invisible, unquittable process. Quit for
+  // real instead, and do it through app.quit() so before-quit -> handleBeforeQuit
+  // -> cleanupAndQuit -> gatewayLifecycle.stop() still runs. That is the IPC
+  // shutdown path that flushes keys.json and the model-key affinity cache, so
+  // this escape hatch cannot cost the user their key state. It must NEVER be a
+  // raw process-level exit here: that would skip the flush entirely.
+  if (tray) return;
+  logAppEvent("warn", "window_all_closed_without_tray", { outcome: "quit" });
+  app.quit();
+});
+
+// ---- IPC handlers with error logging ----
+
+function wrapIpcHandler<T extends (...args: unknown[]) => unknown>(
+  name: string,
+  handler: T
+): T {
+  return wrapIpcHandlerWithLogError(name, handler, (entry) => {
+    // Named explicitly rather than spread: a spread hides which field names reach
+    // the log, keeping them out of the project's logged-field-name census and so
+    // unprotected-by-inspection. These three are the whole IpcErrorLog shape.
+    logAppEvent("error", "ipc_handler_error", { handler: entry.handler, message: entry.message, stack: entry.stack });
+  });
+}
+
+function allowedRendererUrls(): string[] {
+  return app.isPackaged ? [new URL(`file://${path.join(__dirname, "../../renderer/index.html")}`).href] : ["http://localhost:5173/"];
+}
+
+function adminCredentials(): { port: number; token: string } {
+  if (!gatewayRuntime) throw new Error("Gateway runtime is not initialized.");
+  if (!credentials) throw new Error("Admin credential is unavailable.");
+  return { port: readGatewayPort(gatewayRuntime.configPath), token: credentials.adminToken };
+}
+const admin = createAdminIpcDispatcher({
+  getStatus: () => gatewayLifecycle?.getStatus() ?? { state: "stopped" },
+  isStopping: () => gatewayLifecycle?.isStopping() ?? false,
+  getCredentials: adminCredentials,
+  requestAdmin
+});
+
+const updateAppConfig = createAppConfigUpdateHandler({
+  getConfigPath: () => {
+    if (!gatewayRuntime) throw new Error("Gateway runtime is not initialized.");
+    return gatewayRuntime.configPath;
+  },
+  writeAppConfig,
+  protectFile: createRuntimeAclProtector().protectFile,
+  validateBoolean: validators.boolean,
+  getStatus: () => gatewayLifecycle?.getStatus() ?? { state: "stopped" }
+});
+
+// Upper bound for a renderer clipboard write. The largest legitimate payload is
+// a generated client-config block or a cURL snippet (Endpoint/Models views), all
+// far below this; the cap simply stops a renderer from pushing arbitrary volume
+// into the OS clipboard.
+const CLIPBOARD_TEXT_MAX = 1_000_000;
+
+// Validation mirrors the style of validators in ipc-security.ts: assert the type,
+// bound the size, throw a generic Error. The value itself is NEVER echoed into
+// the message -- it can be an NVIDIA API key or the local gateway token.
+function assertClipboardText(value: unknown): asserts value is string {
+  if (typeof value !== "string") throw new Error("Invalid clipboard text.");
+  if (value.length > CLIPBOARD_TEXT_MAX) throw new Error("Invalid clipboard text.");
+}
+
+function secure<T extends (event: Electron.IpcMainInvokeEvent, ...args: any[]) => unknown>(handler: T): T {
+  return ((event: Electron.IpcMainInvokeEvent, ...args: unknown[]) => { if (!mainWindow) throw new Error("Window unavailable."); validateIpcSender(event, mainWindow.webContents, allowedRendererUrls()); return handler(event, ...args); }) as T;
+}
+
+// ---------------------------------------------------------------------------
+// Auto-launch is CACHED in main, and deliberately NOT read on the hot path.
+//
+// MEASURED (Electron 31.7.7, Windows, headless probe): every
+// app.getLoginItemSettings() call leaks exactly ONE kernel `Key` handle that is
+// never returned -- but only when the HKCU\Software\Microsoft\Windows\
+// CurrentVersion\Run value for this app exists, i.e. openAtLogin === true.
+//   openAtLogin=true   5000 calls -> handle delta +5000, still held after idle
+//   openAtLogin=false  5000 calls -> handle delta 0
+// The growth is linear, not one-time initialisation (three consecutive batches
+// of 5000 each added 5000).
+//
+// get-runtime-state is invoked on EVERY renderer refresh, so reading the setting
+// there converted an ordinary per-request call into unbounded paged-pool growth
+// (~16.2 bytes of paged pool per handle). One live process on the reporter's
+// machine had accumulated 7,201,605 handles, 7,200,846 of them of type `Key`.
+//
+// So the setting is read only when it can actually have changed: when WE change
+// it (toggle-auto-launch) or when the renderer explicitly asks (get-auto-launch).
+// That bounds native reads to user actions instead of render cycles.
+//
+// TRADEOFF, stated plainly rather than hidden: if the Run value is edited
+// EXTERNALLY while the app is running -- regedit, msconfig, Task Manager's
+// Startup tab, another installer -- get-runtime-state keeps serving the value we
+// last observed. Settings reads autoLaunch from get-runtime-state, so its toggle
+// can display a stale value for the rest of the session (until the next toggle,
+// an explicit get-auto-launch, or a restart). That is the accepted cost of not
+// leaking a handle per render.
+let autoLaunchCache: boolean | null = null;
+
+/**
+ * Native read. Costs one leaked `Key` handle whenever the Run value exists, so
+ * call this only on user-driven paths, never per request.
+ */
+function refreshAutoLaunch(): boolean {
+  // Same QUOTED path the toggle writes (login-item.ts: Electron compares the Run
+  // value by plain string equality). A legacy unquoted value costs a second read,
+  // still bounded by user actions.
+  autoLaunchCache = readOpenAtLogin((p) => app.getLoginItemSettings({ path: p }).openAtLogin, app.getPath("exe"));
+  return autoLaunchCache;
+}
+
+/**
+ * Cached read for the hot path. Touches the registry at most once per process,
+ * to seed the cache if no user action has already done so.
+ */
+function getAutoLaunchCached(): boolean {
+  return autoLaunchCache ?? refreshAutoLaunch();
+}
+
+ipcMain.handle("get-app-version", wrapIpcHandler("get-app-version", secure(() => app.getVersion())));
+ipcMain.handle("check-ports", wrapIpcHandler("check-ports", secure(async (_event, ports: number[]) => { validators.ports(ports); return checkPorts(ports); })));
+ipcMain.handle("find-free-port", wrapIpcHandler("find-free-port", secure(async () => findFreePort())));
+ipcMain.handle("get-gateway-port", wrapIpcHandler("get-gateway-port", secure(() => {
+  if (!gatewayRuntime) throw new Error("Gateway runtime is not initialized.");
+  return readGatewayPort(gatewayRuntime.configPath);
+})));
+ipcMain.handle("get-window-state", wrapIpcHandler("get-window-state", secure(() => readWindowState(mainWindow))));
+ipcMain.handle("get-gateway-status", wrapIpcHandler("get-gateway-status", secure(() => gatewayLifecycle?.getStatus() ?? { state: "stopped" })));
+ipcMain.handle("get-runtime-state", wrapIpcHandler("get-runtime-state", secure(() => {
+  if (!gatewayRuntime) throw new Error("Gateway runtime is not initialized.");
+  // autoLaunch comes from the cache: this handler runs on every renderer refresh
+  // and app.getLoginItemSettings() leaks a kernel `Key` handle per call whenever
+  // the Run value exists. See the note above getAutoLaunchCached().
+  //
+  // The config is cached for the same reason: this is a POLLED channel, and
+  // readAppConfig is a synchronous readFileSync + JSON.parse — MEASURED at
+  // 1.5348 ms/call on this machine — that blocked the main thread on every
+  // single request. See readAppConfigCached in gateway-runtime.ts for the
+  // accepted staleness tradeoff on an EXTERNAL edit to config.json.
+  // Э1b D1: requestDeadlineMs here is the EFFECTIVE deadline (child's rules:
+  // valid ENV -> valid setting -> 240000) with requestDeadlineSource beside it.
+  return { ...readRuntimeAppConfigCached(gatewayRuntime.configPath), status: gatewayLifecycle?.getStatus() ?? { state: "stopped" }, version: app.getVersion(), autoLaunch: getAutoLaunchCached() };
+})));
+ipcMain.handle("set-app-config", wrapIpcHandler("set-app-config", secure((_event, update: { language?: string; setupComplete?: boolean; performanceMode?: string; requestDeadlineMs?: number; llmStatsEnabled?: boolean }) => {
+  const result = updateAppConfig(update as AppConfigUpdate);
+  if (update.language) {
+    updateTray();
+    updateAppMenu();
+  }
+  return result;
+})));
+ipcMain.handle("retry-gateway", wrapIpcHandler("retry-gateway", secure(async (_event, port?: number) => { if (port !== undefined) validators.port(port); return retryGateway(port); })));
+ipcMain.handle("set-gateway-port", wrapIpcHandler("set-gateway-port", secure(async (_event, port: number) => {
+  validators.port(port);
+  const scan = await checkPorts([port, port + 1]);
+  const current = gatewayLifecycle?.getStatus();
+  if ((scan[port] || scan[port + 1]) && !(current?.state === "running" && current.port === port)) return { state: "error", code: "PORT_IN_USE", port };
+  logAppEvent("info", "port_configuration_change", { newPort: port });
+  return retryGateway(port);
+})));
+
+ipcMain.handle("toggle-auto-launch", wrapIpcHandler("toggle-auto-launch", secure((_event, enable: boolean) => {
+  validators.boolean(enable);
+  app.setLoginItemSettings({ openAtLogin: enable, path: loginItemPath(app.getPath("exe")) });
+  // We just changed it, so re-read the OS state to keep the cache truthful
+  // rather than assuming the write landed. One native read per user toggle is
+  // bounded by user actions; the return value stays `enable` so the renderer
+  // contract is unchanged.
+  refreshAutoLaunch();
+  logAppEvent("info", "auto_launch_toggle", { enabled: enable });
+  return enable;
+})));
+// An explicit request: read the OS state for real and refresh the cache with it.
+ipcMain.handle("get-auto-launch", wrapIpcHandler("get-auto-launch", secure(() => refreshAutoLaunch())));
+const UPDATE_STATUS_FALLBACK: UpdaterStatus = { state: "none", version: null, percent: null };
+ipcMain.handle("get-update-status", wrapIpcHandler("get-update-status", secure(() => updaterService?.getStatus() ?? { ...UPDATE_STATUS_FALLBACK })));
+ipcMain.handle("check-for-updates", wrapIpcHandler("check-for-updates", secure(() => {
+  // Manual check (tray menu or Settings view): errors also surface as dialogs.
+  if (updaterService) void updaterService.checkForUpdates({ manual: true });
+  return updaterService?.getStatus() ?? { ...UPDATE_STATUS_FALLBACK };
+})));
+ipcMain.handle("admin-list-keys", wrapIpcHandler("admin-list-keys", secure(() => admin({ method: "GET", path: "/admin/keys" }))));
+ipcMain.handle("admin-add-key", wrapIpcHandler("admin-add-key", secure((_event, key: string) => { validators.key(key); return admin({ method: "POST", path: "/admin/keys", body: { key } }); })));
+ipcMain.handle("admin-remove-key", wrapIpcHandler("admin-remove-key", secure((_event, id: string) => { validators.uuid(id); return admin({ method: "DELETE", path: `/admin/keys/${encodeURIComponent(id)}` }); })));
+ipcMain.handle("admin-set-status", wrapIpcHandler("admin-set-status", secure((_event, id: string, status: string) => { validators.uuid(id); validators.status(status); return admin({ method: "PATCH", path: `/admin/keys/${encodeURIComponent(id)}`, body: { status } }); })));
+ipcMain.handle("admin-reorder", wrapIpcHandler("admin-reorder", secure((_event, ids: string[]) => { validators.reorder(ids); return admin({ method: "POST", path: "/admin/keys/reorder", body: { ids } }); })));
+ipcMain.handle("admin-logs", wrapIpcHandler("admin-logs", secure(() => admin({ method: "GET", path: "/admin/logs" }))));
+ipcMain.handle("admin-validate-key", wrapIpcHandler("admin-validate-key", secure((_event, key: string) => { validators.key(key); return admin({ method: "POST", path: "/admin/validate", body: { key } }); })));
+ipcMain.handle("get-gateway-credentials", wrapIpcHandler("get-gateway-credentials", secure(() => {
+  if (!gatewayRuntime) throw new Error("Gateway runtime is not initialized.");
+  if (!credentials) throw new Error("Credentials are unavailable.");
+  return { port: readGatewayPort(gatewayRuntime.configPath), gatewayToken: credentials.gatewayToken };
+})));
+
+// Phase 2: Models-panel handlers. The preload already exposes get-models /
+// refresh-models / update-model-settings / toggle-model (src/preload/index.ts);
+// registering them here removes the previous "No handler registered" throws.
+// They reuse the admin dispatcher (admin port+1 + admin token) for HTTP and
+// the atomic writeAppConfig (gateway-runtime.ts) for per-model writes — per-model
+// fields are NOT routed through set-app-config (app-config-ipc.ts rejects any key
+// outside its allowlist: language/setupComplete/performanceMode/requestDeadlineMs/llmStatsEnabled).
+const modelsHandlers = createModelsHandlers({
+  dispatch: admin,
+  getConfigPath: () => {
+    if (!gatewayRuntime) throw new Error("Gateway runtime is not initialized.");
+    return gatewayRuntime.configPath;
+  },
+  writeAppConfig,
+  protectFile: createRuntimeAclProtector().protectFile
+});
+ipcMain.handle("get-models", wrapIpcHandler("get-models", secure(() => modelsHandlers.getModels())));
+ipcMain.handle("refresh-models", wrapIpcHandler("refresh-models", secure(() => modelsHandlers.refreshModels())));
+ipcMain.handle("update-model-settings", wrapIpcHandler("update-model-settings", secure((_event, id: string, settings: { enabled?: boolean; mode?: "day" | "night" | "auto" }) => modelsHandlers.updateModelSettings(id, settings))));
+ipcMain.handle("toggle-model", wrapIpcHandler("toggle-model", secure((_event, id: string, enabled: boolean) => {
+  if (typeof enabled !== "boolean") throw new Error("Invalid enabled flag.");
+  return modelsHandlers.toggleModel(id, enabled);
+})));
+ipcMain.handle("bulk-toggle-models", wrapIpcHandler("bulk-toggle-models", secure((_event, enabled: boolean) => {
+  if (typeof enabled !== "boolean") throw new Error("Invalid enabled flag.");
+  return modelsHandlers.bulkToggleModels(enabled);
+})));
+
+// ---- Error reporting, feedback, diagnostics, and about handlers ----
+// The error reporter is a statically imported CommonJS module compiled from
+// error-reporter.ts; its process hooks are initialized in startNormal.
+ipcMain.handle("error-report:log", wrapIpcHandler("error-report:log", secure((_event, entry: ErrorEntry) => {
+  logError(entry);
+  return undefined;
+})));
+ipcMain.handle("error-report:get-count", wrapIpcHandler("error-report:get-count", secure(() => getErrorCount())));
+ipcMain.handle("error-report:preview", wrapIpcHandler("error-report:preview", secure(() => previewErrors())));
+ipcMain.handle("error-report:send", wrapIpcHandler("error-report:send", secure(async () => sendErrors())));
+// `data: unknown` then validate, exactly as clipboard:write-text and
+// shell:open-external do. secure() is validateIpcSender ONLY — it proves WHO is
+// speaking, never WHAT they said — so without validation these two channels
+// trusted the renderer's payload, and the DOM maxLength attributes in
+// FeedbackModal are a typing affordance rather than a boundary.
+//
+// snapshotFeedbackData, NOT assertFeedbackData. These handlers previously called
+// the assertion and then passed THE SAME OBJECT on to the consumer, which read the
+// fields AGAIN — `openGitHubIssue` re-read `data.title`, `saveFeedback` re-read all
+// three. An assertion function can only narrow a type; it cannot replace the object
+// it narrowed. MEASURED, a payload with a getter on `title` returning 'short' on the
+// first read and 1,000,000 units afterwards PASSED validation and produced a
+// 33,137-character URL, past the 23,704-character bound feedback-validation.ts
+// derives. The snapshot reads every field exactly once and returns a frozen copy, so
+// the values that were validated are by construction the values that get consumed.
+// Not reachable from a renderer today (structured clone flattens a getter before it
+// crosses IPC) — this is defence-in-depth against a future main-process caller.
+ipcMain.handle("feedback:save", wrapIpcHandler("feedback:save", secure((_event, data: unknown) => saveFeedback(snapshotFeedbackData(data)))));
+ipcMain.handle("feedback:open-github-issue", wrapIpcHandler("feedback:open-github-issue", secure((_event, data: unknown) => openGitHubIssue(snapshotFeedbackData(data)))));
+ipcMain.handle("shell:open-external", wrapIpcHandler("shell:open-external", secure((_event, url: unknown) => openExternalUrl(url))));
+ipcMain.handle("diagnostic:export", wrapIpcHandler("diagnostic:export", secure(() => exportDiagnostic())));
+ipcMain.handle("about:get-info", wrapIpcHandler("about:get-info", secure(() => getAboutInfo())));
+
+// Clipboard: WRITE-ONLY, on purpose. navigator.clipboard in the renderer rejects
+// with NotAllowedError ("Document is not focused") whenever the window is not
+// focused -- measured under this app's own webPreferences and CSP -- and this app
+// is tray-resident, so an unfocused window is an ordinary state. Electron's own
+// clipboard module is focus-independent, so the write happens here instead.
+// There is deliberately NO read channel: a renderer must not be able to pull back
+// clipboard contents. The text is never logged; it may be a credential.
+ipcMain.handle("clipboard:write-text", wrapIpcHandler("clipboard:write-text", secure((_event, text: unknown) => {
+  assertClipboardText(text);
+  clipboard.writeText(text);
+  return undefined;
+})));
