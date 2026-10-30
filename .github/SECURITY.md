@@ -77,6 +77,7 @@ Out of scope:
 - All logging subsystems (`app.jsonl`, `gateway.jsonl`, `gateway-stdio.jsonl`, `migration-phase.jsonl`) pass outputs through `src/shared/redaction.mjs`.
 - URL queries, authorization headers, bearer tokens, and NVIDIA API keys (`nvapi-...`) are recursively redacted prior to disk persistence.
 - Windows ACL permissions are applied best-effort on runtime log directories to restrict access to the current OS user SID.
+- Five test files under `tests/` contain obviously fake keys that are fed to the redactors to prove they work. Secret scanners will report them. Only those exact files are allowlisted in [`.gitleaks.toml`](../.gitleaks.toml); the rest of the repository is still scanned.
 
 ### G. Release Authenticity & Download Trust
 - Release builds are **not code-signed** (no Authenticode certificate), so Windows SmartScreen may warn about an unknown publisher.

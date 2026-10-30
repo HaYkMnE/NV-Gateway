@@ -1,0 +1,14 @@
+title = "NV Gateway gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Redaction-test fixtures: obviously fake keys fed to the redactors"
+paths = [
+  '''(?:^|[/\\])tests[/\\]w1b-adapters\.test\.mjs$''',
+  '''(?:^|[/\\])tests[/\\]w2b-adapters\.test\.mjs$''',
+  '''(?:^|[/\\])tests[/\\]w1b-lifecycle-safety\.test\.mjs$''',
+  '''(?:^|[/\\])tests[/\\]startup-diagnostic-redaction\.test\.mjs$''',
+  '''(?:^|[/\\])tests[/\\]privacy-no-auto-transmission\.test\.mjs$''',
+]
