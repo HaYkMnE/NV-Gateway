@@ -47,7 +47,7 @@
     "electron": "44.9.3",
     "electron-builder": "26.18.0",
     "esbuild": "0.28.2",
-    "i18next": "^23.14.0",
+    "i18next": "^27.2.6",
     "js-yaml": "4.3.2",
     "jsqr": "^1.4.0",
     "lucide-react": "^0.435.0",
